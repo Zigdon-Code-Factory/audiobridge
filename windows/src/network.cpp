@@ -1,6 +1,10 @@
 #include "network.h"
 #include <cstdio>
 #include <cstring>
+#include <vector>
+#include <fstream>
+#include <sstream>
+#include <ctime>
 
 Network::Network() {}
 
@@ -10,6 +14,10 @@ Network::~Network() {
 
 bool Network::initialize(const std::string& serverName) {
     serverName_ = serverName;
+    macAddress_ = getMacAddress();
+
+    // Load approved peers from disk
+    loadApprovedPeers();
 
     WSADATA wsaData;
     if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
@@ -63,6 +71,11 @@ bool Network::initialize(const std::string& serverName) {
     streamThread_ = std::thread(&Network::streamThread, this);
 
     printf("Listening: discovery on :4011, stream on :4012\n");
+    printf("Server MAC: %s\n", macAddress_.c_str());
+    {
+        std::lock_guard<std::mutex> lock(peersMutex_);
+        printf("Approved peers: %zu\n", approvedPeers_.size());
+    }
     return true;
 }
 
@@ -96,8 +109,9 @@ void Network::discoveryThread() {
 
         buf[received] = '\0';
         if (strcmp(buf, "AB_DISCOVER") == 0) {
-            char response[256];
-            snprintf(response, sizeof(response), "AB_OFFER|%s|4012", serverName_.c_str());
+            char response[512];
+            snprintf(response, sizeof(response), "AB_OFFER|%s|4012|%s",
+                     serverName_.c_str(), macAddress_.c_str());
 
             sendto(discoverySocket_, response, (int)strlen(response), 0,
                    (sockaddr*)&senderAddr, addrLen);
@@ -122,23 +136,121 @@ void Network::streamThread() {
 
             // Check for text control messages
             if (strncmp(buf, "AB_CONNECT|", 11) == 0) {
-                std::string clientName(buf + 11);
-                {
-                    std::lock_guard<std::mutex> lock(clientMutex_);
-                    clientAddr_ = senderAddr;
+                // Parse: AB_CONNECT|<name>|<clientId>
+                std::string payload(buf + 11);
+                std::string clientName = payload;
+                std::string clientId;
+
+                size_t sep = payload.find('|');
+                if (sep != std::string::npos) {
+                    clientName = payload.substr(0, sep);
+                    clientId = payload.substr(sep + 1);
                 }
-                connected_ = true;
-                paused_ = false;
-                sequence_ = 0;
-                streamStart_ = std::chrono::steady_clock::now();
-                lastClientPacket_ = streamStart_;
 
-                // Send AB_ACCEPT
-                const char* accept = "AB_ACCEPT";
-                sendto(streamSocket_, accept, (int)strlen(accept), 0,
-                       (sockaddr*)&senderAddr, addrLen);
+                // Check if this peer is approved
+                if (!clientId.empty() && isPeerApproved(clientId)) {
+                    // Known peer — auto-accept and refresh timestamp
+                    touchPeer(clientId, clientName);
 
-                if (onConnect_) onConnect_(clientName);
+                    {
+                        std::lock_guard<std::mutex> lock(clientMutex_);
+                        clientAddr_ = senderAddr;
+                    }
+                    connected_ = true;
+                    paused_ = false;
+                    sequence_ = 0;
+                    streamStart_ = std::chrono::steady_clock::now();
+                    lastClientPacket_ = streamStart_;
+
+                    const char* accept = "AB_ACCEPT";
+                    sendto(streamSocket_, accept, (int)strlen(accept), 0,
+                           (sockaddr*)&senderAddr, addrLen);
+
+                    printf("Auto-accepted known peer: %s (%s)\n", clientName.c_str(), clientId.c_str());
+                    if (onConnect_) onConnect_(clientName);
+                } else if (clientId.empty()) {
+                    // Legacy client without ID — accept without pairing
+                    // (backwards compatible)
+                    {
+                        std::lock_guard<std::mutex> lock(clientMutex_);
+                        clientAddr_ = senderAddr;
+                    }
+                    connected_ = true;
+                    paused_ = false;
+                    sequence_ = 0;
+                    streamStart_ = std::chrono::steady_clock::now();
+                    lastClientPacket_ = streamStart_;
+
+                    const char* accept = "AB_ACCEPT";
+                    sendto(streamSocket_, accept, (int)strlen(accept), 0,
+                           (sockaddr*)&senderAddr, addrLen);
+
+                    printf("Accepted legacy client (no ID): %s\n", clientName.c_str());
+                    if (onConnect_) onConnect_(clientName);
+                } else {
+                    // Unknown peer — send PAIR_PENDING and wait for approval
+                    const char* pending = "AB_PAIR_PENDING";
+                    sendto(streamSocket_, pending, (int)strlen(pending), 0,
+                           (sockaddr*)&senderAddr, addrLen);
+
+                    printf("\nNew device wants to pair: '%s' (ID: %s)\n",
+                           clientName.c_str(), clientId.c_str());
+
+                    // Set up pending state
+                    {
+                        std::lock_guard<std::mutex> lock(pendingMutex_);
+                        pendingPeer_.clientId = clientId;
+                        pendingPeer_.clientName = clientName;
+                        pendingPeer_.addr = senderAddr;
+                        pendingPeer_.addrLen = addrLen;
+                        pendingPeer_.responded = false;
+                        pendingPeer_.approved = false;
+                    }
+
+                    // Notify via callback (e.g. console prompt)
+                    if (onPairRequest_) {
+                        onPairRequest_(clientId, clientName);
+                    }
+
+                    // Wait for approval (up to 30 seconds)
+                    {
+                        std::unique_lock<std::mutex> lock(pendingMutex_);
+                        pendingCv_.wait_for(lock, std::chrono::seconds(30), [this] {
+                            return pendingPeer_.responded || !running_;
+                        });
+
+                        if (pendingPeer_.responded && pendingPeer_.approved) {
+                            // Approved — add to peers and accept
+                            touchPeer(clientId, clientName);
+
+                            {
+                                std::lock_guard<std::mutex> lock2(clientMutex_);
+                                clientAddr_ = senderAddr;
+                            }
+                            connected_ = true;
+                            paused_ = false;
+                            sequence_ = 0;
+                            streamStart_ = std::chrono::steady_clock::now();
+                            lastClientPacket_ = streamStart_;
+
+                            const char* accept = "AB_ACCEPT";
+                            sendto(streamSocket_, accept, (int)strlen(accept), 0,
+                                   (sockaddr*)&senderAddr, addrLen);
+
+                            if (onConnect_) onConnect_(clientName);
+                        } else {
+                            // Rejected or timed out
+                            const char* reject = pendingPeer_.responded
+                                ? "AB_REJECT|Denied by server"
+                                : "AB_REJECT|Approval timed out";
+                            sendto(streamSocket_, reject, (int)strlen(reject), 0,
+                                   (sockaddr*)&senderAddr, addrLen);
+                            printf("Pair request %s for %s\n",
+                                   pendingPeer_.responded ? "denied" : "timed out",
+                                   clientName.c_str());
+                        }
+                    }
+                }
                 continue;
             }
 
@@ -233,4 +345,173 @@ std::string Network::getClientAddress() const {
     char addrStr[INET_ADDRSTRLEN];
     inet_ntop(AF_INET, &clientAddr_.sin_addr, addrStr, sizeof(addrStr));
     return std::string(addrStr) + ":" + std::to_string(ntohs(clientAddr_.sin_port));
+}
+
+std::string Network::getMacAddress() {
+    ULONG bufLen = 0;
+    GetAdaptersInfo(nullptr, &bufLen);
+    if (bufLen == 0) return "00:00:00:00:00:00";
+
+    std::vector<uint8_t> buffer(bufLen);
+    PIP_ADAPTER_INFO adapters = reinterpret_cast<PIP_ADAPTER_INFO>(buffer.data());
+
+    if (GetAdaptersInfo(adapters, &bufLen) != ERROR_SUCCESS) {
+        return "00:00:00:00:00:00";
+    }
+
+    // Find the first adapter with a valid MAC (skip loopback/virtual)
+    for (PIP_ADAPTER_INFO adapter = adapters; adapter; adapter = adapter->Next) {
+        if (adapter->AddressLength == 6 && adapter->Type != MIB_IF_TYPE_LOOPBACK) {
+            char mac[18];
+            snprintf(mac, sizeof(mac), "%02X:%02X:%02X:%02X:%02X:%02X",
+                     adapter->Address[0], adapter->Address[1],
+                     adapter->Address[2], adapter->Address[3],
+                     adapter->Address[4], adapter->Address[5]);
+            // Skip zero MACs
+            if (strcmp(mac, "00:00:00:00:00:00") != 0) {
+                return mac;
+            }
+        }
+    }
+    return "00:00:00:00:00:00";
+}
+
+// --- Peer Persistence ---
+
+std::string Network::getPeersFilePath() const {
+    // Store next to the executable
+    char exePath[MAX_PATH];
+    GetModuleFileNameA(nullptr, exePath, MAX_PATH);
+    std::string path(exePath);
+    size_t lastSlash = path.find_last_of("\\/");
+    if (lastSlash != std::string::npos) {
+        path = path.substr(0, lastSlash + 1);
+    }
+    return path + "approved_peers.txt";
+}
+
+void Network::loadApprovedPeers() {
+    std::lock_guard<std::mutex> lock(peersMutex_);
+    approvedPeers_.clear();
+
+    std::string filePath = getPeersFilePath();
+    std::ifstream file(filePath);
+    if (!file.is_open()) return;
+
+    std::string line;
+    int64_t now = std::time(nullptr);
+    int64_t expirySeconds = PEER_EXPIRY_DAYS * 24LL * 3600LL;
+    int loaded = 0, expired = 0;
+
+    while (std::getline(file, line)) {
+        if (line.empty() || line[0] == '#') continue;
+
+        // Format: clientId|clientName|lastConnected(unix timestamp)
+        std::istringstream iss(line);
+        std::string id, name, tsStr;
+        if (!std::getline(iss, id, '|')) continue;
+        if (!std::getline(iss, name, '|')) continue;
+        if (!std::getline(iss, tsStr, '|')) continue;
+
+        int64_t ts = 0;
+        try { ts = std::stoll(tsStr); } catch (...) { continue; }
+
+        // Skip expired peers (30-day sliding window)
+        if (now - ts > expirySeconds) {
+            expired++;
+            continue;
+        }
+
+        ApprovedPeer peer;
+        peer.clientId = id;
+        peer.clientName = name;
+        peer.lastConnected = ts;
+        approvedPeers_[id] = peer;
+        loaded++;
+    }
+
+    if (loaded > 0 || expired > 0) {
+        printf("Loaded %d approved peer(s), %d expired\n", loaded, expired);
+    }
+
+    // If we pruned expired peers, rewrite the file
+    if (expired > 0) {
+        file.close();
+        saveApprovedPeers();
+    }
+}
+
+void Network::saveApprovedPeers() {
+    // Must be called with peersMutex_ held, OR hold it here
+    // We'll try-lock to avoid deadlocks; callers that already hold it
+    // will call the internal version
+    std::string filePath = getPeersFilePath();
+    std::ofstream file(filePath, std::ios::trunc);
+    if (!file.is_open()) {
+        printf("Warning: Could not write peers file: %s\n", filePath.c_str());
+        return;
+    }
+
+    file << "# AudioBridge approved peers\n";
+    file << "# Format: clientId|clientName|lastConnected(unix)\n";
+    for (const auto& [id, peer] : approvedPeers_) {
+        file << peer.clientId << "|" << peer.clientName << "|" << peer.lastConnected << "\n";
+    }
+}
+
+bool Network::isPeerApproved(const std::string& clientId) const {
+    std::lock_guard<std::mutex> lock(peersMutex_);
+    auto it = approvedPeers_.find(clientId);
+    if (it == approvedPeers_.end()) return false;
+
+    // Double-check expiry
+    int64_t now = std::time(nullptr);
+    int64_t expirySeconds = PEER_EXPIRY_DAYS * 24LL * 3600LL;
+    return (now - it->second.lastConnected) <= expirySeconds;
+}
+
+void Network::touchPeer(const std::string& clientId, const std::string& clientName) {
+    std::lock_guard<std::mutex> lock(peersMutex_);
+    auto it = approvedPeers_.find(clientId);
+    if (it != approvedPeers_.end()) {
+        it->second.lastConnected = std::time(nullptr);
+        it->second.clientName = clientName;
+    } else {
+        ApprovedPeer peer;
+        peer.clientId = clientId;
+        peer.clientName = clientName;
+        peer.lastConnected = std::time(nullptr);
+        approvedPeers_[clientId] = peer;
+    }
+    saveApprovedPeers();
+}
+
+void Network::approvePeer(const std::string& clientId) {
+    std::lock_guard<std::mutex> lock(pendingMutex_);
+    if (pendingPeer_.clientId == clientId) {
+        pendingPeer_.responded = true;
+        pendingPeer_.approved = true;
+        pendingCv_.notify_one();
+    }
+}
+
+void Network::rejectPeer(const std::string& clientId) {
+    std::lock_guard<std::mutex> lock(pendingMutex_);
+    if (pendingPeer_.clientId == clientId) {
+        pendingPeer_.responded = true;
+        pendingPeer_.approved = false;
+        pendingCv_.notify_one();
+    }
+}
+
+std::map<std::string, ApprovedPeer> Network::getApprovedPeers() const {
+    std::lock_guard<std::mutex> lock(peersMutex_);
+    return approvedPeers_;
+}
+
+void Network::revokePeer(const std::string& clientId) {
+    std::lock_guard<std::mutex> lock(peersMutex_);
+    approvedPeers_.erase(clientId);
+    saveApprovedPeers();
+    printf("Revoked peer: %s\n", clientId.c_str());
 }

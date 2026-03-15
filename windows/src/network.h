@@ -1,6 +1,7 @@
 #pragma once
 #include <WinSock2.h>
 #include <WS2tcpip.h>
+#include <iphlpapi.h>
 #include <cstdint>
 #include <string>
 #include <atomic>
@@ -8,8 +9,11 @@
 #include <mutex>
 #include <functional>
 #include <chrono>
+#include <map>
+#include <condition_variable>
 
 #pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "iphlpapi.lib")
 
 struct PacketHeader {
     uint8_t version;    // 0x01
@@ -31,11 +35,22 @@ enum ControlCmd : uint8_t {
     CTRL_DISCONNECT = 0x03,
 };
 
+struct ApprovedPeer {
+    std::string clientId;   // MAC address or UUID
+    std::string clientName;
+    int64_t lastConnected;  // unix timestamp (seconds)
+};
+
 class Network {
 public:
     using ConnectCallback = std::function<void(const std::string& clientName)>;
     using DisconnectCallback = std::function<void()>;
     using PauseCallback = std::function<void(bool paused)>;
+    // Called when an unknown peer wants to pair. Return value ignored;
+    // call approvePeer()/rejectPeer() from any thread.
+    using PairRequestCallback = std::function<void(const std::string& clientId, const std::string& clientName)>;
+
+    static constexpr int PEER_EXPIRY_DAYS = 30;
 
     Network();
     ~Network();
@@ -43,11 +58,21 @@ public:
     bool initialize(const std::string& serverName);
     void shutdown();
 
-    void setCallbacks(ConnectCallback onConnect, DisconnectCallback onDisconnect, PauseCallback onPause) {
+    void setCallbacks(ConnectCallback onConnect, DisconnectCallback onDisconnect,
+                      PauseCallback onPause, PairRequestCallback onPairRequest = nullptr) {
         onConnect_ = onConnect;
         onDisconnect_ = onDisconnect;
         onPause_ = onPause;
+        onPairRequest_ = onPairRequest;
     }
+
+    // Call from any thread to approve/reject a pending peer
+    void approvePeer(const std::string& clientId);
+    void rejectPeer(const std::string& clientId);
+
+    // Peer management
+    std::map<std::string, ApprovedPeer> getApprovedPeers() const;
+    void revokePeer(const std::string& clientId);
 
     bool isConnected() const { return connected_; }
     bool isPaused() const { return paused_; }
@@ -59,13 +84,23 @@ public:
     void sendKeepalive();
 
     std::string getClientAddress() const;
+    std::string getServerMac() const { return macAddress_; }
 
 private:
     void discoveryThread();
     void streamThread();
     void writeHeader(uint8_t* buf, uint8_t type, uint16_t payloadLen);
+    static std::string getMacAddress();
+
+    // Peer persistence
+    void loadApprovedPeers();
+    void saveApprovedPeers();
+    bool isPeerApproved(const std::string& clientId) const;
+    void touchPeer(const std::string& clientId, const std::string& clientName);
+    std::string getPeersFilePath() const;
 
     std::string serverName_;
+    std::string macAddress_;
     SOCKET discoverySocket_ = INVALID_SOCKET;
     SOCKET streamSocket_ = INVALID_SOCKET;
 
@@ -86,4 +121,22 @@ private:
     ConnectCallback onConnect_;
     DisconnectCallback onDisconnect_;
     PauseCallback onPause_;
+    PairRequestCallback onPairRequest_;
+
+    // Approved peers (clientId -> ApprovedPeer)
+    std::map<std::string, ApprovedPeer> approvedPeers_;
+    mutable std::mutex peersMutex_;
+
+    // Pending pair request state
+    struct PendingPeer {
+        std::string clientId;
+        std::string clientName;
+        sockaddr_in addr;
+        int addrLen;
+        bool responded = false;
+        bool approved = false;
+    };
+    PendingPeer pendingPeer_;
+    std::mutex pendingMutex_;
+    std::condition_variable pendingCv_;
 };

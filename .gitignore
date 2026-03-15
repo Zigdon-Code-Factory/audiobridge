@@ -1,0 +1,76 @@
+# === Build outputs ===
+windows/build/
+flutter_app/build/
+
+# === CMake ===
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CPackConfig.cmake
+CPackSourceConfig.cmake
+_deps/
+*.vcxproj
+*.vcxproj.filters
+*.sln
+*.dir/
+
+# === Compiled binaries ===
+*.exe
+*.dll
+*.lib
+*.obj
+*.o
+*.a
+*.so
+*.pdb
+*.ilk
+*.exp
+
+# === IDE / Editor ===
+.vs/
+.vscode/
+.idea/
+*.suo
+*.user
+*.sdf
+*.opensdf
+*.cachefile
+
+# === OS junk ===
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# === Flutter / Dart ===
+flutter_app/.dart_tool/
+flutter_app/.flutter-plugins
+flutter_app/.flutter-plugins-dependencies
+flutter_app/.pub-cache/
+flutter_app/.pub/
+flutter_app/**/doc/api/
+flutter_app/**/ios/Flutter/.last_build_id
+flutter_app/app.*.symbols
+flutter_app/app.*.map.json
+flutter_app/android/app/debug
+flutter_app/android/app/profile
+flutter_app/android/app/release
+
+# === Gradle (Android) ===
+flutter_app/android/.gradle/
+flutter_app/android/app/build/
+flutter_app/android/build/
+*.apk
+*.aab
+
+# === Native build intermediates ===
+flutter_app/android/app/src/main/jniLibs/
+flutter_app/android/app/.cxx/
+flutter_app/android/.cxx/
+
+# === Opus fetched source (CMake FetchContent) ===
+windows/build/_deps/
+
+# === Logs ===
+*.log
+audiobridge_crash.log
+approved_peers.txt

@@ -182,11 +182,27 @@ void AudioCapture::resampleAndDeliver(const float* src, uint32_t srcFrames,
     // Deliver complete 480-sample frames
     const size_t chunkSize = targetFrameSize * targetChannels;
     while (resampleBuf_.size() >= chunkSize) {
-        // Copy to contiguous buffer for callback
+        // Copy to contiguous buffer for callback, clamping to [-1.0, 1.0]
+        // WASAPI loopback can deliver values outside this range when apps output
+        // hot signals or system mixing occurs. Opus expects normalized float input
+        // and distorts badly on out-of-range values (causes harsh "expanded" sound).
         std::vector<float> chunk(chunkSize);
+        bool clipped = false;
         for (size_t i = 0; i < chunkSize; i++) {
-            chunk[i] = resampleBuf_.front();
+            float sample = resampleBuf_.front();
             resampleBuf_.pop_front();
+            float absSample = sample < 0 ? -sample : sample;
+            if (absSample > peakLevel_) peakLevel_ = absSample;
+            if (sample > 1.0f) { sample = 1.0f; clipped = true; }
+            else if (sample < -1.0f) { sample = -1.0f; clipped = true; }
+            chunk[i] = sample;
+        }
+        peakSampleCount_ += targetFrameSize;
+        if (peakSampleCount_ >= PEAK_REPORT_INTERVAL) {
+            printf("\n  [Audio] Peak level: %.3f%s\n",
+                   peakLevel_, peakLevel_ > 1.0f ? " (CLIPPED!)" : "");
+            peakLevel_ = 0.0f;
+            peakSampleCount_ = 0;
         }
         callback_(chunk.data(), targetFrameSize);
     }

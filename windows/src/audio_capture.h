@@ -43,4 +43,9 @@ private:
     // Resampling accumulation buffer
     std::deque<float> resampleBuf_;
     double resamplePos_ = 0.0;
+
+    // Peak level monitoring
+    float peakLevel_ = 0.0f;
+    uint64_t peakSampleCount_ = 0;
+    static constexpr uint64_t PEAK_REPORT_INTERVAL = 48000 * 5; // every 5 seconds
 };

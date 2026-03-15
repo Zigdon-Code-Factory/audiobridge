@@ -17,9 +17,9 @@ bool OpusEncoderWrapper::initialize() {
 
     opus_encoder_ctl(encoder_, OPUS_SET_BITRATE(128000));
     opus_encoder_ctl(encoder_, OPUS_SET_SIGNAL(OPUS_SIGNAL_MUSIC));
-    opus_encoder_ctl(encoder_, OPUS_SET_COMPLEXITY(5));
+    opus_encoder_ctl(encoder_, OPUS_SET_COMPLEXITY(8));
 
-    printf("Opus encoder: 48kHz stereo, 128kbps, restricted low-delay\n");
+    printf("Opus encoder: 48kHz stereo, 128kbps, restricted low-delay, complexity 8\n");
     return true;
 }
 

@@ -20,10 +20,10 @@ static constexpr int FRAME_SIZE = 480; // 10ms at 48kHz
 static constexpr int SAMPLES_PER_FRAME = FRAME_SIZE * CHANNELS;
 static constexpr int HEADER_SIZE = 16;
 
-// Jitter buffer constants
-static constexpr int MIN_BUFFER_FRAMES = 1;  // 10ms
-static constexpr int MAX_BUFFER_FRAMES = 3;  // 30ms
-static constexpr int INITIAL_BUFFER_FRAMES = 2; // 20ms
+// Jitter buffer constants — aggressive low-latency mode
+static constexpr int MIN_BUFFER_FRAMES = 0;  // 0 = pass-through, play immediately
+static constexpr int MAX_BUFFER_FRAMES = 3;  // 30ms max — accept some glitches over huge latency
+static constexpr int INITIAL_BUFFER_FRAMES = 1; // 10ms — single-frame startup
 
 struct AudioFrame {
     int16_t samples[SAMPLES_PER_FRAME];
@@ -76,7 +76,8 @@ public:
         }
 
         // Only start playing once we have enough buffered frames
-        if (!primed_ && frames_.size() < static_cast<size_t>(targetFrames_)) {
+        // With targetFrames_ == 0, this is always satisfied (pass-through)
+        if (!primed_ && targetFrames_ > 0 && frames_.size() < static_cast<size_t>(targetFrames_)) {
             return false;
         }
         primed_ = true;
@@ -87,7 +88,7 @@ public:
         // Adapt: shrink if consistently have excess
         if (frames_.size() > static_cast<size_t>(targetFrames_)) {
             earlyCount_++;
-            if (earlyCount_ >= 20 && targetFrames_ > MIN_BUFFER_FRAMES) {
+            if (earlyCount_ >= 10 && targetFrames_ > MIN_BUFFER_FRAMES) {
                 targetFrames_--;
                 earlyCount_ = 0;
                 LOGI("Jitter buffer shrunk to %d frames", targetFrames_);
@@ -146,7 +147,9 @@ public:
                ->setSampleRate(SAMPLE_RATE)
                ->setFramesPerCallback(FRAME_SIZE)
                ->setDataCallback(this)
-               ->setUsage(oboe::Usage::Media);
+               ->setUsage(oboe::Usage::Media)
+               ->setContentType(oboe::ContentType::Speech)
+               ->setBufferCapacityInFrames(FRAME_SIZE * 2);
 
         oboe::Result result = builder.openStream(stream_);
         if (result != oboe::Result::OK) {
