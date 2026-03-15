@@ -671,9 +671,10 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
   // ---- Main View (disconnected / scanning) ----
   Widget _buildMainView(ColorScheme cs) {
     final isConnected = _state == ConnectionState_.connected;
-    final isDiscovering = _state == ConnectionState_.discovering;
+    final isScanning = _state == ConnectionState_.discovering;
+    final isConnecting = _state == ConnectionState_.connecting;
     final isPairPending = _state == ConnectionState_.pairPending;
-    final isWorking = isDiscovering || _state == ConnectionState_.connecting || isPairPending;
+    final isWorking = isScanning || isConnecting || isPairPending;
     final recentServers = _knownServers.reversed.take(10).toList();
 
     return Column(
