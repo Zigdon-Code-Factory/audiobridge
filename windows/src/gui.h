@@ -48,6 +48,7 @@ public:
     using PairApproveCallback = std::function<void(const std::string& clientId)>;
     using PairDenyCallback = std::function<void(const std::string& clientId)>;
     using RevokeCallback = std::function<void(const std::string& clientId)>;
+    using DeviceChangeCallback = std::function<void(const std::wstring& deviceId)>;
 
     ServerGui();
     ~ServerGui();
@@ -63,12 +64,18 @@ public:
     void showPairRequest(const std::string& clientId, const std::string& name);
     void clearPairRequest();
     void addLogMessage(const std::string& msg);
+    void updateDevices(const std::vector<std::pair<std::wstring, std::wstring>>& devices,
+                       const std::wstring& currentId);
+    void updateOutDevices(const std::vector<std::pair<std::wstring, std::wstring>>& devices,
+                       const std::wstring& currentId);
 
     // Set callbacks
     void setJitterChangeCallback(JitterChangeCallback cb) { onJitterChange_ = cb; }
     void setPairApproveCallback(PairApproveCallback cb) { onPairApprove_ = cb; }
     void setPairDenyCallback(PairDenyCallback cb) { onPairDeny_ = cb; }
     void setRevokeCallback(RevokeCallback cb) { onRevoke_ = cb; }
+    void setDeviceChangeCallback(DeviceChangeCallback cb) { onDeviceChange_ = cb; }
+    void setOutDeviceChangeCallback(DeviceChangeCallback cb) { onOutDeviceChange_ = cb; }
 
     int getJitterBufferMs() const { return jitterBufferMs_; }
 
@@ -95,6 +102,8 @@ private:
     HWND jitterLabel_ = nullptr;
     HWND approveBtn_ = nullptr;
     HWND denyBtn_ = nullptr;
+    HWND deviceCombo_ = nullptr;
+    HWND outDeviceCombo_ = nullptr;
 
     HFONT fontTitle_ = nullptr;
     HFONT fontNormal_ = nullptr;
@@ -121,11 +130,21 @@ private:
     PairApproveCallback onPairApprove_;
     PairDenyCallback onPairDeny_;
     RevokeCallback onRevoke_;
+    DeviceChangeCallback onDeviceChange_;
+    DeviceChangeCallback onOutDeviceChange_;
+
+    // Audio device list
+    std::vector<std::pair<std::wstring, std::wstring>> audioDevices_; // id, name
+    std::wstring currentDeviceId_;
+    std::vector<std::pair<std::wstring, std::wstring>> outAudioDevices_; // id, name
+    std::wstring currentOutDeviceId_;
 
     // Control IDs
     static constexpr int IDC_JITTER_SLIDER = 1001;
     static constexpr int IDC_APPROVE_BTN = 1002;
     static constexpr int IDC_DENY_BTN = 1003;
+    static constexpr int IDC_DEVICE_COMBO = 1004;
+    static constexpr int IDC_OUT_DEVICE_COMBO = 1005;
     static constexpr int IDC_TIMER_REFRESH = 2001;
 
     // Colors

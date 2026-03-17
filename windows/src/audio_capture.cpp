@@ -16,24 +16,101 @@ AudioCapture::AudioCapture() {}
 
 AudioCapture::~AudioCapture() {
     stop();
-    if (captureClient_) captureClient_->Release();
-    if (audioClient_) audioClient_->Release();
-    if (device_) device_->Release();
-    if (enumerator_) enumerator_->Release();
+    cleanup();
+    if (enumerator_) { enumerator_->Release(); enumerator_ = nullptr; }
 }
 
-bool AudioCapture::initialize() {
+void AudioCapture::cleanup() {
+    if (captureClient_) { captureClient_->Release(); captureClient_ = nullptr; }
+    if (audioClient_) { audioClient_->Release(); audioClient_ = nullptr; }
+    if (device_) { device_->Release(); device_ = nullptr; }
+    resampleBuf_.clear();
+    resamplePos_ = 0.0;
+    peakLevel_ = 0.0f;
+    peakSampleCount_ = 0;
+    sampleRate_ = 0;
+    channels_ = 0;
+}
+
+std::vector<AudioDeviceInfo> AudioCapture::getDevices() {
+    std::vector<AudioDeviceInfo> devices;
+
+    IMMDeviceEnumerator* enumerator = nullptr;
     HRESULT hr = CoCreateInstance(CLSID_MMDeviceEnumerator, nullptr,
                                   CLSCTX_ALL, IID_IMMDeviceEnumerator,
-                                  (void**)&enumerator_);
+                                  (void**)&enumerator);
+    if (FAILED(hr)) return devices;
+
+    IMMDeviceCollection* collection = nullptr;
+    hr = enumerator->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &collection);
     if (FAILED(hr)) {
-        printf("Failed to create device enumerator: 0x%08lx\n", hr);
-        return false;
+        enumerator->Release();
+        return devices;
     }
 
-    hr = enumerator_->GetDefaultAudioEndpoint(eRender, eConsole, &device_);
+    UINT count = 0;
+    collection->GetCount(&count);
+
+    for (UINT i = 0; i < count; i++) {
+        IMMDevice* device = nullptr;
+        hr = collection->Item(i, &device);
+        if (FAILED(hr)) continue;
+
+        LPWSTR deviceId = nullptr;
+        hr = device->GetId(&deviceId);
+        if (FAILED(hr)) {
+            device->Release();
+            continue;
+        }
+
+        IPropertyStore* props = nullptr;
+        hr = device->OpenPropertyStore(STGM_READ, &props);
+        if (FAILED(hr)) {
+            CoTaskMemFree(deviceId);
+            device->Release();
+            continue;
+        }
+
+        PROPVARIANT varName;
+        PropVariantInit(&varName);
+        hr = props->GetValue(PKEY_Device_FriendlyName, &varName);
+
+        AudioDeviceInfo info;
+        info.id = deviceId;
+        info.name = (hr == S_OK && varName.vt == VT_LPWSTR) ? varName.pwszVal : L"Unknown Device";
+        devices.push_back(info);
+
+        PropVariantClear(&varName);
+        props->Release();
+        CoTaskMemFree(deviceId);
+        device->Release();
+    }
+
+    collection->Release();
+    enumerator->Release();
+
+    return devices;
+}
+
+bool AudioCapture::initialize(const std::wstring& deviceId) {
+    if (!enumerator_) {
+        HRESULT hr = CoCreateInstance(CLSID_MMDeviceEnumerator, nullptr,
+                                      CLSCTX_ALL, IID_IMMDeviceEnumerator,
+                                      (void**)&enumerator_);
+        if (FAILED(hr)) {
+            printf("Failed to create device enumerator: 0x%08lx\n", hr);
+            return false;
+        }
+    }
+
+    HRESULT hr;
+    if (deviceId.empty()) {
+        hr = enumerator_->GetDefaultAudioEndpoint(eRender, eConsole, &device_);
+    } else {
+        hr = enumerator_->GetDevice(deviceId.c_str(), &device_);
+    }
     if (FAILED(hr)) {
-        printf("Failed to get default audio endpoint: 0x%08lx\n", hr);
+        printf("Failed to get audio endpoint: 0x%08lx\n", hr);
         return false;
     }
 
@@ -108,7 +185,13 @@ void AudioCapture::captureThread() {
     while (running_) {
         UINT32 packetLength = 0;
         HRESULT hr = captureClient_->GetNextPacketSize(&packetLength);
-        if (FAILED(hr)) break;
+        if (FAILED(hr)) {
+            if (hr == AUDCLNT_E_DEVICE_INVALIDATED) {
+                printf("Audio device invalidated\n");
+                if (onDeviceInvalidated_) onDeviceInvalidated_();
+            }
+            break;
+        }
 
         while (packetLength > 0) {
             BYTE* data = nullptr;

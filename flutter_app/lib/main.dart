@@ -86,6 +86,7 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
   String _serverMac = '';
   double _latencyMs = 0.0;
   String _deviceId = '';
+  bool _isRecording = true; // default on
 
   RawDatagramSocket? _discoverySocket;
   RawDatagramSocket? _audioSocket;
@@ -390,6 +391,15 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
       }
 
       await _channel.invokeMethod('startAudio');
+      if (_isRecording) {
+         try {
+           await _channel.invokeMethod('startRecording', {
+             'ip': address.address,
+             'port': port,
+           });
+         } catch (_) {}
+      }
+      
       _recordConnection(name, mac, address.address);
 
       setState(() {
@@ -476,6 +486,33 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
     _audioSocket?.send(packet, address, port);
   }
 
+  Future<void> _toggleMic(bool enable) async {
+    setState(() {
+      _isRecording = enable;
+    });
+    
+    if (_state != ConnectionState_.connected || _serverAddress.isEmpty) return;
+
+    if (enable) {
+      try {
+         await _channel.invokeMethod('startRecording', {
+           'ip': _serverAddress,
+           'port': 4012,
+         });
+      } catch (e) {
+         if (mounted) {
+           ScaffoldMessenger.of(context).showSnackBar(
+             SnackBar(content: Text('Failed to start mic: $e')),
+           );
+         }
+      }
+    } else {
+      try {
+        await _channel.invokeMethod('stopRecording');
+      } catch (_) {}
+    }
+  }
+
   Future<void> _disconnect() async {
     _keepaliveTimer?.cancel();
     _keepaliveTimer = null;
@@ -487,6 +524,7 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
 
     try {
       await _channel.invokeMethod('stopAudio');
+      await _channel.invokeMethod('stopRecording');
     } catch (_) {}
 
     if (_audioSocket != null && _serverAddress.isNotEmpty) {
@@ -643,6 +681,45 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
                 ],
               ),
             ),
+            const SizedBox(height: 32),
+
+            // Microphone Toggle
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
+              decoration: BoxDecoration(
+                color: _isRecording ? cs.primaryContainer : cs.surfaceContainerHighest,
+                borderRadius: BorderRadius.circular(16),
+                border: Border.all(
+                  color: _isRecording 
+                      ? cs.primary.withOpacity(0.5) 
+                      : cs.outlineVariant.withOpacity(0.3)
+                ),
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(
+                    _isRecording ? Icons.mic_rounded : Icons.mic_off_rounded,
+                    color: _isRecording ? cs.onPrimaryContainer : cs.onSurfaceVariant,
+                  ),
+                  const SizedBox(width: 12),
+                  Text(
+                    'Microphone',
+                    style: TextStyle(
+                      fontWeight: FontWeight.w600,
+                      color: _isRecording ? cs.onPrimaryContainer : cs.onSurfaceVariant,
+                    ),
+                  ),
+                  const SizedBox(width: 16),
+                  Switch(
+                    value: _isRecording,
+                    onChanged: _toggleMic,
+                    activeColor: cs.primary,
+                  ),
+                ],
+              ),
+            ),
+            
             const SizedBox(height: 48),
 
             // Disconnect button

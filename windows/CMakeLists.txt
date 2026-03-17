@@ -19,7 +19,9 @@ FetchContent_MakeAvailable(opus)
 add_executable(audiobridge WIN32
     src/main.cpp
     src/audio_capture.cpp
+    src/audio_render.cpp
     src/opus_encoder.cpp
+    src/opus_decoder.cpp
     src/network.cpp
     src/gui.cpp
 )

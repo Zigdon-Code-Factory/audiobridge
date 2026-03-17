@@ -265,6 +265,14 @@ void Network::streamThread() {
 
             // Binary packet from client
             if (connected_ && received >= 16) {
+                // Verify sender IP matches connected client (port may differ for mic socket)
+                bool sameClient;
+                {
+                    std::lock_guard<std::mutex> lock(clientMutex_);
+                    sameClient = (senderAddr.sin_addr.s_addr == clientAddr_.sin_addr.s_addr);
+                }
+                if (!sameClient) continue;
+
                 lastClientPacket_ = std::chrono::steady_clock::now();
 
                 uint8_t type = (uint8_t)buf[1];
@@ -280,6 +288,12 @@ void Network::streamThread() {
                         connected_ = false;
                         paused_ = false;
                         if (onDisconnect_) onDisconnect_();
+                    }
+                } else if (type == PACKET_MIC_AUDIO && received >= 16) {
+                    uint16_t payloadLen;
+                    memcpy(&payloadLen, buf + 14, 2);
+                    if (received >= 16 + payloadLen && onMicAudio_) {
+                        onMicAudio_((const uint8_t*)(buf + 16), payloadLen);
                     }
                 } else if (type == PACKET_KEEPALIVE) {
                     // Just update lastClientPacket_ (already done above)

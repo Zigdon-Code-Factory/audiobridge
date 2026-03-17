@@ -8,6 +8,12 @@
 #include <cstdint>
 #include <deque>
 #include <vector>
+#include <string>
+
+struct AudioDeviceInfo {
+    std::wstring id;
+    std::wstring name;
+};
 
 class AudioCapture {
 public:
@@ -17,9 +23,14 @@ public:
     AudioCapture();
     ~AudioCapture();
 
-    bool initialize();
+    static std::vector<AudioDeviceInfo> getDevices();
+
+    bool initialize(const std::wstring& deviceId = L"");
+    void cleanup();
     bool start(FrameCallback callback);
     void stop();
+
+    void setOnDeviceInvalidated(std::function<void()> cb) { onDeviceInvalidated_ = cb; }
 
     uint32_t getSampleRate() const { return sampleRate_; }
     uint32_t getChannels() const { return channels_; }
@@ -39,6 +50,8 @@ private:
     FrameCallback callback_;
     std::atomic<bool> running_{false};
     std::thread thread_;
+
+    std::function<void()> onDeviceInvalidated_;
 
     // Resampling accumulation buffer
     std::deque<float> resampleBuf_;

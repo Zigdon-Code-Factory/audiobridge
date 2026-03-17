@@ -9,7 +9,9 @@
 #include <fstream>
 
 #include "audio_capture.h"
+#include "audio_render.h"
 #include "opus_encoder.h"
+#include "opus_decoder.h"
 #include "network.h"
 #include "gui.h"
 
@@ -96,6 +98,21 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     }
     gui.addLogMessage("Opus encoder: 48kHz stereo, 128kbps, low-delay");
 
+    OpusDecoderWrapper decoder;
+    if (!decoder.initialize()) {
+        MessageBoxA(nullptr, "Failed to initialize Opus decoder", "AudioBridge Error", MB_OK | MB_ICONERROR);
+        CoUninitialize();
+        return 1;
+    }
+
+    AudioRender render;
+    if (!render.initialize()) { // Default device
+        // We will just log this as error, not fatal
+        gui.addLogMessage("Warning: Default playback device init failed");
+    } else {
+        render.start();
+    }
+
     Network network;
     std::atomic<uint64_t> packetsSent{0};
     std::atomic<uint64_t> bytesSent{0};
@@ -134,6 +151,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         [&](bool paused) {
             gui.addLogMessage(std::string("Stream ") + (paused ? "PAUSED" : "RESUMED"));
         },
+        [&](const uint8_t* opusData, int opusLen) {
+            float pcmOutput[960]; // Max 20ms at 48kHz mono
+            int frames = decoder.decode(opusData, opusLen, pcmOutput, 960);
+            if (frames > 0) {
+                render.pushAudio(pcmOutput, frames);
+            }
+        },
         [&](const std::string& clientId, const std::string& name) {
             gui.addLogMessage("Pair request from: " + name + " (ID: " + clientId + ")");
             gui.showPairRequest(clientId, name);
@@ -151,11 +175,20 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     // Load initial approved peers into GUI
     gui.updateApprovedPeers(network.getApprovedPeers());
 
+    // Device management state for input (capture)
+    std::wstring currentDeviceId;  // empty = default device
+    std::atomic<bool> deviceInvalidated{false};
+
+    // Device management state for output (render)
+    std::wstring currentOutDeviceId; // empty = default device
+    std::atomic<bool> outDeviceInvalidated{false};
+
     // Start capture — encode and send audio frames
     uint8_t opusBuf[4000];
     auto lastAudioSent = std::chrono::steady_clock::now();
 
-    bool captureStarted = capture.start([&](const float* data, uint32_t frameCount) {
+    // Reusable capture callback
+    AudioCapture::FrameCallback captureCallback = [&](const float* data, uint32_t frameCount) {
         if (!network.isConnected() || network.isPaused()) return;
 
         // Track peak level
@@ -172,7 +205,98 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
             packetsSent++;
             bytesSent += encoded + 16;
         }
+    };
+
+    // Helper: refresh device list in GUI for output
+    auto refreshOutDeviceList = [&]() {
+        auto devs = AudioRender::getDevices();
+        std::vector<std::pair<std::wstring, std::wstring>> devList;
+        for (const auto& d : devs) {
+            devList.push_back({d.first, d.second});
+        }
+        gui.updateOutDevices(devList, currentOutDeviceId);
+    };
+
+    auto refreshDeviceList = [&]() {
+        auto devs = AudioCapture::getDevices();
+        std::vector<std::pair<std::wstring, std::wstring>> devList;
+        for (const auto& d : devs) {
+            devList.push_back({d.id, d.name});
+        }
+        gui.updateDevices(devList, currentDeviceId);
+    };
+
+    // Helper: reinitialize audio capture with a new device
+    auto reinitAudio = [&](const std::wstring& deviceId) -> bool {
+        capture.stop();
+        capture.cleanup();
+
+        if (!capture.initialize(deviceId)) {
+            gui.addLogMessage("ERROR: Failed to initialize audio device");
+            return false;
+        }
+
+        gui.addLogMessage("Audio device: " + std::to_string(capture.getSampleRate()) + " Hz, " +
+                          std::to_string(capture.getChannels()) + " ch");
+
+        if (!capture.start(captureCallback)) {
+            gui.addLogMessage("ERROR: Failed to start audio capture");
+            return false;
+        }
+
+        refreshDeviceList();
+        return true;
+    };
+
+    // Helper: reinitialize audio render with a new device
+    auto reinitOutAudio = [&](const std::wstring& deviceId) -> bool {
+        render.stop();
+        render.cleanup();
+
+        if (!render.initialize(deviceId)) {
+            gui.addLogMessage("ERROR: Failed to initialize output device");
+            return false;
+        }
+
+        gui.addLogMessage("Output device switched");
+        
+        if (!render.start()) {
+            gui.addLogMessage("ERROR: Failed to start audio output");
+            return false;
+        }
+
+        refreshOutDeviceList();
+        return true;
+    };
+
+    // Set device invalidation callbacks
+    capture.setOnDeviceInvalidated([&]() {
+        deviceInvalidated.store(true);
     });
+
+    render.setOnDeviceInvalidated([&]() {
+        outDeviceInvalidated.store(true);
+    });
+
+    // Wire GUI device change callback
+    gui.setDeviceChangeCallback([&](const std::wstring& deviceId) {
+        currentDeviceId = deviceId;
+        gui.addLogMessage("Switching audio input device...");
+        reinitAudio(deviceId);
+    });
+
+    // Wire GUI output device change callback
+    gui.setOutDeviceChangeCallback([&](const std::wstring& deviceId) {
+        currentOutDeviceId = deviceId;
+        gui.addLogMessage("Switching audio output device...");
+        reinitOutAudio(deviceId);
+    });
+
+    // Populate initial device list
+    refreshDeviceList();
+    refreshOutDeviceList();
+
+    bool captureStarted = capture.start(captureCallback);
 
     if (!captureStarted) {
         MessageBoxA(nullptr, "Failed to start audio capture", "AudioBridge Error", MB_OK | MB_ICONERROR);
@@ -195,6 +319,32 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         }
 
         auto now = std::chrono::steady_clock::now();
+
+        // Handle input device invalidation
+        if (deviceInvalidated.exchange(false)) {
+            if (currentDeviceId.empty()) {
+                gui.addLogMessage("Default audio device changed, reinitializing...");
+                reinitAudio(L"");
+            } else {
+                gui.addLogMessage("Audio device disconnected. Select a new device.");
+                capture.stop();
+                capture.cleanup();
+                refreshDeviceList();
+            }
+        }
+
+        // Handle output device invalidation
+        if (outDeviceInvalidated.exchange(false)) {
+            if (currentOutDeviceId.empty()) {
+                gui.addLogMessage("Default output device changed, reinitializing...");
+                reinitOutAudio(L"");
+            } else {
+                gui.addLogMessage("Output device disconnected. Select a new device.");
+                render.stop();
+                render.cleanup();
+                refreshOutDeviceList();
+            }
+        }
 
         // Send keepalive every 500ms
         auto keepaliveElapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -236,6 +386,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         Sleep(5);  // ~200fps message loop, actual paint is timer-driven at ~5fps
     }
 
+    render.stop();
     capture.stop();
     network.shutdown();
     CoUninitialize();

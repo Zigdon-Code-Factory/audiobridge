@@ -162,6 +162,26 @@ void ServerGui::createControls(HWND hwnd) {
     SendMessage(jitterSlider_, TBM_SETPOS, TRUE, jitterBufferMs_);
     SendMessage(jitterSlider_, TBM_SETTICFREQ, 10, 0);
 
+    // Audio device dropdown
+    deviceCombo_ = CreateWindowExW(
+        0, L"COMBOBOX", nullptr,
+        WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
+        0, 0, 200, 300,
+        hwnd, (HMENU)IDC_DEVICE_COMBO, GetModuleHandle(nullptr), nullptr
+    );
+    SendMessage(deviceCombo_, CB_ADDSTRING, 0, (LPARAM)L"Default Device");
+    SendMessage(deviceCombo_, CB_SETCURSEL, 0, 0);
+
+    // Audio output device dropdown
+    outDeviceCombo_ = CreateWindowExW(
+        0, L"COMBOBOX", nullptr,
+        WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
+        0, 0, 200, 300,
+        hwnd, (HMENU)IDC_OUT_DEVICE_COMBO, GetModuleHandle(nullptr), nullptr
+    );
+    SendMessage(outDeviceCombo_, CB_ADDSTRING, 0, (LPARAM)L"Default Device");
+    SendMessage(outDeviceCombo_, CB_SETCURSEL, 0, 0);
+
     // Approve/Deny buttons (hidden until pair request)
     approveBtn_ = CreateWindowExW(
         0, L"BUTTON", L"\u2713 Approve",
@@ -175,6 +195,8 @@ void ServerGui::createControls(HWND hwnd) {
     );
 
     SendMessage(jitterSlider_, WM_SETFONT, (WPARAM)fontNormal_, TRUE);
+    SendMessage(deviceCombo_, WM_SETFONT, (WPARAM)fontNormal_, TRUE);
+    SendMessage(outDeviceCombo_, WM_SETFONT, (WPARAM)fontNormal_, TRUE);
     SendMessage(approveBtn_, WM_SETFONT, (WPARAM)fontBold_, TRUE);
     SendMessage(denyBtn_, WM_SETFONT, (WPARAM)fontBold_, TRUE);
 }
@@ -246,6 +268,52 @@ void ServerGui::addLogMessage(const std::string& msg) {
     }
 }
 
+void ServerGui::updateDevices(const std::vector<std::pair<std::wstring, std::wstring>>& devices,
+                              const std::wstring& currentId) {
+    {
+        std::lock_guard<std::mutex> lock(dataMutex_);
+        audioDevices_ = devices;
+        currentDeviceId_ = currentId;
+    }
+
+    if (deviceCombo_) {
+        SendMessage(deviceCombo_, CB_RESETCONTENT, 0, 0);
+        SendMessage(deviceCombo_, CB_ADDSTRING, 0, (LPARAM)L"Default Device");
+
+        int selectIndex = 0;
+        for (size_t i = 0; i < devices.size(); i++) {
+            SendMessage(deviceCombo_, CB_ADDSTRING, 0, (LPARAM)devices[i].second.c_str());
+            if (devices[i].first == currentId) {
+                selectIndex = (int)(i + 1);
+            }
+        }
+        SendMessage(deviceCombo_, CB_SETCURSEL, selectIndex, 0);
+    }
+}
+
+void ServerGui::updateOutDevices(const std::vector<std::pair<std::wstring, std::wstring>>& devices,
+                               const std::wstring& currentId) {
+    {
+        std::lock_guard<std::mutex> lock(dataMutex_);
+        outAudioDevices_ = devices;
+        currentOutDeviceId_ = currentId;
+    }
+
+    if (outDeviceCombo_) {
+        SendMessage(outDeviceCombo_, CB_RESETCONTENT, 0, 0);
+        SendMessage(outDeviceCombo_, CB_ADDSTRING, 0, (LPARAM)L"Default Device");
+
+        int selectIndex = 0;
+        for (size_t i = 0; i < devices.size(); i++) {
+            SendMessage(outDeviceCombo_, CB_ADDSTRING, 0, (LPARAM)devices[i].second.c_str());
+            if (devices[i].first == currentId) {
+                selectIndex = (int)(i + 1);
+            }
+        }
+        SendMessage(outDeviceCombo_, CB_SETCURSEL, selectIndex, 0);
+    }
+}
+
 LRESULT CALLBACK ServerGui::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     ServerGui* gui = nullptr;
     if (msg == WM_NCCREATE) {
@@ -284,7 +352,39 @@ LRESULT ServerGui::handleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         return 0;
 
     case WM_COMMAND:
-        if (LOWORD(wParam) == IDC_APPROVE_BTN) {
+        if (LOWORD(wParam) == IDC_DEVICE_COMBO && HIWORD(wParam) == CBN_SELCHANGE) {
+            int sel = (int)SendMessage(deviceCombo_, CB_GETCURSEL, 0, 0);
+            if (sel >= 0 && onDeviceChange_) {
+                std::wstring deviceId;
+                bool valid = false;
+                {
+                    std::lock_guard<std::mutex> lock(dataMutex_);
+                    if (sel == 0) {
+                        valid = true;
+                    } else if (sel - 1 < (int)audioDevices_.size()) {
+                        deviceId = audioDevices_[sel - 1].first;
+                        valid = true;
+                    }
+                }
+                if (valid) onDeviceChange_(deviceId);
+            }
+        } else if (LOWORD(wParam) == IDC_OUT_DEVICE_COMBO && HIWORD(wParam) == CBN_SELCHANGE) {
+            int sel = (int)SendMessage(outDeviceCombo_, CB_GETCURSEL, 0, 0);
+            if (sel >= 0 && onOutDeviceChange_) {
+                std::wstring deviceId;
+                bool valid = false;
+                {
+                    std::lock_guard<std::mutex> lock(dataMutex_);
+                    if (sel == 0) {
+                        valid = true;
+                    } else if (sel - 1 < (int)outAudioDevices_.size()) {
+                        deviceId = outAudioDevices_[sel - 1].first;
+                        valid = true;
+                    }
+                }
+                if (valid) onOutDeviceChange_(deviceId);
+            }
+        } else if (LOWORD(wParam) == IDC_APPROVE_BTN) {
             std::string clientId;
             {
                 std::lock_guard<std::mutex> lock(dataMutex_);
@@ -316,7 +416,8 @@ LRESULT ServerGui::handleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         return 0;
 
     case WM_CTLCOLORSTATIC:
-    case WM_CTLCOLORBTN: {
+    case WM_CTLCOLORBTN:
+    case WM_CTLCOLORLISTBOX: {
         HDC hdc = (HDC)wParam;
         SetBkColor(hdc, CLR_CARD);
         SetTextColor(hdc, CLR_TEXT);
@@ -480,6 +581,36 @@ void ServerGui::onPaint(HWND hwnd) {
         }
     }
     y += 16;
+
+    // === AUDIO DEVICE CARD ===
+    {
+        RECT cardRc = {cardMargin, y, w - cardMargin, y + 100};
+        drawRoundRect(memDC, cardRc, 10, cardBrush_, CLR_CARD_BORDER);
+
+        SelectObject(memDC, fontBold_);
+        RECT headerRc = {cardRc.left + cardPad, cardRc.top + 10, cardRc.right - cardPad, cardRc.top + 28};
+        drawColorText(memDC, L"\u266B  AUDIO DEVICES", headerRc, CLR_TEXT_DIM);
+
+        // Subheaders
+        SelectObject(memDC, fontSmall_);
+        RECT inRc = {cardRc.left + cardPad, cardRc.top + 34, cardRc.right - cardPad, cardRc.top + 50};
+        drawColorText(memDC, L"Streaming from PC (Input Device):", inRc, CLR_TEXT_DIM);
+
+        RECT outRc = {cardRc.left + cardPad, cardRc.top + 64, cardRc.right - cardPad, cardRc.top + 80};
+        drawColorText(memDC, L"Mic from Phone (Output Device):", outRc, CLR_TEXT_DIM);
+
+        // Position combo boxes inside this card
+        int labelWidth = 240;
+        if (deviceCombo_) {
+            MoveWindow(deviceCombo_, cardRc.left + cardPad + labelWidth, cardRc.top + 30,
+                       cardRc.right - cardRc.left - cardPad * 2 - labelWidth, 300, TRUE);
+        }
+        if (outDeviceCombo_) {
+            MoveWindow(outDeviceCombo_, cardRc.left + cardPad + labelWidth, cardRc.top + 60,
+                       cardRc.right - cardRc.left - cardPad * 2 - labelWidth, 300, TRUE);
+        }
+    }
+    y += 110;
 
     // === JITTER BUFFER CARD ===
     {

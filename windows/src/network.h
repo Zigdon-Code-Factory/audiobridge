@@ -27,6 +27,7 @@ enum PacketType : uint8_t {
     PACKET_AUDIO     = 0x01,
     PACKET_KEEPALIVE = 0x02,
     PACKET_CONTROL   = 0x03,
+    PACKET_MIC_AUDIO = 0x04,
 };
 
 enum ControlCmd : uint8_t {
@@ -46,6 +47,7 @@ public:
     using ConnectCallback = std::function<void(const std::string& clientName)>;
     using DisconnectCallback = std::function<void()>;
     using PauseCallback = std::function<void(bool paused)>;
+    using MicAudioCallback = std::function<void(const uint8_t* opusData, int opusLen)>;
     // Called when an unknown peer wants to pair. Return value ignored;
     // call approvePeer()/rejectPeer() from any thread.
     using PairRequestCallback = std::function<void(const std::string& clientId, const std::string& clientName)>;
@@ -59,10 +61,11 @@ public:
     void shutdown();
 
     void setCallbacks(ConnectCallback onConnect, DisconnectCallback onDisconnect,
-                      PauseCallback onPause, PairRequestCallback onPairRequest = nullptr) {
+                      PauseCallback onPause, MicAudioCallback onMicAudio, PairRequestCallback onPairRequest = nullptr) {
         onConnect_ = onConnect;
         onDisconnect_ = onDisconnect;
         onPause_ = onPause;
+        onMicAudio_ = onMicAudio;
         onPairRequest_ = onPairRequest;
     }
 
@@ -121,6 +124,7 @@ private:
     ConnectCallback onConnect_;
     DisconnectCallback onDisconnect_;
     PauseCallback onPause_;
+    MicAudioCallback onMicAudio_;
     PairRequestCallback onPairRequest_;
 
     // Approved peers (clientId -> ApprovedPeer)
