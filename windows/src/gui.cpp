@@ -30,7 +30,7 @@ static void drawRoundRect(HDC hdc, RECT rc, int radius, HBRUSH fillBrush, COLORR
 }
 
 // Helper: draw text with color
-static void drawColorText(HDC hdc, const wchar_t* text, RECT& rc, COLORREF color, 
+static void drawColorText(HDC hdc, const wchar_t* text, RECT& rc, COLORREF color,
                            UINT format = DT_LEFT | DT_SINGLELINE | DT_NOPREFIX) {
     SetTextColor(hdc, color);
     DrawTextW(hdc, text, -1, &rc, format);
@@ -63,7 +63,6 @@ static std::string formatUptime(double seconds) {
         snprintf(buf, sizeof(buf), "%ds", s);
     return buf;
 }
-
 
 ServerGui::ServerGui() {}
 
@@ -100,22 +99,21 @@ bool ServerGui::initialize(const std::string& title) {
     }
 
     // Create fonts
-    fontTitle_ = CreateFontW(22, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+    fontTitle_ = CreateFontW(20, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
                               DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                               CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
-    fontNormal_ = CreateFontW(15, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+    fontNormal_ = CreateFontW(14, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
                                DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                                CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
     fontSmall_ = CreateFontW(12, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
                               DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                               CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
-    fontMono_ = CreateFontW(13, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+    fontMono_ = CreateFontW(12, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
                              DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                              CLEARTYPE_QUALITY, FIXED_PITCH, L"Consolas");
-    fontBold_ = CreateFontW(14, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+    fontBold_ = CreateFontW(13, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
                              DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                              CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
-
     // Create brushes
     bgBrush_ = CreateSolidBrush(CLR_BG);
     cardBrush_ = CreateSolidBrush(CLR_CARD);
@@ -125,7 +123,7 @@ bool ServerGui::initialize(const std::string& title) {
     hwnd_ = CreateWindowExW(
         0, L"AudioBridgeServerGui", wtitle.c_str(),
         WS_OVERLAPPEDWINDOW,
-        CW_USEDEFAULT, CW_USEDEFAULT, 680, 820,
+        CW_USEDEFAULT, CW_USEDEFAULT, 580, 780,
         nullptr, nullptr, GetModuleHandle(nullptr), this
     );
 
@@ -151,36 +149,34 @@ bool ServerGui::initialize(const std::string& title) {
 }
 
 void ServerGui::createControls(HWND hwnd) {
-    // Jitter slider (trackbar) — will be positioned in onResize
+    // Jitter slider
     jitterSlider_ = CreateWindowExW(
         0, TRACKBAR_CLASSW, nullptr,
         WS_CHILD | WS_VISIBLE | TBS_HORZ | TBS_NOTICKS,
-        0, 0, 200, 30,
+        0, 0, 200, 25,
         hwnd, (HMENU)IDC_JITTER_SLIDER, GetModuleHandle(nullptr), nullptr
     );
-    SendMessage(jitterSlider_, TBM_SETRANGE, TRUE, MAKELPARAM(0, 50));  // 0-50ms
+    SendMessage(jitterSlider_, TBM_SETRANGE, TRUE, MAKELPARAM(0, 50));
     SendMessage(jitterSlider_, TBM_SETPOS, TRUE, jitterBufferMs_);
-    SendMessage(jitterSlider_, TBM_SETTICFREQ, 10, 0);
 
-    // Audio device dropdown
+    // Audio device dropdowns
     deviceCombo_ = CreateWindowExW(
         0, L"COMBOBOX", nullptr,
         WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
         0, 0, 200, 300,
         hwnd, (HMENU)IDC_DEVICE_COMBO, GetModuleHandle(nullptr), nullptr
     );
-    SendMessage(deviceCombo_, CB_ADDSTRING, 0, (LPARAM)L"Default Device");
-    SendMessage(deviceCombo_, CB_SETCURSEL, 0, 0);
+    SendMessageW(deviceCombo_, CB_ADDSTRING, 0, (LPARAM)L"Default Device");
+    SendMessageW(deviceCombo_, CB_SETCURSEL, 0, 0);
 
-    // Audio output device dropdown
     outDeviceCombo_ = CreateWindowExW(
         0, L"COMBOBOX", nullptr,
         WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
         0, 0, 200, 300,
         hwnd, (HMENU)IDC_OUT_DEVICE_COMBO, GetModuleHandle(nullptr), nullptr
     );
-    SendMessage(outDeviceCombo_, CB_ADDSTRING, 0, (LPARAM)L"Default Device");
-    SendMessage(outDeviceCombo_, CB_SETCURSEL, 0, 0);
+    SendMessageW(outDeviceCombo_, CB_ADDSTRING, 0, (LPARAM)L"Default Device");
+    SendMessageW(outDeviceCombo_, CB_SETCURSEL, 0, 0);
 
     // Approve/Deny buttons (hidden until pair request)
     approveBtn_ = CreateWindowExW(
@@ -233,15 +229,11 @@ void ServerGui::showPairRequest(const std::string& clientId, const std::string& 
         pairRequest_.clientName = name;
         pairRequest_.pending = true;
     }
-    // Show approve/deny buttons
     ShowWindow(approveBtn_, SW_SHOW);
     ShowWindow(denyBtn_, SW_SHOW);
 
-    // Flash the window to get attention
     FLASHWINFO fi = { sizeof(fi), hwnd_, FLASHW_ALL | FLASHW_TIMERNOFG, 5, 0 };
     FlashWindowEx(&fi);
-
-    // Also bring to front
     SetForegroundWindow(hwnd_);
 }
 
@@ -256,7 +248,6 @@ void ServerGui::clearPairRequest() {
 
 void ServerGui::addLogMessage(const std::string& msg) {
     std::lock_guard<std::mutex> lock(dataMutex_);
-    // Add timestamp
     time_t now = std::time(nullptr);
     struct tm t;
     localtime_s(&t, &now);
@@ -270,6 +261,7 @@ void ServerGui::addLogMessage(const std::string& msg) {
 
 void ServerGui::updateDevices(const std::vector<std::pair<std::wstring, std::wstring>>& devices,
                               const std::wstring& currentId) {
+    updatingDevices_ = true;
     {
         std::lock_guard<std::mutex> lock(dataMutex_);
         audioDevices_ = devices;
@@ -277,22 +269,24 @@ void ServerGui::updateDevices(const std::vector<std::pair<std::wstring, std::wst
     }
 
     if (deviceCombo_) {
-        SendMessage(deviceCombo_, CB_RESETCONTENT, 0, 0);
-        SendMessage(deviceCombo_, CB_ADDSTRING, 0, (LPARAM)L"Default Device");
+        SendMessageW(deviceCombo_, CB_RESETCONTENT, 0, 0);
+        SendMessageW(deviceCombo_, CB_ADDSTRING, 0, (LPARAM)L"Default Device");
 
         int selectIndex = 0;
         for (size_t i = 0; i < devices.size(); i++) {
-            SendMessage(deviceCombo_, CB_ADDSTRING, 0, (LPARAM)devices[i].second.c_str());
+            SendMessageW(deviceCombo_, CB_ADDSTRING, 0, (LPARAM)devices[i].second.c_str());
             if (devices[i].first == currentId) {
                 selectIndex = (int)(i + 1);
             }
         }
-        SendMessage(deviceCombo_, CB_SETCURSEL, selectIndex, 0);
+        SendMessageW(deviceCombo_, CB_SETCURSEL, selectIndex, 0);
     }
+    updatingDevices_ = false;
 }
 
 void ServerGui::updateOutDevices(const std::vector<std::pair<std::wstring, std::wstring>>& devices,
                                const std::wstring& currentId) {
+    updatingOutDevices_ = true;
     {
         std::lock_guard<std::mutex> lock(dataMutex_);
         outAudioDevices_ = devices;
@@ -300,18 +294,19 @@ void ServerGui::updateOutDevices(const std::vector<std::pair<std::wstring, std::
     }
 
     if (outDeviceCombo_) {
-        SendMessage(outDeviceCombo_, CB_RESETCONTENT, 0, 0);
-        SendMessage(outDeviceCombo_, CB_ADDSTRING, 0, (LPARAM)L"Default Device");
+        SendMessageW(outDeviceCombo_, CB_RESETCONTENT, 0, 0);
+        SendMessageW(outDeviceCombo_, CB_ADDSTRING, 0, (LPARAM)L"Default Device");
 
         int selectIndex = 0;
         for (size_t i = 0; i < devices.size(); i++) {
-            SendMessage(outDeviceCombo_, CB_ADDSTRING, 0, (LPARAM)devices[i].second.c_str());
+            SendMessageW(outDeviceCombo_, CB_ADDSTRING, 0, (LPARAM)devices[i].second.c_str());
             if (devices[i].first == currentId) {
                 selectIndex = (int)(i + 1);
             }
         }
-        SendMessage(outDeviceCombo_, CB_SETCURSEL, selectIndex, 0);
+        SendMessageW(outDeviceCombo_, CB_SETCURSEL, selectIndex, 0);
     }
+    updatingOutDevices_ = false;
 }
 
 LRESULT CALLBACK ServerGui::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -336,7 +331,7 @@ LRESULT ServerGui::handleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         return 0;
 
     case WM_ERASEBKGND:
-        return 1;  // We handle background in WM_PAINT
+        return 1;
 
     case WM_SIZE:
         onResize(hwnd, LOWORD(lParam), HIWORD(lParam));
@@ -353,6 +348,7 @@ LRESULT ServerGui::handleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
 
     case WM_COMMAND:
         if (LOWORD(wParam) == IDC_DEVICE_COMBO && HIWORD(wParam) == CBN_SELCHANGE) {
+            if (updatingDevices_) return 0; // Ignore re-entrant notifications
             int sel = (int)SendMessage(deviceCombo_, CB_GETCURSEL, 0, 0);
             if (sel >= 0 && onDeviceChange_) {
                 std::wstring deviceId;
@@ -369,6 +365,7 @@ LRESULT ServerGui::handleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                 if (valid) onDeviceChange_(deviceId);
             }
         } else if (LOWORD(wParam) == IDC_OUT_DEVICE_COMBO && HIWORD(wParam) == CBN_SELCHANGE) {
+            if (updatingOutDevices_) return 0; // Ignore re-entrant notifications
             int sel = (int)SendMessage(outDeviceCombo_, CB_GETCURSEL, 0, 0);
             if (sel >= 0 && onOutDeviceChange_) {
                 std::wstring deviceId;
@@ -411,7 +408,10 @@ LRESULT ServerGui::handleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
 
     case WM_TIMER:
         if (wParam == IDC_TIMER_REFRESH) {
-            InvalidateRect(hwnd, nullptr, FALSE);
+            // Reposition controls (connection state may have changed)
+            RECT rc;
+            GetClientRect(hwnd, &rc);
+            onResize(hwnd, rc.right, rc.bottom);
         }
         return 0;
 
@@ -434,19 +434,50 @@ LRESULT ServerGui::handleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
 }
 
 void ServerGui::onResize(HWND hwnd, int width, int height) {
-    // Position jitter slider
-    int sliderX = 150;
-    int sliderY = 340;
-    int sliderW = width - 190;
-    if (jitterSlider_) {
-        MoveWindow(jitterSlider_, sliderX, sliderY, sliderW, 25, TRUE);
+    // Reposition child controls based on current layout
+    // This must be done here, NOT in onPaint, to avoid control shrinking bugs
+    if (width > 0 && height > 0) {
+        int margin = 12;
+        int pad = 12;
+        int cardW = width - margin * 2;
+        int y = 48; // after title + separator
+
+        // Status card height
+        bool connected;
+        {
+            std::lock_guard<std::mutex> lock(dataMutex_);
+            connected = stats_.connected;
+        }
+        int statusCardH = connected ? 108 : 64;
+        y += statusCardH + 8;
+
+        // Audio devices card
+        int devCardY = y;
+        int comboX = margin + pad + 56;
+        int comboW = width - margin - pad - comboX;
+        if (deviceCombo_) MoveWindow(deviceCombo_, comboX, devCardY + 26, comboW, 300, TRUE);
+        if (outDeviceCombo_) MoveWindow(outDeviceCombo_, comboX, devCardY + 54, comboW, 300, TRUE);
+        y += 90 + 8;
+
+        // Jitter buffer card
+        int jitterCardY = y;
+        if (jitterSlider_) {
+            MoveWindow(jitterSlider_, margin + pad, jitterCardY + 28,
+                       cardW - pad * 2, 22, TRUE);
+        }
+        y += 58 + 8;
+
+        // Pair request card (conditional)
+        bool hasPairReq;
+        {
+            std::lock_guard<std::mutex> lock(dataMutex_);
+            hasPairReq = pairRequest_.pending;
+        }
+        if (hasPairReq) {
+            if (approveBtn_) MoveWindow(approveBtn_, margin + pad, y + 58, 100, 26, TRUE);
+            if (denyBtn_) MoveWindow(denyBtn_, margin + pad + 108, y + 58, 90, 26, TRUE);
+        }
     }
-
-    // Position approve/deny buttons (in pair request section area)
-    int btnY = height - 170;  // Rough position
-    if (approveBtn_) MoveWindow(approveBtn_, 30, btnY, 120, 34, TRUE);
-    if (denyBtn_) MoveWindow(denyBtn_, 160, btnY, 120, 34, TRUE);
-
     InvalidateRect(hwnd, nullptr, FALSE);
 }
 
@@ -468,352 +499,263 @@ void ServerGui::onPaint(HWND hwnd) {
     FillRect(memDC, &clientRect, bgBrush_);
     SetBkMode(memDC, TRANSPARENT);
 
-    // Title bar area
     HFONT oldFont = (HFONT)SelectObject(memDC, fontTitle_);
-    RECT titleRect = {20, 12, w - 20, 44};
-    drawColorText(memDC, L"\u266B  AudioBridge Server", titleRect, CLR_ACCENT_LIGHT);
 
-    // Version label
+    // Title
+    RECT titleRect = {20, 10, w - 20, 36};
+    drawColorText(memDC, L"AudioBridge", titleRect, CLR_ACCENT_LIGHT);
+
     SelectObject(memDC, fontSmall_);
-    RECT verRect = {w - 80, 18, w - 20, 36};
+    RECT verRect = {w - 60, 14, w - 16, 30};
     drawColorText(memDC, L"v1.0", verRect, CLR_TEXT_DIM, DT_RIGHT | DT_SINGLELINE);
 
-    // Separator
-    RECT sepRect = {20, 46, w - 20, 47};
-    FillRect(memDC, &sepRect, CreateSolidBrush(CLR_SEPARATOR));
+    // Thin separator
+    HBRUSH sepBrush = CreateSolidBrush(CLR_SEPARATOR);
+    RECT sepRect = {16, 40, w - 16, 41};
+    FillRect(memDC, &sepRect, sepBrush);
+    DeleteObject(sepBrush);
 
-    int y = 56;
-    int cardMargin = 16;
-    int cardPad = 14;
-    int cardWidth = w - cardMargin * 2;
+    int y = 48;
+    int margin = 12;
+    int pad = 12;
+    int cardW = w - margin * 2;
 
     // === STATUS CARD ===
     {
-        RECT cardRc = {cardMargin, y, w - cardMargin, y + 120};
-        drawRoundRect(memDC, cardRc, 10, cardBrush_, CLR_CARD_BORDER);
-
-        SelectObject(memDC, fontBold_);
-        RECT headerRc = {cardRc.left + cardPad, cardRc.top + 10, cardRc.right - cardPad, cardRc.top + 28};
-        drawColorText(memDC, L"\u25CF  STATUS", headerRc, CLR_TEXT_DIM);
-
         std::lock_guard<std::mutex> lock(dataMutex_);
-        SelectObject(memDC, fontNormal_);
+        bool connected = stats_.connected;
+        bool paused = stats_.paused;
 
-        // Connection status indicator
-        COLORREF statusColor = stats_.connected ? (stats_.paused ? CLR_YELLOW : CLR_GREEN) : CLR_RED;
-        std::wstring statusText = stats_.connected
-            ? (stats_.paused ? L"Paused" : L"Streaming")
-            : L"Waiting for client...";
+        int cardH = connected ? 108 : 64;
+        RECT cardRc = {margin, y, w - margin, y + cardH};
+        drawRoundRect(memDC, cardRc, 8, cardBrush_, CLR_CARD_BORDER);
 
-        // Status dot
-        HBRUSH dotBrush = CreateSolidBrush(statusColor);
-        RECT dotRc = {cardRc.left + cardPad, cardRc.top + 38, cardRc.left + cardPad + 10, cardRc.top + 48};
-        HBRUSH oldBr = (HBRUSH)SelectObject(memDC, dotBrush);
+        // Status dot + text
+        COLORREF statusColor = connected ? (paused ? CLR_YELLOW : CLR_GREEN) : CLR_TEXT_DIM;
+        std::wstring statusText = connected
+            ? (paused ? L"Paused" : L"Streaming")
+            : L"Waiting for connection";
+
+        // Dot
+        HBRUSH dotBr = CreateSolidBrush(statusColor);
         HPEN noPen = CreatePen(PS_NULL, 0, 0);
-        HPEN oldP = (HPEN)SelectObject(memDC, noPen);
-        Ellipse(memDC, dotRc.left, dotRc.top, dotRc.right, dotRc.bottom);
-        SelectObject(memDC, oldP);
-        SelectObject(memDC, oldBr);
-        DeleteObject(dotBrush);
+        HPEN prevPen = (HPEN)SelectObject(memDC, noPen);
+        HBRUSH prevBr = (HBRUSH)SelectObject(memDC, dotBr);
+        Ellipse(memDC, cardRc.left + pad, cardRc.top + 14, cardRc.left + pad + 8, cardRc.top + 22);
+        SelectObject(memDC, prevPen);
+        SelectObject(memDC, prevBr);
+        DeleteObject(dotBr);
         DeleteObject(noPen);
 
-        RECT statusRc = {cardRc.left + cardPad + 16, cardRc.top + 34, cardRc.right - cardPad, cardRc.top + 52};
-        drawColorText(memDC, statusText.c_str(), statusRc, statusColor);
+        SelectObject(memDC, fontBold_);
+        RECT stRc = {cardRc.left + pad + 14, cardRc.top + 10, cardRc.right - pad, cardRc.top + 26};
+        drawColorText(memDC, statusText.c_str(), stRc, statusColor);
 
-        if (stats_.connected) {
-            // Client name and address
+        if (connected) {
+            // Client info
             SelectObject(memDC, fontMono_);
             std::wstring clientInfo = toWide(stats_.clientName) + L"  \u2022  " + toWide(stats_.clientAddress);
-            RECT clientRc = {cardRc.left + cardPad, cardRc.top + 56, cardRc.right - cardPad, cardRc.top + 72};
-            drawColorText(memDC, clientInfo.c_str(), clientRc, CLR_TEXT);
+            RECT cRc = {cardRc.left + pad, cardRc.top + 30, cardRc.right - pad, cardRc.top + 44};
+            drawColorText(memDC, clientInfo.c_str(), cRc, CLR_TEXT);
 
-            // Stats row
-            SelectObject(memDC, fontSmall_);
-            char statsBuf[256];
-            snprintf(statsBuf, sizeof(statsBuf), 
-                     "Packets: %llu    Data: %s    Rate: %.1f kbps    Seq: %u",
-                     (unsigned long long)stats_.packetsSent, formatBytes(stats_.bytesSent).c_str(),
-                     stats_.kbps, stats_.sequenceNum);
-            std::wstring statsW = toWide(statsBuf);
-            RECT statsRc = {cardRc.left + cardPad, cardRc.top + 78, cardRc.right - cardPad, cardRc.top + 94};
-            drawColorText(memDC, statsW.c_str(), statsRc, CLR_TEXT_DIM);
+            // Audio level bar
+            int barY = cardRc.top + 50;
+            HBRUSH barBgBr = CreateSolidBrush(CLR_SEPARATOR);
+            RECT barBg = {cardRc.left + pad, barY, cardRc.right - pad, barY + 4};
+            FillRect(memDC, &barBg, barBgBr);
+            DeleteObject(barBgBr);
 
-            // Uptime and peak level
-            char extraBuf[128];
-            snprintf(extraBuf, sizeof(extraBuf), "Uptime: %s    Peak: %.3f%s",
-                     formatUptime(stats_.uptimeSeconds).c_str(),
-                     stats_.peakLevel,
-                     stats_.peakLevel > 0.95f ? " (HOT!)" : "");
-            std::wstring extraW = toWide(extraBuf);
-            RECT extraRc = {cardRc.left + cardPad, cardRc.top + 94, cardRc.right - cardPad, cardRc.top + 110};
-            drawColorText(memDC, extraW.c_str(), extraRc, CLR_TEXT_DIM);
-        } else {
-            // Server info when not connected
-            SelectObject(memDC, fontSmall_);
-            std::wstring serverInfo = L"Server: " + toWide(stats_.serverName) + L"  \u2022  MAC: " + toWide(stats_.serverMac);
-            RECT infoRc = {cardRc.left + cardPad, cardRc.top + 56, cardRc.right - cardPad, cardRc.top + 72};
-            drawColorText(memDC, serverInfo.c_str(), infoRc, CLR_TEXT_DIM);
-
-            std::wstring portInfo = L"Discovery: :4011  \u2022  Stream: :4012";
-            RECT portRc = {cardRc.left + cardPad, cardRc.top + 72, cardRc.right - cardPad, cardRc.top + 88};
-            drawColorText(memDC, portInfo.c_str(), portRc, CLR_TEXT_DIM);
-        }
-    }
-    y += 130;
-
-    // === AUDIO LEVEL BAR ===
-    {
-        std::lock_guard<std::mutex> lock(dataMutex_);
-        RECT barBg = {cardMargin, y, w - cardMargin, y + 6};
-        HBRUSH barBgBr = CreateSolidBrush(CLR_SEPARATOR);
-        FillRect(memDC, &barBg, barBgBr);
-        DeleteObject(barBgBr);
-
-        if (stats_.connected) {
             float level = stats_.peakLevel;
             if (level > 1.0f) level = 1.0f;
-            int barWidth = (int)((w - cardMargin * 2) * level);
-            COLORREF barColor = level > 0.9f ? CLR_RED : (level > 0.7f ? CLR_ORANGE : CLR_GREEN);
-            RECT barFg = {cardMargin, y, cardMargin + barWidth, y + 6};
-            HBRUSH barFgBr = CreateSolidBrush(barColor);
-            FillRect(memDC, &barFg, barFgBr);
-            DeleteObject(barFgBr);
-        }
-    }
-    y += 16;
+            int barWidth = (int)((cardW - pad * 2) * level);
+            if (barWidth > 0) {
+                COLORREF barColor = level > 0.9f ? CLR_RED : (level > 0.7f ? CLR_ORANGE : CLR_GREEN);
+                HBRUSH barFgBr = CreateSolidBrush(barColor);
+                RECT barFg = {cardRc.left + pad, barY, cardRc.left + pad + barWidth, barY + 4};
+                FillRect(memDC, &barFg, barFgBr);
+                DeleteObject(barFgBr);
+            }
 
-    // === AUDIO DEVICE CARD ===
+            // Stats row 1
+            SelectObject(memDC, fontSmall_);
+            char s1[256];
+            snprintf(s1, sizeof(s1), "%llu pkts   %s   %.0f kbps   seq %u",
+                     (unsigned long long)stats_.packetsSent, formatBytes(stats_.bytesSent).c_str(),
+                     stats_.kbps, stats_.sequenceNum);
+            std::wstring s1w = toWide(s1);
+            RECT r1 = {cardRc.left + pad, barY + 10, cardRc.right - pad, barY + 24};
+            drawColorText(memDC, s1w.c_str(), r1, CLR_TEXT_DIM);
+
+            // Stats row 2
+            char s2[128];
+            snprintf(s2, sizeof(s2), "Uptime: %s   Peak: %.3f%s",
+                     formatUptime(stats_.uptimeSeconds).c_str(),
+                     stats_.peakLevel,
+                     stats_.peakLevel > 0.95f ? " HOT" : "");
+            std::wstring s2w = toWide(s2);
+            RECT r2 = {cardRc.left + pad, barY + 24, cardRc.right - pad, barY + 38};
+            drawColorText(memDC, s2w.c_str(), r2, CLR_TEXT_DIM);
+        } else {
+            // Server info
+            SelectObject(memDC, fontSmall_);
+            std::wstring info = toWide(stats_.serverName) + L"  \u2022  " + toWide(stats_.serverMac);
+            RECT iRc = {cardRc.left + pad, cardRc.top + 32, cardRc.right - pad, cardRc.top + 46};
+            drawColorText(memDC, info.c_str(), iRc, CLR_TEXT_DIM);
+        }
+
+        y += cardH + 8;
+    }
+
+    // === AUDIO DEVICES CARD ===
     {
-        RECT cardRc = {cardMargin, y, w - cardMargin, y + 100};
-        drawRoundRect(memDC, cardRc, 10, cardBrush_, CLR_CARD_BORDER);
+        int cardH = 90;
+        RECT cardRc = {margin, y, w - margin, y + cardH};
+        drawRoundRect(memDC, cardRc, 8, cardBrush_, CLR_CARD_BORDER);
 
         SelectObject(memDC, fontBold_);
-        RECT headerRc = {cardRc.left + cardPad, cardRc.top + 10, cardRc.right - cardPad, cardRc.top + 28};
-        drawColorText(memDC, L"\u266B  AUDIO DEVICES", headerRc, CLR_TEXT_DIM);
+        RECT hdrRc = {cardRc.left + pad, cardRc.top + 8, cardRc.right - pad, cardRc.top + 22};
+        drawColorText(memDC, L"AUDIO DEVICES", hdrRc, CLR_TEXT_DIM);
 
-        // Subheaders
         SelectObject(memDC, fontSmall_);
-        RECT inRc = {cardRc.left + cardPad, cardRc.top + 34, cardRc.right - cardPad, cardRc.top + 50};
-        drawColorText(memDC, L"Streaming from PC (Input Device):", inRc, CLR_TEXT_DIM);
+        RECT lbl1 = {cardRc.left + pad, cardRc.top + 30, cardRc.left + pad + 80, cardRc.top + 44};
+        drawColorText(memDC, L"Casting:", lbl1, CLR_TEXT_DIM);
+        RECT lbl2 = {cardRc.left + pad, cardRc.top + 58, cardRc.left + pad + 80, cardRc.top + 72};
+        drawColorText(memDC, L"Receiving:", lbl2, CLR_TEXT_DIM);
 
-        RECT outRc = {cardRc.left + cardPad, cardRc.top + 64, cardRc.right - cardPad, cardRc.top + 80};
-        drawColorText(memDC, L"Mic from Phone (Output Device):", outRc, CLR_TEXT_DIM);
-
-        // Position combo boxes inside this card
-        int labelWidth = 240;
-        if (deviceCombo_) {
-            MoveWindow(deviceCombo_, cardRc.left + cardPad + labelWidth, cardRc.top + 30,
-                       cardRc.right - cardRc.left - cardPad * 2 - labelWidth, 300, TRUE);
-        }
-        if (outDeviceCombo_) {
-            MoveWindow(outDeviceCombo_, cardRc.left + cardPad + labelWidth, cardRc.top + 60,
-                       cardRc.right - cardRc.left - cardPad * 2 - labelWidth, 300, TRUE);
-        }
+        y += cardH + 8;
     }
-    y += 110;
 
     // === JITTER BUFFER CARD ===
     {
-        RECT cardRc = {cardMargin, y, w - cardMargin, y + 80};
-        drawRoundRect(memDC, cardRc, 10, cardBrush_, CLR_CARD_BORDER);
+        int cardH = 58;
+        RECT cardRc = {margin, y, w - margin, y + cardH};
+        drawRoundRect(memDC, cardRc, 8, cardBrush_, CLR_CARD_BORDER);
 
         SelectObject(memDC, fontBold_);
-        RECT headerRc = {cardRc.left + cardPad, cardRc.top + 10, cardRc.right - cardPad, cardRc.top + 28};
-        drawColorText(memDC, L"\u23F1  JITTER BUFFER", headerRc, CLR_TEXT_DIM);
+        RECT hdrRc = {cardRc.left + pad, cardRc.top + 8, cardRc.right - 60, cardRc.top + 22};
+        drawColorText(memDC, L"JITTER BUFFER", hdrRc, CLR_TEXT_DIM);
 
-        // Show current value
-        SelectObject(memDC, fontNormal_);
-        wchar_t valBuf[32];
-        swprintf(valBuf, 32, L"%d ms", jitterBufferMs_);
-        RECT valRc = {cardRc.right - 80, cardRc.top + 10, cardRc.right - cardPad, cardRc.top + 28};
+        // Value
+        wchar_t valBuf[16];
+        swprintf(valBuf, 16, L"%d ms", jitterBufferMs_);
+        RECT valRc = {cardRc.right - 60, cardRc.top + 8, cardRc.right - pad, cardRc.top + 22};
         drawColorText(memDC, valBuf, valRc, CLR_ACCENT_LIGHT, DT_RIGHT | DT_SINGLELINE);
 
-        // Slider labels
-        SelectObject(memDC, fontSmall_);
-        RECT minRc = {cardRc.left + cardPad, cardRc.top + 60, cardRc.left + 60, cardRc.top + 74};
-        drawColorText(memDC, L"0 ms", minRc, CLR_TEXT_DIM);
-        RECT maxRc = {cardRc.right - 60, cardRc.top + 60, cardRc.right - cardPad, cardRc.top + 74};
-        drawColorText(memDC, L"50 ms", maxRc, CLR_TEXT_DIM, DT_RIGHT | DT_SINGLELINE);
-
-        // Reposition slider inside this card
-        if (jitterSlider_) {
-            MoveWindow(jitterSlider_, cardRc.left + cardPad, cardRc.top + 34,
-                       cardRc.right - cardRc.left - cardPad * 2, 24, TRUE);
-        }
+        y += cardH + 8;
     }
-    y += 90;
 
-    // === CONNECTED DEVICES CARD ===
-    {
-        RECT cardRc = {cardMargin, y, w - cardMargin, y + 80};
-        drawRoundRect(memDC, cardRc, 10, cardBrush_, CLR_CARD_BORDER);
-
-        SelectObject(memDC, fontBold_);
-        RECT headerRc = {cardRc.left + cardPad, cardRc.top + 10, cardRc.right - cardPad, cardRc.top + 28};
-        drawColorText(memDC, L"\u26A1  CONNECTED DEVICES", headerRc, CLR_TEXT_DIM);
-
-        std::lock_guard<std::mutex> lock(dataMutex_);
-        if (stats_.connected) {
-            SelectObject(memDC, fontNormal_);
-            std::wstring devLine = L"\u2022  " + toWide(stats_.clientName);
-            RECT devRc = {cardRc.left + cardPad + 4, cardRc.top + 36, cardRc.right - 160, cardRc.top + 54};
-            drawColorText(memDC, devLine.c_str(), devRc, CLR_TEXT);
-
-            SelectObject(memDC, fontMono_);
-            std::wstring addrLine = toWide(stats_.clientAddress);
-            RECT addrRc = {cardRc.right - 200, cardRc.top + 36, cardRc.right - cardPad, cardRc.top + 54};
-            drawColorText(memDC, addrLine.c_str(), addrRc, CLR_TEXT_DIM, DT_RIGHT | DT_SINGLELINE);
-
-            // Status badge
-            std::wstring badge = stats_.paused ? L"PAUSED" : L"STREAMING";
-            COLORREF badgeColor = stats_.paused ? CLR_YELLOW : CLR_GREEN;
-            SelectObject(memDC, fontSmall_);
-            RECT badgeRc = {cardRc.left + cardPad + 20, cardRc.top + 56, cardRc.right - cardPad, cardRc.top + 70};
-            drawColorText(memDC, badge.c_str(), badgeRc, badgeColor);
-        } else {
-            SelectObject(memDC, fontNormal_);
-            RECT emptyRc = {cardRc.left + cardPad, cardRc.top + 36, cardRc.right - cardPad, cardRc.top + 56};
-            drawColorText(memDC, L"No devices connected", emptyRc, CLR_TEXT_DIM);
-        }
-    }
-    y += 90;
-
-    // === PAIR REQUEST CARD (only if pending) ===
-    bool hasPairRequest = false;
+    // === PAIR REQUEST CARD (conditional) ===
+    bool hasPairReq = false;
     {
         std::lock_guard<std::mutex> lock(dataMutex_);
-        hasPairRequest = pairRequest_.pending;
+        hasPairReq = pairRequest_.pending;
     }
-    if (hasPairRequest) {
-        RECT cardRc = {cardMargin, y, w - cardMargin, y + 90};
-        // Highlight border for attention
-        drawRoundRect(memDC, cardRc, 10, cardBrush_, CLR_YELLOW);
+    if (hasPairReq) {
+        int cardH = 88;
+        RECT cardRc = {margin, y, w - margin, y + cardH};
+        drawRoundRect(memDC, cardRc, 8, cardBrush_, CLR_YELLOW);
 
         SelectObject(memDC, fontBold_);
-        RECT headerRc = {cardRc.left + cardPad, cardRc.top + 10, cardRc.right - cardPad, cardRc.top + 28};
-        drawColorText(memDC, L"\u26A0  PAIRING REQUEST", headerRc, CLR_YELLOW);
+        RECT hdrRc = {cardRc.left + pad, cardRc.top + 8, cardRc.right - pad, cardRc.top + 22};
+        drawColorText(memDC, L"\u26A0  PAIRING REQUEST", hdrRc, CLR_YELLOW);
 
         std::lock_guard<std::mutex> lock(dataMutex_);
         SelectObject(memDC, fontNormal_);
         std::wstring reqText = L"\"" + toWide(pairRequest_.clientName) + L"\" wants to connect";
-        RECT reqRc = {cardRc.left + cardPad, cardRc.top + 34, cardRc.right - cardPad, cardRc.top + 52};
+        RECT reqRc = {cardRc.left + pad, cardRc.top + 26, cardRc.right - pad, cardRc.top + 42};
         drawColorText(memDC, reqText.c_str(), reqRc, CLR_TEXT);
 
         SelectObject(memDC, fontMono_);
-        std::wstring idText = L"ID: " + toWide(pairRequest_.clientId);
-        RECT idRc = {cardRc.left + cardPad, cardRc.top + 54, cardRc.right - cardPad, cardRc.top + 68};
+        std::wstring idText = L"ID: " + toWide(pairRequest_.clientId.substr(0, 20));
+        RECT idRc = {cardRc.left + pad, cardRc.top + 42, cardRc.right - pad, cardRc.top + 56};
         drawColorText(memDC, idText.c_str(), idRc, CLR_TEXT_DIM);
 
-        // Position buttons inside this card
-        if (approveBtn_) MoveWindow(approveBtn_, cardRc.left + cardPad, cardRc.top + 72, 110, 30, TRUE);
-        if (denyBtn_) MoveWindow(denyBtn_, cardRc.left + cardPad + 120, cardRc.top + 72, 100, 30, TRUE);
-
-        // Extend card to fit buttons
-        cardRc.bottom = cardRc.top + 110;
-        // Redraw with extended size
-        drawRoundRect(memDC, cardRc, 10, cardBrush_, CLR_YELLOW);
-        // Redraw text on top
-        SelectObject(memDC, fontBold_);
-        drawColorText(memDC, L"\u26A0  PAIRING REQUEST", headerRc, CLR_YELLOW);
-        SelectObject(memDC, fontNormal_);
-        drawColorText(memDC, reqText.c_str(), reqRc, CLR_TEXT);
-        SelectObject(memDC, fontMono_);
-        drawColorText(memDC, idText.c_str(), idRc, CLR_TEXT_DIM);
-
-        y += 120;
+        y += cardH + 8;
     }
 
     // === PAIRED DEVICES CARD ===
     {
-        int peerCount = 0;
-        {
-            std::lock_guard<std::mutex> lock(dataMutex_);
-            peerCount = (int)approvedPeers_.size();
-        }
-        int cardHeight = 40 + (std::max)(1, peerCount) * 22;
-        RECT cardRc = {cardMargin, y, w - cardMargin, y + cardHeight};
-        drawRoundRect(memDC, cardRc, 10, cardBrush_, CLR_CARD_BORDER);
+        std::lock_guard<std::mutex> lock(dataMutex_);
+        int peerCount = (int)approvedPeers_.size();
+        int contentH = (std::max)(1, peerCount) * 20;
+        int cardH = 32 + contentH;
+        RECT cardRc = {margin, y, w - margin, y + cardH};
+        drawRoundRect(memDC, cardRc, 8, cardBrush_, CLR_CARD_BORDER);
 
         SelectObject(memDC, fontBold_);
-        wchar_t peerHeader[64];
-        swprintf(peerHeader, 64, L"\u2605  PAIRED DEVICES (%d)", peerCount);
-        RECT headerRc = {cardRc.left + cardPad, cardRc.top + 10, cardRc.right - cardPad, cardRc.top + 28};
-        drawColorText(memDC, peerHeader, headerRc, CLR_TEXT_DIM);
+        wchar_t hdr[48];
+        swprintf(hdr, 48, L"PAIRED DEVICES  (%d)", peerCount);
+        RECT hdrRc = {cardRc.left + pad, cardRc.top + 8, cardRc.right - pad, cardRc.top + 22};
+        drawColorText(memDC, hdr, hdrRc, CLR_TEXT_DIM);
 
-        std::lock_guard<std::mutex> lock(dataMutex_);
         if (approvedPeers_.empty()) {
-            SelectObject(memDC, fontNormal_);
-            RECT emptyRc = {cardRc.left + cardPad, cardRc.top + 34, cardRc.right - cardPad, cardRc.top + 52};
-            drawColorText(memDC, L"No paired devices", emptyRc, CLR_TEXT_DIM);
+            SelectObject(memDC, fontSmall_);
+            RECT eRc = {cardRc.left + pad, cardRc.top + 26, cardRc.right - pad, cardRc.top + 40};
+            drawColorText(memDC, L"No paired devices", eRc, CLR_TEXT_DIM);
         } else {
-            int py = cardRc.top + 34;
+            int py = cardRc.top + 28;
             for (size_t i = 0; i < approvedPeers_.size(); i++) {
-                SelectObject(memDC, fontNormal_);
-                std::wstring name = L"\u2022  " + toWide(approvedPeers_[i].second);
-                RECT nameRc = {cardRc.left + cardPad + 4, py, cardRc.left + 250, py + 18};
-                drawColorText(memDC, name.c_str(), nameRc, CLR_TEXT);
-
-                // Show last connected time
-                if (i < peerTimestamps_.size()) {
-                    int64_t age = std::time(nullptr) - peerTimestamps_[i];
-                    int days = (int)(age / 86400);
-                    int hours = (int)((age % 86400) / 3600);
-                    char ageBuf[48];
-                    if (days > 0)
-                        snprintf(ageBuf, sizeof(ageBuf), "%dd ago (expires %dd)", days, 30 - days);
-                    else
-                        snprintf(ageBuf, sizeof(ageBuf), "%dh ago", hours);
-
-                    SelectObject(memDC, fontSmall_);
-                    std::wstring ageW = toWide(ageBuf);
-                    RECT ageRc = {cardRc.right - 200, py + 2, cardRc.right - cardPad, py + 16};
-                    drawColorText(memDC, ageW.c_str(), ageRc, CLR_TEXT_DIM, DT_RIGHT | DT_SINGLELINE);
-                }
+                SelectObject(memDC, fontSmall_);
+                std::wstring name = L"\u2022 " + toWide(approvedPeers_[i].second);
+                RECT nRc = {cardRc.left + pad, py, cardRc.left + 200, py + 16};
+                drawColorText(memDC, name.c_str(), nRc, CLR_TEXT);
 
                 // Truncated ID
                 SelectObject(memDC, fontMono_);
                 std::string shortId = approvedPeers_[i].first;
-                if (shortId.length() > 17) shortId = shortId.substr(0, 17);
-                std::wstring idW = toWide(shortId);
-                RECT idRc = {cardRc.left + 250, py + 2, cardRc.right - 200, py + 16};
-                drawColorText(memDC, idW.c_str(), idRc, CLR_TEXT_DIM);
+                if (shortId.length() > 12) shortId = shortId.substr(0, 12) + "...";
+                RECT idRc = {cardRc.left + 200, py + 1, cardRc.right - 100, py + 15};
+                drawColorText(memDC, toWide(shortId).c_str(), idRc, CLR_TEXT_DIM);
 
-                py += 22;
+                // Time ago
+                if (i < peerTimestamps_.size()) {
+                    int64_t age = std::time(nullptr) - peerTimestamps_[i];
+                    int days = (int)(age / 86400);
+                    int hours = (int)((age % 86400) / 3600);
+                    char ageBuf[32];
+                    if (days > 0)
+                        snprintf(ageBuf, sizeof(ageBuf), "%dd ago", days);
+                    else
+                        snprintf(ageBuf, sizeof(ageBuf), "%dh ago", hours);
+                    RECT aRc = {cardRc.right - 80, py + 1, cardRc.right - pad, py + 15};
+                    drawColorText(memDC, toWide(ageBuf).c_str(), aRc, CLR_TEXT_DIM, DT_RIGHT | DT_SINGLELINE);
+                }
+                py += 20;
             }
         }
 
-        y += cardHeight + 10;
+        y += cardH + 8;
     }
 
-    // === LOG CARD ===
+    // === LOG CARD (fills remaining space) ===
     {
-        int logHeight = h - y - 10;
-        if (logHeight < 60) logHeight = 60;
-        RECT cardRc = {cardMargin, y, w - cardMargin, y + logHeight};
-        drawRoundRect(memDC, cardRc, 10, cardBrush_, CLR_CARD_BORDER);
+        int logH = h - y - 8;
+        if (logH < 50) logH = 50;
+        RECT cardRc = {margin, y, w - margin, y + logH};
+        drawRoundRect(memDC, cardRc, 8, cardBrush_, CLR_CARD_BORDER);
 
         SelectObject(memDC, fontBold_);
-        RECT headerRc = {cardRc.left + cardPad, cardRc.top + 10, cardRc.right - cardPad, cardRc.top + 28};
-        drawColorText(memDC, L"\u25B6  LOG", headerRc, CLR_TEXT_DIM);
+        RECT hdrRc = {cardRc.left + pad, cardRc.top + 8, cardRc.right - pad, cardRc.top + 22};
+        drawColorText(memDC, L"LOG", hdrRc, CLR_TEXT_DIM);
 
         std::lock_guard<std::mutex> lock(dataMutex_);
         SelectObject(memDC, fontMono_);
-        int ly = cardRc.top + 32;
-        int maxLines = (logHeight - 40) / 16;
+        int ly = cardRc.top + 26;
+        int maxLines = (logH - 34) / 14;
         int startIdx = (int)logMessages_.size() - maxLines;
         if (startIdx < 0) startIdx = 0;
 
-        for (int i = startIdx; i < (int)logMessages_.size() && ly < cardRc.bottom - 10; i++) {
+        for (int i = startIdx; i < (int)logMessages_.size() && ly < cardRc.bottom - 6; i++) {
             std::wstring logW = toWide(logMessages_[i]);
-            RECT logRc = {cardRc.left + cardPad, ly, cardRc.right - cardPad, ly + 16};
-            drawColorText(memDC, logW.c_str(), logRc, CLR_TEXT_DIM);
-            ly += 16;
+            RECT lRc = {cardRc.left + pad, ly, cardRc.right - pad, ly + 14};
+            drawColorText(memDC, logW.c_str(), lRc, CLR_TEXT_DIM);
+            ly += 14;
         }
 
         if (logMessages_.empty()) {
-            SelectObject(memDC, fontNormal_);
-            RECT emptyRc = {cardRc.left + cardPad, cardRc.top + 36, cardRc.right - cardPad, cardRc.top + 54};
-            drawColorText(memDC, L"No log messages", emptyRc, CLR_TEXT_DIM);
+            SelectObject(memDC, fontSmall_);
+            RECT eRc = {cardRc.left + pad, cardRc.top + 28, cardRc.right - pad, cardRc.top + 42};
+            drawColorText(memDC, L"No log messages", eRc, CLR_TEXT_DIM);
         }
     }
 

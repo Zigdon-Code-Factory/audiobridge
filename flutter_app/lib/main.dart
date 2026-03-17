@@ -86,7 +86,10 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
   String _serverMac = '';
   double _latencyMs = 0.0;
   String _deviceId = '';
-  bool _isRecording = true; // default on
+  bool _isRecording = true; // mic on by default
+  bool _isMuted = false; // audio output mute
+  bool _isPaused = false; // stream paused
+  String _micSource = 'auto'; // 'auto', 'phone', 'bluetooth'
 
   RawDatagramSocket? _discoverySocket;
   RawDatagramSocket? _audioSocket;
@@ -113,6 +116,25 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
     );
     _loadHistory();
     _loadOrCreateDeviceId();
+
+    // Handle media actions from notification
+    _channel.setMethodCallHandler((call) async {
+      if (call.method == 'onMediaAction') {
+        final action = call.arguments as String?;
+        switch (action) {
+          case 'toggleMic':
+            _toggleMic(!_isRecording);
+            break;
+          case 'togglePause':
+            _togglePause();
+            break;
+          case 'disconnect':
+            _disconnect();
+            break;
+        }
+      }
+      return null;
+    });
   }
 
   @override
@@ -142,7 +164,6 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
       if (await file.exists()) {
         _deviceId = (await file.readAsString()).trim();
       } else {
-        // Generate a stable UUID-like ID
         final rng = Random.secure();
         final bytes = List<int>.generate(16, (_) => rng.nextInt(256));
         _deviceId = bytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
@@ -167,7 +188,7 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
         });
       }
     } catch (e) {
-      // First launch or corrupt file, start fresh
+      // First launch or corrupt file
     }
   }
 
@@ -175,9 +196,7 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
     try {
       final file = await _historyFile;
       await file.writeAsString(jsonEncode(_knownServers.map((s) => s.toJson()).toList()));
-    } catch (e) {
-      // Ignore write errors
-    }
+    } catch (e) {}
   }
 
   void _recordConnection(String name, String mac, String ip) {
@@ -201,7 +220,6 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
 
   Future<void> _startDiscovery() async {
     if (_state == ConnectionState_.discovering) {
-      // Already scanning — stop it
       _stopDiscovery();
       setState(() {
         _state = ConnectionState_.disconnected;
@@ -263,7 +281,6 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
         (_) => _sendDiscovery(),
       );
 
-      // Timeout after 30 seconds
       _timeoutTimer = Timer(const Duration(seconds: 30), () {
         if (_state == ConnectionState_.discovering) {
           _stopDiscovery();
@@ -326,13 +343,15 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
       _serverName = name;
       _serverMac = mac;
       _serverAddress = address.address;
+      _isPaused = false;
+      _isMuted = false;
     });
 
     _stopDiscovery();
 
     try {
       _audioSocket = await RawDatagramSocket.bind(InternetAddress.anyIPv4, 0);
-      final completer = Completer<String>(); // completes with 'accepted', 'rejected', or 'timeout'
+      final completer = Completer<String>();
       _audioSocket!.listen((event) {
         if (event == RawSocketEvent.read) {
           final datagram = _audioSocket!.receive();
@@ -344,14 +363,13 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
               return;
             }
             if (msg == 'AB_PAIR_PENDING' && !completer.isCompleted) {
-              // Server is waiting for operator approval
               if (mounted) {
                 setState(() {
                   _state = ConnectionState_.pairPending;
                   _statusMessage = 'Waiting for server approval...';
                 });
               }
-              return; // Don't complete yet — wait for AB_ACCEPT or AB_REJECT
+              return;
             }
             if (msg.startsWith('AB_REJECT') && !completer.isCompleted) {
               final reason = msg.contains('|') ? msg.split('|')[1] : 'Connection denied';
@@ -363,12 +381,11 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
         }
       });
 
-      // Send connect with device ID
       final connectMsg = Uint8List.fromList('AB_CONNECT|AudioBridge|$_deviceId'.codeUnits);
       _audioSocket!.send(connectMsg, address, port);
 
       final result = await completer.future.timeout(
-        const Duration(seconds: 35), // 30s server timeout + 5s buffer
+        const Duration(seconds: 35),
         onTimeout: () => 'timeout',
       );
 
@@ -390,22 +407,24 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
         return;
       }
 
-      await _channel.invokeMethod('startAudio');
+      await _channel.invokeMethod('startAudio', {'serverName': name});
       if (_isRecording) {
-         try {
-           await _channel.invokeMethod('startRecording', {
-             'ip': address.address,
-             'port': port,
-           });
-         } catch (_) {}
+        try {
+          await _channel.invokeMethod('startRecording', {
+            'ip': address.address,
+            'port': port,
+          });
+        } catch (_) {}
       }
-      
+
       _recordConnection(name, mac, address.address);
 
       setState(() {
         _state = ConnectionState_.connected;
         _statusMessage = 'Connected to $_serverName';
       });
+
+      _updateServiceState();
 
       _keepaliveTimer = Timer.periodic(const Duration(milliseconds: 1000), (_) {
         _sendKeepalive(address, port);
@@ -486,31 +505,104 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
     _audioSocket?.send(packet, address, port);
   }
 
+  // --- Media Controls ---
+
   Future<void> _toggleMic(bool enable) async {
     setState(() {
       _isRecording = enable;
     });
-    
+
     if (_state != ConnectionState_.connected || _serverAddress.isEmpty) return;
 
     if (enable) {
       try {
-         await _channel.invokeMethod('startRecording', {
-           'ip': _serverAddress,
-           'port': 4012,
-         });
+        await _channel.invokeMethod('startRecording', {
+          'ip': _serverAddress,
+          'port': 4012,
+          'micSource': _micSource,
+        });
       } catch (e) {
-         if (mounted) {
-           ScaffoldMessenger.of(context).showSnackBar(
-             SnackBar(content: Text('Failed to start mic: $e')),
-           );
-         }
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text('Failed to start mic: $e')),
+          );
+        }
       }
     } else {
       try {
         await _channel.invokeMethod('stopRecording');
       } catch (_) {}
     }
+    _updateServiceState();
+  }
+
+  Future<void> _switchMicSource(String source) async {
+    if (source == _micSource) return;
+    setState(() {
+      _micSource = source;
+    });
+    // Restart recording with new source if currently recording
+    if (_isRecording && _state == ConnectionState_.connected) {
+      try {
+        await _channel.invokeMethod('stopRecording');
+        await _channel.invokeMethod('startRecording', {
+          'ip': _serverAddress,
+          'port': 4012,
+          'micSource': _micSource,
+        });
+      } catch (_) {}
+    }
+  }
+
+  Future<void> _toggleMute() async {
+    setState(() {
+      _isMuted = !_isMuted;
+    });
+    try {
+      await _channel.invokeMethod('setMuted', _isMuted);
+    } catch (_) {}
+  }
+
+  Future<void> _togglePause() async {
+    if (_state != ConnectionState_.connected || _serverAddress.isEmpty) return;
+
+    setState(() {
+      _isPaused = !_isPaused;
+    });
+
+    // Send pause/resume control packet to server
+    _sendControlCommand(_isPaused ? 0x01 : 0x02); // CTRL_PAUSE or CTRL_RESUME
+    // Also send media play/pause to control Windows media
+    _sendControlCommand(0x10); // CTRL_MEDIA_PLAY_PAUSE
+    _updateServiceState();
+  }
+
+  void _sendMediaCommand(int cmd) {
+    if (_state != ConnectionState_.connected || _serverAddress.isEmpty) return;
+    _sendControlCommand(cmd);
+  }
+
+  void _sendControlCommand(int cmd) {
+    final packet = Uint8List(17);
+    packet[0] = 0x01; // version
+    packet[1] = 0x03; // control
+    packet[14] = 1; // payload length
+    packet[15] = 0;
+    packet[16] = cmd;
+
+    try {
+      _audioSocket?.send(packet, InternetAddress(_serverAddress), 4012);
+    } catch (_) {}
+  }
+
+  void _updateServiceState() {
+    try {
+      _channel.invokeMethod('updateServiceState', {
+        'micMuted': !_isRecording,
+        'paused': _isPaused,
+        'serverName': _serverName,
+      });
+    } catch (_) {}
   }
 
   Future<void> _disconnect() async {
@@ -549,6 +641,8 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
         _serverAddress = '';
         _serverMac = '';
         _statusMessage = 'Disconnected';
+        _isPaused = false;
+        _isMuted = false;
       });
     }
   }
@@ -604,34 +698,44 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
-            // Animated speaker icon
+            // Speaker icon
             Container(
-              width: 120,
-              height: 120,
+              width: 100,
+              height: 100,
               decoration: BoxDecoration(
                 shape: BoxShape.circle,
-                gradient: LinearGradient(
-                  colors: [cs.primary, cs.tertiary],
-                  begin: Alignment.topLeft,
-                  end: Alignment.bottomRight,
-                ),
-                boxShadow: [
-                  BoxShadow(
-                    color: cs.primary.withOpacity(0.4),
-                    blurRadius: 30,
-                    spreadRadius: 2,
-                  ),
-                ],
+                gradient: _isPaused
+                    ? LinearGradient(colors: [cs.surfaceContainerHighest, cs.surfaceContainerHighest])
+                    : LinearGradient(
+                        colors: [cs.primary, cs.tertiary],
+                        begin: Alignment.topLeft,
+                        end: Alignment.bottomRight,
+                      ),
+                boxShadow: _isPaused
+                    ? []
+                    : [
+                        BoxShadow(
+                          color: cs.primary.withOpacity(0.3),
+                          blurRadius: 24,
+                          spreadRadius: 2,
+                        ),
+                      ],
               ),
-              child: const Icon(Icons.volume_up_rounded, size: 56, color: Colors.white),
+              child: Icon(
+                _isPaused
+                    ? Icons.pause_rounded
+                    : (_isMuted ? Icons.volume_off_rounded : Icons.volume_up_rounded),
+                size: 48,
+                color: _isPaused ? cs.onSurface.withOpacity(0.4) : Colors.white,
+              ),
             ),
-            const SizedBox(height: 32),
+            const SizedBox(height: 24),
 
             Text(
-              'Streaming',
+              _isPaused ? 'Paused' : 'Streaming',
               style: Theme.of(context).textTheme.headlineSmall?.copyWith(
                     fontWeight: FontWeight.w300,
-                    color: cs.onSurface.withOpacity(0.6),
+                    color: cs.onSurface.withOpacity(0.5),
                   ),
             ),
             const SizedBox(height: 4),
@@ -641,29 +745,29 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
                     fontWeight: FontWeight.bold,
                   ),
             ),
-            const SizedBox(height: 4),
+            const SizedBox(height: 2),
             Text(
               _serverAddress,
               style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                    color: cs.onSurface.withOpacity(0.4),
+                    color: cs.onSurface.withOpacity(0.35),
                     fontFamily: 'monospace',
                   ),
             ),
-            const SizedBox(height: 32),
+            const SizedBox(height: 28),
 
             // Latency pill
             Container(
-              padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 14),
+              padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
               decoration: BoxDecoration(
                 color: cs.surfaceContainerHighest,
-                borderRadius: BorderRadius.circular(16),
-                border: Border.all(color: cs.outlineVariant.withOpacity(0.3)),
+                borderRadius: BorderRadius.circular(12),
+                border: Border.all(color: cs.outlineVariant.withOpacity(0.2)),
               ),
               child: Row(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  Icon(Icons.speed_rounded, size: 18, color: cs.primary),
-                  const SizedBox(width: 10),
+                  Icon(Icons.speed_rounded, size: 16, color: cs.primary),
+                  const SizedBox(width: 8),
                   Text(
                     '${_latencyMs.toStringAsFixed(0)} ms',
                     style: Theme.of(context).textTheme.titleMedium?.copyWith(
@@ -671,70 +775,132 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
                           fontWeight: FontWeight.w600,
                         ),
                   ),
-                  const SizedBox(width: 6),
-                  Text(
-                    'latency',
-                    style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                          color: cs.onSurface.withOpacity(0.5),
-                        ),
-                  ),
                 ],
               ),
             ),
             const SizedBox(height: 32),
 
-            // Microphone Toggle
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
-              decoration: BoxDecoration(
-                color: _isRecording ? cs.primaryContainer : cs.surfaceContainerHighest,
-                borderRadius: BorderRadius.circular(16),
-                border: Border.all(
-                  color: _isRecording 
-                      ? cs.primary.withOpacity(0.5) 
-                      : cs.outlineVariant.withOpacity(0.3)
+            // Media transport controls
+            Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                // Skip back
+                _buildControlButton(
+                  icon: Icons.skip_previous_rounded,
+                  label: 'Prev',
+                  isActive: true,
+                  activeColor: cs.primary,
+                  onTap: () => _sendMediaCommand(0x12), // CTRL_MEDIA_PREV
+                  cs: cs,
                 ),
-              ),
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Icon(
-                    _isRecording ? Icons.mic_rounded : Icons.mic_off_rounded,
-                    color: _isRecording ? cs.onPrimaryContainer : cs.onSurfaceVariant,
-                  ),
-                  const SizedBox(width: 12),
-                  Text(
-                    'Microphone',
-                    style: TextStyle(
-                      fontWeight: FontWeight.w600,
-                      color: _isRecording ? cs.onPrimaryContainer : cs.onSurfaceVariant,
+                const SizedBox(width: 12),
+
+                // Play/Pause button (larger, center)
+                GestureDetector(
+                  onTap: _togglePause,
+                  child: Container(
+                    width: 72,
+                    height: 72,
+                    decoration: BoxDecoration(
+                      shape: BoxShape.circle,
+                      color: _isPaused ? cs.primary : cs.surfaceContainerHighest,
+                      border: Border.all(
+                        color: _isPaused ? cs.primary : cs.outlineVariant.withOpacity(0.3),
+                        width: 2,
+                      ),
+                    ),
+                    child: Icon(
+                      _isPaused ? Icons.play_arrow_rounded : Icons.pause_rounded,
+                      size: 36,
+                      color: _isPaused ? cs.onPrimary : cs.onSurface,
                     ),
                   ),
-                  const SizedBox(width: 16),
-                  Switch(
-                    value: _isRecording,
-                    onChanged: _toggleMic,
-                    activeColor: cs.primary,
+                ),
+                const SizedBox(width: 12),
+
+                // Skip forward
+                _buildControlButton(
+                  icon: Icons.skip_next_rounded,
+                  label: 'Next',
+                  isActive: true,
+                  activeColor: cs.primary,
+                  onTap: () => _sendMediaCommand(0x11), // CTRL_MEDIA_NEXT
+                  cs: cs,
+                ),
+              ],
+            ),
+            const SizedBox(height: 16),
+
+            // Mic & Volume controls row
+            Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                _buildControlButton(
+                  icon: _isRecording ? Icons.mic_rounded : Icons.mic_off_rounded,
+                  label: _isRecording ? 'Mic On' : 'Mic Off',
+                  isActive: _isRecording,
+                  activeColor: cs.primary,
+                  onTap: () => _toggleMic(!_isRecording),
+                  cs: cs,
+                ),
+                const SizedBox(width: 24),
+                _buildControlButton(
+                  icon: _isMuted ? Icons.volume_off_rounded : Icons.volume_up_rounded,
+                  label: _isMuted ? 'Muted' : 'Sound',
+                  isActive: !_isMuted,
+                  activeColor: cs.primary,
+                  onTap: _toggleMute,
+                  cs: cs,
+                ),
+              ],
+            ),
+
+            const SizedBox(height: 20),
+
+            // Mic source selector
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+              decoration: BoxDecoration(
+                color: cs.surfaceContainerHighest,
+                borderRadius: BorderRadius.circular(12),
+                border: Border.all(color: cs.outlineVariant.withOpacity(0.2)),
+              ),
+              child: DropdownButtonHideUnderline(
+                child: DropdownButton<String>(
+                  value: _micSource,
+                  isDense: true,
+                  dropdownColor: cs.surfaceContainerHighest,
+                  icon: Icon(Icons.expand_more_rounded, size: 20, color: cs.onSurface.withOpacity(0.5)),
+                  style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                    color: cs.onSurface.withOpacity(0.7),
                   ),
-                ],
+                  items: const [
+                    DropdownMenuItem(value: 'auto', child: Text('Mic: Auto (BT if available)')),
+                    DropdownMenuItem(value: 'bluetooth', child: Text('Mic: Bluetooth')),
+                    DropdownMenuItem(value: 'phone', child: Text('Mic: Phone')),
+                  ],
+                  onChanged: (v) {
+                    if (v != null) _switchMicSource(v);
+                  },
+                ),
               ),
             ),
-            
-            const SizedBox(height: 48),
+
+            const SizedBox(height: 28),
 
             // Disconnect button
             SizedBox(
-              width: 200,
-              height: 52,
+              width: 180,
+              height: 48,
               child: OutlinedButton.icon(
                 onPressed: _disconnect,
-                icon: const Icon(Icons.stop_rounded),
-                label: const Text('Disconnect', style: TextStyle(fontSize: 16)),
+                icon: const Icon(Icons.stop_rounded, size: 20),
+                label: const Text('Disconnect', style: TextStyle(fontSize: 15)),
                 style: OutlinedButton.styleFrom(
                   foregroundColor: cs.error,
-                  side: BorderSide(color: cs.error.withOpacity(0.5)),
+                  side: BorderSide(color: cs.error.withOpacity(0.4)),
                   shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(14),
+                    borderRadius: BorderRadius.circular(12),
                   ),
                 ),
               ),
@@ -745,18 +911,60 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
     );
   }
 
+  Widget _buildControlButton({
+    required IconData icon,
+    required String label,
+    required bool isActive,
+    required Color activeColor,
+    required VoidCallback onTap,
+    required ColorScheme cs,
+  }) {
+    return GestureDetector(
+      onTap: onTap,
+      child: Column(
+        children: [
+          Container(
+            width: 56,
+            height: 56,
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              color: isActive
+                  ? activeColor.withOpacity(0.15)
+                  : cs.surfaceContainerHighest,
+              border: Border.all(
+                color: isActive
+                    ? activeColor.withOpacity(0.4)
+                    : cs.outlineVariant.withOpacity(0.2),
+              ),
+            ),
+            child: Icon(
+              icon,
+              size: 24,
+              color: isActive ? activeColor : cs.onSurface.withOpacity(0.4),
+            ),
+          ),
+          const SizedBox(height: 6),
+          Text(
+            label,
+            style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                  color: isActive ? cs.onSurface.withOpacity(0.7) : cs.onSurface.withOpacity(0.35),
+                ),
+          ),
+        ],
+      ),
+    );
+  }
+
   // ---- Main View (disconnected / scanning) ----
   Widget _buildMainView(ColorScheme cs) {
-    final isConnected = _state == ConnectionState_.connected;
     final isScanning = _state == ConnectionState_.discovering;
     final isConnecting = _state == ConnectionState_.connecting;
     final isPairPending = _state == ConnectionState_.pairPending;
-    final isWorking = isScanning || isConnecting || isPairPending;
     final recentServers = _knownServers.reversed.take(10).toList();
 
     return Column(
       children: [
-        // Header area
+        // Header
         Padding(
           padding: const EdgeInsets.fromLTRB(24, 20, 24, 0),
           child: Row(
@@ -816,9 +1024,11 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
               label: Text(
                 isConnecting
                     ? 'Connecting...'
-                    : isScanning
-                        ? 'Scanning...'
-                        : 'Scan for Servers',
+                    : isPairPending
+                        ? 'Awaiting approval...'
+                        : isScanning
+                            ? 'Scanning...'
+                            : 'Scan for Servers',
                 style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
               ),
               style: FilledButton.styleFrom(
@@ -843,14 +1053,13 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
 
         const SizedBox(height: 20),
 
-        // Content area (scrollable)
+        // Content
         Expanded(
           child: SingleChildScrollView(
             padding: const EdgeInsets.symmetric(horizontal: 24),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                // Discovered servers
                 if (isScanning && _discoveredServers.isNotEmpty) ...[
                   _buildSectionHeader(cs, 'Available Servers', Icons.wifi_rounded),
                   const SizedBox(height: 8),
@@ -878,16 +1087,14 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
                   ),
                 ],
 
-                // Recent connections
-                if (recentServers.isNotEmpty && !isConnecting) ...[
+                if (recentServers.isNotEmpty && !isConnecting && !isPairPending) ...[
                   _buildSectionHeader(cs, 'Recent', Icons.history_rounded),
                   const SizedBox(height: 8),
                   ...recentServers.map((server) => _buildHistoryCard(cs, server)),
                   const SizedBox(height: 24),
                 ],
 
-                // Empty state
-                if (recentServers.isEmpty && !isScanning && !isConnecting)
+                if (recentServers.isEmpty && !isScanning && !isConnecting && !isPairPending)
                   Padding(
                     padding: const EdgeInsets.symmetric(vertical: 48),
                     child: Center(

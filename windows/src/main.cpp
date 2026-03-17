@@ -106,8 +106,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     }
 
     AudioRender render;
-    if (!render.initialize()) { // Default device
-        // We will just log this as error, not fatal
+    if (!render.initialize()) {
         gui.addLogMessage("Warning: Default playback device init failed");
     } else {
         render.start();
@@ -122,7 +121,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     // Set up GUI callbacks
     gui.setJitterChangeCallback([&](int bufferMs) {
         gui.addLogMessage("Jitter buffer target: " + std::to_string(bufferMs) + " ms");
-        // TODO: Send jitter config to connected client via control message
     });
 
     gui.setPairApproveCallback([&](const std::string& clientId) {
@@ -152,7 +150,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
             gui.addLogMessage(std::string("Stream ") + (paused ? "PAUSED" : "RESUMED"));
         },
         [&](const uint8_t* opusData, int opusLen) {
-            float pcmOutput[960]; // Max 20ms at 48kHz mono
+            float pcmOutput[960];
             int frames = decoder.decode(opusData, opusLen, pcmOutput, 960);
             if (frames > 0) {
                 render.pushAudio(pcmOutput, frames);
@@ -161,6 +159,25 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         [&](const std::string& clientId, const std::string& name) {
             gui.addLogMessage("Pair request from: " + name + " (ID: " + clientId + ")");
             gui.showPairRequest(clientId, name);
+        },
+        [&](uint8_t cmd) {
+            WORD vk = 0;
+            const char* cmdName = "";
+            switch (cmd) {
+                case CTRL_MEDIA_PLAY_PAUSE: vk = VK_MEDIA_PLAY_PAUSE; cmdName = "Play/Pause"; break;
+                case CTRL_MEDIA_NEXT:       vk = VK_MEDIA_NEXT_TRACK; cmdName = "Next Track"; break;
+                case CTRL_MEDIA_PREV:       vk = VK_MEDIA_PREV_TRACK; cmdName = "Prev Track"; break;
+            }
+            if (vk) {
+                INPUT input[2] = {};
+                input[0].type = INPUT_KEYBOARD;
+                input[0].ki.wVk = vk;
+                input[1].type = INPUT_KEYBOARD;
+                input[1].ki.wVk = vk;
+                input[1].ki.dwFlags = KEYEVENTF_KEYUP;
+                SendInput(2, input, sizeof(INPUT));
+                gui.addLogMessage(std::string("Media: ") + cmdName);
+            }
         }
     );
 
@@ -172,22 +189,18 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     gui.addLogMessage("Network ready: discovery :4011, stream :4012");
     gui.addLogMessage("Server MAC: " + network.getServerMac());
 
-    // Load initial approved peers into GUI
     gui.updateApprovedPeers(network.getApprovedPeers());
 
-    // Device management state for input (capture)
-    std::wstring currentDeviceId;  // empty = default device
+    // Device management state
+    std::wstring currentDeviceId;
     std::atomic<bool> deviceInvalidated{false};
-
-    // Device management state for output (render)
-    std::wstring currentOutDeviceId; // empty = default device
+    std::wstring currentOutDeviceId;
     std::atomic<bool> outDeviceInvalidated{false};
 
-    // Start capture — encode and send audio frames
+    // Capture callback
     uint8_t opusBuf[4000];
     auto lastAudioSent = std::chrono::steady_clock::now();
 
-    // Reusable capture callback
     AudioCapture::FrameCallback captureCallback = [&](const float* data, uint32_t frameCount) {
         if (!network.isConnected() || network.isPaused()) return;
 
@@ -207,16 +220,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         }
     };
 
-    // Helper: refresh device list in GUI for output
-    auto refreshOutDeviceList = [&]() {
-        auto devs = AudioRender::getDevices();
-        std::vector<std::pair<std::wstring, std::wstring>> devList;
-        for (const auto& d : devs) {
-            devList.push_back({d.first, d.second});
-        }
-        gui.updateOutDevices(devList, currentOutDeviceId);
-    };
-
+    // Helper: refresh device lists in GUI
     auto refreshDeviceList = [&]() {
         auto devs = AudioCapture::getDevices();
         std::vector<std::pair<std::wstring, std::wstring>> devList;
@@ -226,14 +230,31 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         gui.updateDevices(devList, currentDeviceId);
     };
 
-    // Helper: reinitialize audio capture with a new device
+    auto refreshOutDeviceList = [&]() {
+        auto devs = AudioRender::getDevices();
+        std::vector<std::pair<std::wstring, std::wstring>> devList;
+        for (const auto& d : devs) {
+            devList.push_back({d.first, d.second});
+        }
+        gui.updateOutDevices(devList, currentOutDeviceId);
+    };
+
+    // Helper: reinitialize audio capture with error recovery
     auto reinitAudio = [&](const std::wstring& deviceId) -> bool {
         capture.stop();
         capture.cleanup();
 
         if (!capture.initialize(deviceId)) {
-            gui.addLogMessage("ERROR: Failed to initialize audio device");
-            return false;
+            gui.addLogMessage("ERROR: Failed to init device, trying default...");
+            // Fall back to default device
+            if (!deviceId.empty() && capture.initialize(L"")) {
+                currentDeviceId = L"";
+                gui.addLogMessage("Fell back to default audio device");
+            } else {
+                gui.addLogMessage("ERROR: No audio device available");
+                refreshDeviceList(); // Still refresh so user can pick a valid device
+                return false;
+            }
         }
 
         gui.addLogMessage("Audio device: " + std::to_string(capture.getSampleRate()) + " Hz, " +
@@ -241,6 +262,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
         if (!capture.start(captureCallback)) {
             gui.addLogMessage("ERROR: Failed to start audio capture");
+            refreshDeviceList();
             return false;
         }
 
@@ -248,20 +270,28 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         return true;
     };
 
-    // Helper: reinitialize audio render with a new device
+    // Helper: reinitialize audio render with error recovery
     auto reinitOutAudio = [&](const std::wstring& deviceId) -> bool {
         render.stop();
         render.cleanup();
 
         if (!render.initialize(deviceId)) {
-            gui.addLogMessage("ERROR: Failed to initialize output device");
-            return false;
+            gui.addLogMessage("ERROR: Failed to init output, trying default...");
+            if (!deviceId.empty() && render.initialize(L"")) {
+                currentOutDeviceId = L"";
+                gui.addLogMessage("Fell back to default output device");
+            } else {
+                gui.addLogMessage("ERROR: No output device available");
+                refreshOutDeviceList();
+                return false;
+            }
         }
 
         gui.addLogMessage("Output device switched");
-        
+
         if (!render.start()) {
             gui.addLogMessage("ERROR: Failed to start audio output");
+            refreshOutDeviceList();
             return false;
         }
 
@@ -278,14 +308,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         outDeviceInvalidated.store(true);
     });
 
-    // Wire GUI device change callback
+    // Wire GUI device change callbacks
     gui.setDeviceChangeCallback([&](const std::wstring& deviceId) {
         currentDeviceId = deviceId;
         gui.addLogMessage("Switching audio input device...");
         reinitAudio(deviceId);
     });
 
-    // Wire GUI output device change callback
     gui.setOutDeviceChangeCallback([&](const std::wstring& deviceId) {
         currentOutDeviceId = deviceId;
         gui.addLogMessage("Switching audio output device...");
@@ -310,9 +339,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     auto lastKeepalive = startTime;
     auto lastPeakReset = startTime;
 
-    // Main loop — GUI message pump + status updates + keepalive
+    // Main loop
     while (g_running) {
-        // Process window messages
         if (!gui.processMessages()) {
             g_running = false;
             break;
@@ -383,7 +411,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
         gui.updateStats(stats);
 
-        Sleep(5);  // ~200fps message loop, actual paint is timer-driven at ~5fps
+        Sleep(5);
     }
 
     render.stop();

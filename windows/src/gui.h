@@ -29,7 +29,7 @@ struct ServerStats {
     uint64_t bytesSent = 0;
     double kbps = 0.0;
     float peakLevel = 0.0f;
-    int jitterBufferMs = 10;  // Current jitter buffer target (ms)
+    int jitterBufferMs = 10;
     uint32_t sequenceNum = 0;
     double uptimeSeconds = 0.0;
     std::string serverName;
@@ -49,7 +49,6 @@ public:
     using PairDenyCallback = std::function<void(const std::string& clientId)>;
     using RevokeCallback = std::function<void(const std::string& clientId)>;
     using DeviceChangeCallback = std::function<void(const std::wstring& deviceId)>;
-
     ServerGui();
     ~ServerGui();
 
@@ -76,7 +75,6 @@ public:
     void setRevokeCallback(RevokeCallback cb) { onRevoke_ = cb; }
     void setDeviceChangeCallback(DeviceChangeCallback cb) { onDeviceChange_ = cb; }
     void setOutDeviceChangeCallback(DeviceChangeCallback cb) { onOutDeviceChange_ = cb; }
-
     int getJitterBufferMs() const { return jitterBufferMs_; }
 
     HWND getHwnd() const { return hwnd_; }
@@ -104,7 +102,6 @@ private:
     HWND denyBtn_ = nullptr;
     HWND deviceCombo_ = nullptr;
     HWND outDeviceCombo_ = nullptr;
-
     HFONT fontTitle_ = nullptr;
     HFONT fontNormal_ = nullptr;
     HFONT fontSmall_ = nullptr;
@@ -115,6 +112,10 @@ private:
     HBRUSH accentBrush_ = nullptr;
 
     int jitterBufferMs_ = 10;
+
+    // Re-entrancy guards for device combos
+    bool updatingDevices_ = false;
+    bool updatingOutDevices_ = false;
 
     // Thread-safe data
     mutable std::mutex dataMutex_;
@@ -132,7 +133,6 @@ private:
     RevokeCallback onRevoke_;
     DeviceChangeCallback onDeviceChange_;
     DeviceChangeCallback onOutDeviceChange_;
-
     // Audio device list
     std::vector<std::pair<std::wstring, std::wstring>> audioDevices_; // id, name
     std::wstring currentDeviceId_;
@@ -148,16 +148,16 @@ private:
     static constexpr int IDC_TIMER_REFRESH = 2001;
 
     // Colors
-    static constexpr COLORREF CLR_BG = RGB(18, 18, 24);
-    static constexpr COLORREF CLR_CARD = RGB(28, 28, 40);
-    static constexpr COLORREF CLR_CARD_BORDER = RGB(45, 45, 65);
-    static constexpr COLORREF CLR_TEXT = RGB(220, 220, 235);
-    static constexpr COLORREF CLR_TEXT_DIM = RGB(130, 130, 155);
+    static constexpr COLORREF CLR_BG = RGB(15, 15, 20);
+    static constexpr COLORREF CLR_CARD = RGB(24, 24, 34);
+    static constexpr COLORREF CLR_CARD_BORDER = RGB(38, 38, 55);
+    static constexpr COLORREF CLR_TEXT = RGB(225, 225, 240);
+    static constexpr COLORREF CLR_TEXT_DIM = RGB(120, 120, 150);
     static constexpr COLORREF CLR_ACCENT = RGB(99, 102, 241);   // Indigo
     static constexpr COLORREF CLR_ACCENT_LIGHT = RGB(129, 140, 248);
     static constexpr COLORREF CLR_GREEN = RGB(52, 211, 153);
     static constexpr COLORREF CLR_RED = RGB(248, 113, 113);
     static constexpr COLORREF CLR_YELLOW = RGB(251, 191, 36);
     static constexpr COLORREF CLR_ORANGE = RGB(251, 146, 60);
-    static constexpr COLORREF CLR_SEPARATOR = RGB(40, 40, 58);
+    static constexpr COLORREF CLR_SEPARATOR = RGB(35, 35, 50);
 };

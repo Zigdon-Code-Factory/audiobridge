@@ -34,6 +34,9 @@ enum ControlCmd : uint8_t {
     CTRL_PAUSE      = 0x01,
     CTRL_RESUME     = 0x02,
     CTRL_DISCONNECT = 0x03,
+    CTRL_MEDIA_PLAY_PAUSE = 0x10,
+    CTRL_MEDIA_NEXT       = 0x11,
+    CTRL_MEDIA_PREV       = 0x12,
 };
 
 struct ApprovedPeer {
@@ -51,6 +54,7 @@ public:
     // Called when an unknown peer wants to pair. Return value ignored;
     // call approvePeer()/rejectPeer() from any thread.
     using PairRequestCallback = std::function<void(const std::string& clientId, const std::string& clientName)>;
+    using MediaCommandCallback = std::function<void(uint8_t cmd)>;
 
     static constexpr int PEER_EXPIRY_DAYS = 30;
 
@@ -61,12 +65,15 @@ public:
     void shutdown();
 
     void setCallbacks(ConnectCallback onConnect, DisconnectCallback onDisconnect,
-                      PauseCallback onPause, MicAudioCallback onMicAudio, PairRequestCallback onPairRequest = nullptr) {
+                      PauseCallback onPause, MicAudioCallback onMicAudio,
+                      PairRequestCallback onPairRequest = nullptr,
+                      MediaCommandCallback onMediaCommand = nullptr) {
         onConnect_ = onConnect;
         onDisconnect_ = onDisconnect;
         onPause_ = onPause;
         onMicAudio_ = onMicAudio;
         onPairRequest_ = onPairRequest;
+        onMediaCommand_ = onMediaCommand;
     }
 
     // Call from any thread to approve/reject a pending peer
@@ -126,6 +133,7 @@ private:
     PauseCallback onPause_;
     MicAudioCallback onMicAudio_;
     PairRequestCallback onPairRequest_;
+    MediaCommandCallback onMediaCommand_;
 
     // Approved peers (clientId -> ApprovedPeer)
     std::map<std::string, ApprovedPeer> approvedPeers_;

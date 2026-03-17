@@ -288,6 +288,8 @@ void Network::streamThread() {
                         connected_ = false;
                         paused_ = false;
                         if (onDisconnect_) onDisconnect_();
+                    } else if (cmd >= CTRL_MEDIA_PLAY_PAUSE && cmd <= CTRL_MEDIA_PREV) {
+                        if (onMediaCommand_) onMediaCommand_(cmd);
                     }
                 } else if (type == PACKET_MIC_AUDIO && received >= 16) {
                     uint16_t payloadLen;

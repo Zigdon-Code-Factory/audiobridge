@@ -133,7 +133,9 @@ private:
 
 class AudioPlayer : public oboe::AudioStreamDataCallback, public oboe::AudioStreamErrorCallback {
 public:
-    AudioPlayer() : decoder_(nullptr), running_(false), latencyMs_(0.0) {}
+    AudioPlayer() : decoder_(nullptr), running_(false), latencyMs_(0.0), muted_(false) {}
+
+    void setMuted(bool muted) { muted_.store(muted); }
 
     bool start() {
         int error;
@@ -257,6 +259,14 @@ public:
             return oboe::DataCallbackResult::Stop;
         }
 
+        // If muted, output silence but still consume jitter buffer
+        if (muted_.load()) {
+            memset(output, 0, numFrames * CHANNELS * sizeof(int16_t));
+            AudioFrame discard;
+            while (jitterBuffer_.pop(discard)) {}
+            return oboe::DataCallbackResult::Continue;
+        }
+
         int framesWritten = 0;
         while (framesWritten < numFrames) {
             int framesToWrite = std::min(FRAME_SIZE, numFrames - framesWritten);
@@ -309,6 +319,7 @@ private:
     JitterBuffer jitterBuffer_;
     std::atomic<bool> running_;
     std::atomic<double> latencyMs_;
+    std::atomic<bool> muted_;
 };
 
 // --- AudioRecorder (Microphone to PC) ---
@@ -560,6 +571,12 @@ JNIEXPORT void JNICALL
 Java_com_audiobridge_audiobridge_MainActivity_nativeStopRecording(
         JNIEnv* env, jobject thiz) {
     g_recorder.stop();
+}
+
+JNIEXPORT void JNICALL
+Java_com_audiobridge_audiobridge_MainActivity_nativeSetMuted(
+        JNIEnv* env, jobject thiz, jboolean muted) {
+    g_player.setMuted(muted == JNI_TRUE);
 }
 
 } // extern "C"
