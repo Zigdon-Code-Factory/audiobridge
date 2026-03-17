@@ -1,24 +1,16 @@
 #pragma once
-#include <Windows.h>
-#include <CommCtrl.h>
 #include <string>
 #include <vector>
 #include <mutex>
 #include <functional>
 #include <map>
-
-#pragma comment(lib, "comctl32.lib")
-#pragma comment(lib, "uxtheme.lib")
-#pragma comment(lib, "gdi32.lib")
+#include <memory>
+#include <cstdint>
 
 // Forward declarations
 struct ApprovedPeer;
 
-struct ConnectedDevice {
-    std::string name;
-    std::string address;
-    std::string clientId;
-};
+#include "webview/webview.h"
 
 struct ServerStats {
     bool connected = false;
@@ -49,13 +41,15 @@ public:
     using PairDenyCallback = std::function<void(const std::string& clientId)>;
     using RevokeCallback = std::function<void(const std::string& clientId)>;
     using DeviceChangeCallback = std::function<void(const std::wstring& deviceId)>;
+    using TickCallback = std::function<void()>;
+
     ServerGui();
     ~ServerGui();
 
     bool initialize(const std::string& title);
 
-    // Non-blocking: process pending window messages, returns false if window closed
-    bool processMessages();
+    // Run the event loop (blocks until window closed)
+    void run();
 
     // Update data (thread-safe)
     void updateStats(const ServerStats& stats);
@@ -75,47 +69,20 @@ public:
     void setRevokeCallback(RevokeCallback cb) { onRevoke_ = cb; }
     void setDeviceChangeCallback(DeviceChangeCallback cb) { onDeviceChange_ = cb; }
     void setOutDeviceChangeCallback(DeviceChangeCallback cb) { onOutDeviceChange_ = cb; }
+    void setTickCallback(TickCallback cb) { onTick_ = cb; }
     int getJitterBufferMs() const { return jitterBufferMs_; }
 
-    HWND getHwnd() const { return hwnd_; }
-
 private:
-    static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
-    LRESULT handleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
+    void setupBindings();
+    std::string buildStateJson();
+    int getCurrentDeviceIndex() const;
+    int getCurrentOutDeviceIndex() const;
 
-    void createControls(HWND hwnd);
-    void onPaint(HWND hwnd);
-    void onResize(HWND hwnd, int width, int height);
-    void drawSection(HDC hdc, RECT rc, const wchar_t* title);
-    void drawStatusCard(HDC hdc, RECT rc);
-    void drawJitterSection(HDC hdc, RECT rc);
-    void drawConnectedSection(HDC hdc, RECT rc);
-    void drawPairedSection(HDC hdc, RECT rc);
-    void drawPairRequestSection(HDC hdc, RECT rc);
-    void drawLogSection(HDC hdc, RECT rc);
-    void refreshDisplay();
+    static std::string escapeJson(const std::string& s);
+    static std::string wideToUtf8(const std::wstring& ws);
 
-    HWND hwnd_ = nullptr;
-    HWND jitterSlider_ = nullptr;
-    HWND jitterLabel_ = nullptr;
-    HWND approveBtn_ = nullptr;
-    HWND denyBtn_ = nullptr;
-    HWND deviceCombo_ = nullptr;
-    HWND outDeviceCombo_ = nullptr;
-    HFONT fontTitle_ = nullptr;
-    HFONT fontNormal_ = nullptr;
-    HFONT fontSmall_ = nullptr;
-    HFONT fontMono_ = nullptr;
-    HFONT fontBold_ = nullptr;
-    HBRUSH bgBrush_ = nullptr;
-    HBRUSH cardBrush_ = nullptr;
-    HBRUSH accentBrush_ = nullptr;
-
+    std::unique_ptr<webview::webview> webview_;
     int jitterBufferMs_ = 10;
-
-    // Re-entrancy guards for device combos
-    bool updatingDevices_ = false;
-    bool updatingOutDevices_ = false;
 
     // Thread-safe data
     mutable std::mutex dataMutex_;
@@ -126,6 +93,15 @@ private:
     std::vector<std::string> logMessages_;
     static constexpr int MAX_LOG_MESSAGES = 50;
 
+    // Device lists
+    struct DeviceEntry { std::wstring id; std::string name; };
+    std::vector<DeviceEntry> audioDevices_;
+    std::wstring currentDeviceId_;
+    std::vector<DeviceEntry> outAudioDevices_;
+    std::wstring currentOutDeviceId_;
+    bool devicesChanged_ = true;
+    bool outDevicesChanged_ = true;
+
     // Callbacks
     JitterChangeCallback onJitterChange_;
     PairApproveCallback onPairApprove_;
@@ -133,31 +109,5 @@ private:
     RevokeCallback onRevoke_;
     DeviceChangeCallback onDeviceChange_;
     DeviceChangeCallback onOutDeviceChange_;
-    // Audio device list
-    std::vector<std::pair<std::wstring, std::wstring>> audioDevices_; // id, name
-    std::wstring currentDeviceId_;
-    std::vector<std::pair<std::wstring, std::wstring>> outAudioDevices_; // id, name
-    std::wstring currentOutDeviceId_;
-
-    // Control IDs
-    static constexpr int IDC_JITTER_SLIDER = 1001;
-    static constexpr int IDC_APPROVE_BTN = 1002;
-    static constexpr int IDC_DENY_BTN = 1003;
-    static constexpr int IDC_DEVICE_COMBO = 1004;
-    static constexpr int IDC_OUT_DEVICE_COMBO = 1005;
-    static constexpr int IDC_TIMER_REFRESH = 2001;
-
-    // Colors
-    static constexpr COLORREF CLR_BG = RGB(15, 15, 20);
-    static constexpr COLORREF CLR_CARD = RGB(24, 24, 34);
-    static constexpr COLORREF CLR_CARD_BORDER = RGB(38, 38, 55);
-    static constexpr COLORREF CLR_TEXT = RGB(225, 225, 240);
-    static constexpr COLORREF CLR_TEXT_DIM = RGB(120, 120, 150);
-    static constexpr COLORREF CLR_ACCENT = RGB(99, 102, 241);   // Indigo
-    static constexpr COLORREF CLR_ACCENT_LIGHT = RGB(129, 140, 248);
-    static constexpr COLORREF CLR_GREEN = RGB(52, 211, 153);
-    static constexpr COLORREF CLR_RED = RGB(248, 113, 113);
-    static constexpr COLORREF CLR_YELLOW = RGB(251, 191, 36);
-    static constexpr COLORREF CLR_ORANGE = RGB(251, 146, 60);
-    static constexpr COLORREF CLR_SEPARATOR = RGB(35, 35, 50);
+    TickCallback onTick_;
 };

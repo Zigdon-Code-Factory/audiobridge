@@ -17,8 +17,6 @@
 
 #pragma comment(lib, "dbghelp.lib")
 
-static std::atomic<bool> g_running{true};
-
 static std::string getCrashLogPath() {
     char exePath[MAX_PATH];
     GetModuleFileNameA(nullptr, exePath, MAX_PATH);
@@ -58,8 +56,8 @@ static LONG WINAPI CrashHandler(EXCEPTION_POINTERS* ex) {
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
     SetUnhandledExceptionFilter(CrashHandler);
 
-    // Initialize COM for WASAPI
-    HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    // Initialize COM as STA (required by WebView2)
+    HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     if (FAILED(hr)) {
         MessageBoxA(nullptr, "COM init failed", "AudioBridge Error", MB_OK | MB_ICONERROR);
         return 1;
@@ -73,7 +71,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     // Initialize GUI
     ServerGui gui;
     if (!gui.initialize(computerName)) {
-        MessageBoxA(nullptr, "Failed to create GUI window", "AudioBridge Error", MB_OK | MB_ICONERROR);
+        MessageBoxA(nullptr, "Failed to create GUI window.\nEnsure WebView2 Runtime is installed.",
+                    "AudioBridge Error", MB_OK | MB_ICONERROR);
         CoUninitialize();
         return 1;
     }
@@ -132,6 +131,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     gui.setPairDenyCallback([&](const std::string& clientId) {
         network.rejectPeer(clientId);
         gui.addLogMessage("Denied peer: " + clientId);
+    });
+
+    gui.setRevokeCallback([&](const std::string& clientId) {
+        network.revokePeer(clientId);
+        gui.addLogMessage("Revoked peer: " + clientId);
+        gui.updateApprovedPeers(network.getApprovedPeers());
     });
 
     network.setCallbacks(
@@ -246,13 +251,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
         if (!capture.initialize(deviceId)) {
             gui.addLogMessage("ERROR: Failed to init device, trying default...");
-            // Fall back to default device
             if (!deviceId.empty() && capture.initialize(L"")) {
                 currentDeviceId = L"";
                 gui.addLogMessage("Fell back to default audio device");
             } else {
                 gui.addLogMessage("ERROR: No audio device available");
-                refreshDeviceList(); // Still refresh so user can pick a valid device
+                refreshDeviceList();
                 return false;
             }
         }
@@ -335,17 +339,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     gui.addLogMessage("Audio capture started. Waiting for clients...");
 
+    // Timing state for tick callback
     auto startTime = std::chrono::steady_clock::now();
     auto lastKeepalive = startTime;
     auto lastPeakReset = startTime;
 
-    // Main loop
-    while (g_running) {
-        if (!gui.processMessages()) {
-            g_running = false;
-            break;
-        }
-
+    // Tick callback: performs all periodic work previously in the main loop
+    gui.setTickCallback([&]() {
         auto now = std::chrono::steady_clock::now();
 
         // Handle input device invalidation
@@ -410,10 +410,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         stats.serverMac = network.getServerMac();
 
         gui.updateStats(stats);
+    });
 
-        Sleep(5);
-    }
+    // Run webview event loop (blocks until window closed)
+    gui.run();
 
+    // Cleanup
     render.stop();
     capture.stop();
     network.shutdown();

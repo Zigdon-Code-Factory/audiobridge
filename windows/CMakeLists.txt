@@ -4,8 +4,9 @@ project(AudioBridge VERSION 1.0.0 LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Fetch libopus
 include(FetchContent)
+
+# Fetch libopus
 FetchContent_Declare(
     opus
     GIT_REPOSITORY https://github.com/xiph/opus.git
@@ -15,6 +16,17 @@ set(OPUS_BUILD_TESTING OFF CACHE BOOL "" FORCE)
 set(OPUS_BUILD_PROGRAMS OFF CACHE BOOL "" FORCE)
 set(OPUS_INSTALL OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(opus)
+
+# Fetch webview
+FetchContent_Declare(
+    webview
+    GIT_REPOSITORY https://github.com/webview/webview.git
+    GIT_TAG        0.12.0
+)
+set(WEBVIEW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(WEBVIEW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(WEBVIEW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(webview)
 
 add_executable(audiobridge WIN32
     src/main.cpp
@@ -33,14 +45,11 @@ target_include_directories(audiobridge PRIVATE
 
 target_link_libraries(audiobridge PRIVATE
     opus
+    webview::core
     ws2_32
     ole32
     avrt
     iphlpapi
-    comctl32
-    uxtheme
-    gdi32
-    dwmapi
 )
 
 target_compile_definitions(audiobridge PRIVATE
