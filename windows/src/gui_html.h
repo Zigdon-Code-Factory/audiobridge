@@ -275,7 +275,6 @@ input[type=range]::-webkit-slider-thumb {
         <div class="dim">Waiting for events...</div>
     </div>
 </div>
-
 <script>
 let lastLogCount = 0;
 let lastPeerJson = '';

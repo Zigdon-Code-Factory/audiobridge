@@ -86,10 +86,19 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
   String _serverMac = '';
   double _latencyMs = 0.0;
   String _deviceId = '';
+  String _deviceName = 'AudioBridge';
   bool _isRecording = true; // mic on by default
   bool _isMuted = false; // audio output mute
   bool _isPaused = false; // stream paused
   String _micSource = 'auto'; // 'auto', 'phone', 'bluetooth'
+
+  // Now playing info from server
+  String _nowPlayingTitle = '';
+  String _nowPlayingArtist = '';
+  String _nowPlayingAlbum = '';
+  int _nowPlayingStatus = 0; // 0=stopped, 1=playing, 2=paused
+  int _nowPlayingPositionMs = 0;
+  int _nowPlayingDurationMs = 0;
 
   RawDatagramSocket? _discoverySocket;
   RawDatagramSocket? _audioSocket;
@@ -116,6 +125,7 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
     );
     _loadHistory();
     _loadOrCreateDeviceId();
+    _loadDeviceName();
 
     // Handle media actions from notification
     _channel.setMethodCallHandler((call) async {
@@ -126,7 +136,7 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
             _toggleMic(!_isRecording);
             break;
           case 'togglePause':
-            _togglePause();
+            _mediaPlayPause();
             break;
           case 'disconnect':
             _disconnect();
@@ -175,6 +185,62 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
     } catch (e) {
       _deviceId = 'unknown';
     }
+  }
+
+  Future<void> _loadDeviceName() async {
+    try {
+      final dir = await _appDir;
+      final file = File('${dir.path}/device_name.txt');
+      if (await file.exists()) {
+        final name = (await file.readAsString()).trim();
+        if (name.isNotEmpty) {
+          setState(() => _deviceName = name);
+        }
+      }
+    } catch (_) {}
+  }
+
+  Future<void> _saveDeviceName(String name) async {
+    try {
+      final dir = await _appDir;
+      final file = File('${dir.path}/device_name.txt');
+      await file.writeAsString(name);
+      setState(() => _deviceName = name);
+    } catch (_) {}
+  }
+
+  void _showEditDeviceNameDialog() {
+    final controller = TextEditingController(text: _deviceName);
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Device Name'),
+        content: TextField(
+          controller: controller,
+          autofocus: true,
+          maxLength: 30,
+          decoration: const InputDecoration(
+            hintText: 'Enter device name',
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Cancel'),
+          ),
+          TextButton(
+            onPressed: () {
+              final name = controller.text.trim();
+              if (name.isNotEmpty) {
+                _saveDeviceName(name);
+              }
+              Navigator.pop(ctx);
+            },
+            child: const Text('Save'),
+          ),
+        ],
+      ),
+    );
   }
 
   Future<void> _loadHistory() async {
@@ -381,7 +447,7 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
         }
       });
 
-      final connectMsg = Uint8List.fromList('AB_CONNECT|AudioBridge|$_deviceId'.codeUnits);
+      final connectMsg = Uint8List.fromList('AB_CONNECT|$_deviceName|$_deviceId'.codeUnits);
       _audioSocket!.send(connectMsg, address, port);
 
       final result = await completer.future.timeout(
@@ -491,6 +557,22 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
           );
         }
       }
+    } else if (type == 0x05 && data.length > 16) {
+      // Media info packet
+      try {
+        final jsonStr = utf8.decode(data.sublist(16));
+        final info = jsonDecode(jsonStr) as Map<String, dynamic>;
+        if (mounted) {
+          setState(() {
+            _nowPlayingTitle = (info['t'] as String?) ?? '';
+            _nowPlayingArtist = (info['a'] as String?) ?? '';
+            _nowPlayingAlbum = (info['al'] as String?) ?? '';
+            _nowPlayingStatus = (info['s'] as int?) ?? 0;
+            _nowPlayingPositionMs = (info['p'] as int?) ?? 0;
+            _nowPlayingDurationMs = (info['d'] as int?) ?? 0;
+          });
+        }
+      } catch (_) {}
     }
   }
 
@@ -563,18 +645,8 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
     } catch (_) {}
   }
 
-  Future<void> _togglePause() async {
-    if (_state != ConnectionState_.connected || _serverAddress.isEmpty) return;
-
-    setState(() {
-      _isPaused = !_isPaused;
-    });
-
-    // Send pause/resume control packet to server
-    _sendControlCommand(_isPaused ? 0x01 : 0x02); // CTRL_PAUSE or CTRL_RESUME
-    // Also send media play/pause to control Windows media
-    _sendControlCommand(0x10); // CTRL_MEDIA_PLAY_PAUSE
-    _updateServiceState();
+  void _mediaPlayPause() {
+    _sendMediaCommand(0x10); // CTRL_MEDIA_PLAY_PAUSE
   }
 
   void _sendMediaCommand(int cmd) {
@@ -643,6 +715,12 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
         _statusMessage = 'Disconnected';
         _isPaused = false;
         _isMuted = false;
+        _nowPlayingTitle = '';
+        _nowPlayingArtist = '';
+        _nowPlayingAlbum = '';
+        _nowPlayingStatus = 0;
+        _nowPlayingPositionMs = 0;
+        _nowPlayingDurationMs = 0;
       });
     }
   }
@@ -778,7 +856,81 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
                 ],
               ),
             ),
-            const SizedBox(height: 32),
+            const SizedBox(height: 24),
+
+            // Now playing info
+            if (_nowPlayingTitle.isNotEmpty) ...[
+              Container(
+                width: double.infinity,
+                margin: const EdgeInsets.symmetric(horizontal: 20),
+                padding: const EdgeInsets.all(16),
+                decoration: BoxDecoration(
+                  color: cs.surfaceContainerHighest,
+                  borderRadius: BorderRadius.circular(14),
+                  border: Border.all(color: cs.outlineVariant.withOpacity(0.2)),
+                ),
+                child: Column(
+                  children: [
+                    Text(
+                      _nowPlayingTitle,
+                      style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                            fontWeight: FontWeight.w700,
+                          ),
+                      textAlign: TextAlign.center,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                    if (_nowPlayingArtist.isNotEmpty) ...[
+                      const SizedBox(height: 4),
+                      Text(
+                        _nowPlayingArtist,
+                        style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                              color: cs.onSurface.withOpacity(0.6),
+                            ),
+                        textAlign: TextAlign.center,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ],
+                    if (_nowPlayingDurationMs > 0) ...[
+                      const SizedBox(height: 12),
+                      ClipRRect(
+                        borderRadius: BorderRadius.circular(2),
+                        child: LinearProgressIndicator(
+                          value: (_nowPlayingPositionMs / _nowPlayingDurationMs).clamp(0.0, 1.0),
+                          minHeight: 4,
+                          backgroundColor: cs.outlineVariant.withOpacity(0.3),
+                          valueColor: AlwaysStoppedAnimation(cs.primary),
+                        ),
+                      ),
+                      const SizedBox(height: 6),
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: [
+                          Text(
+                            _formatDuration(_nowPlayingPositionMs),
+                            style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                                  color: cs.onSurface.withOpacity(0.5),
+                                  fontFamily: 'monospace',
+                                  fontSize: 11,
+                                ),
+                          ),
+                          Text(
+                            _formatDuration(_nowPlayingDurationMs),
+                            style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                                  color: cs.onSurface.withOpacity(0.5),
+                                  fontFamily: 'monospace',
+                                  fontSize: 11,
+                                ),
+                          ),
+                        ],
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+              const SizedBox(height: 16),
+            ],
 
             // Media transport controls
             Row(
@@ -797,22 +949,22 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
 
                 // Play/Pause button (larger, center)
                 GestureDetector(
-                  onTap: _togglePause,
+                  onTap: _mediaPlayPause,
                   child: Container(
                     width: 72,
                     height: 72,
                     decoration: BoxDecoration(
                       shape: BoxShape.circle,
-                      color: _isPaused ? cs.primary : cs.surfaceContainerHighest,
+                      color: cs.primary,
                       border: Border.all(
-                        color: _isPaused ? cs.primary : cs.outlineVariant.withOpacity(0.3),
+                        color: cs.primary,
                         width: 2,
                       ),
                     ),
                     child: Icon(
-                      _isPaused ? Icons.play_arrow_rounded : Icons.pause_rounded,
+                      Icons.play_arrow_rounded,
                       size: 36,
-                      color: _isPaused ? cs.onPrimary : cs.onSurface,
+                      color: cs.onPrimary,
                     ),
                   ),
                 ),
@@ -911,6 +1063,13 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
     );
   }
 
+  String _formatDuration(int ms) {
+    final totalSeconds = ms ~/ 1000;
+    final minutes = totalSeconds ~/ 60;
+    final seconds = totalSeconds % 60;
+    return '$minutes:${seconds.toString().padLeft(2, '0')}';
+  }
+
   Widget _buildControlButton({
     required IconData icon,
     required String label,
@@ -992,7 +1151,40 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
             ],
           ),
         ),
-        const SizedBox(height: 24),
+        const SizedBox(height: 16),
+
+        // Device name (tappable to edit)
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 24),
+          child: GestureDetector(
+            onTap: _showEditDeviceNameDialog,
+            child: Container(
+              width: double.infinity,
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+              decoration: BoxDecoration(
+                color: cs.surfaceContainerHighest,
+                borderRadius: BorderRadius.circular(10),
+                border: Border.all(color: cs.outlineVariant.withOpacity(0.2)),
+              ),
+              child: Row(
+                children: [
+                  Icon(Icons.badge_outlined, size: 18, color: cs.onSurface.withOpacity(0.5)),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Text(
+                      _deviceName,
+                      style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                            fontWeight: FontWeight.w500,
+                          ),
+                    ),
+                  ),
+                  Icon(Icons.edit_outlined, size: 16, color: cs.onSurface.withOpacity(0.3)),
+                ],
+              ),
+            ),
+          ),
+        ),
+        const SizedBox(height: 16),
 
         // Scan button
         Padding(

@@ -28,6 +28,7 @@ enum PacketType : uint8_t {
     PACKET_KEEPALIVE = 0x02,
     PACKET_CONTROL   = 0x03,
     PACKET_MIC_AUDIO = 0x04,
+    PACKET_MEDIA_INFO = 0x05,
 };
 
 enum ControlCmd : uint8_t {
@@ -83,6 +84,7 @@ public:
     // Peer management
     std::map<std::string, ApprovedPeer> getApprovedPeers() const;
     void revokePeer(const std::string& clientId);
+    std::string getPeerName(const std::string& clientId) const;
 
     bool isConnected() const { return connected_; }
     bool isPaused() const { return paused_; }
@@ -92,6 +94,9 @@ public:
 
     // Send keepalive
     void sendKeepalive();
+
+    // Send media info to connected client
+    void sendMediaInfo(const std::string& json);
 
     std::string getClientAddress() const;
     std::string getServerMac() const { return macAddress_; }

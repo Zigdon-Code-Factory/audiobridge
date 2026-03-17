@@ -50,6 +50,7 @@ target_link_libraries(audiobridge PRIVATE
     ole32
     avrt
     iphlpapi
+    windowsapp
 )
 
 target_compile_definitions(audiobridge PRIVATE

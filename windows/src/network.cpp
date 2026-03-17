@@ -149,7 +149,8 @@ void Network::streamThread() {
 
                 // Check if this peer is approved
                 if (!clientId.empty() && isPeerApproved(clientId)) {
-                    // Known peer — auto-accept and refresh timestamp
+                    // Known peer — auto-accept, use stored name (not client-provided)
+                    std::string storedName = getPeerName(clientId);
                     touchPeer(clientId, clientName);
 
                     {
@@ -166,8 +167,8 @@ void Network::streamThread() {
                     sendto(streamSocket_, accept, (int)strlen(accept), 0,
                            (sockaddr*)&senderAddr, addrLen);
 
-                    printf("Auto-accepted known peer: %s (%s)\n", clientName.c_str(), clientId.c_str());
-                    if (onConnect_) onConnect_(clientName);
+                    printf("Auto-accepted known peer: %s (%s)\n", storedName.c_str(), clientId.c_str());
+                    if (onConnect_) onConnect_(storedName);
                 } else if (clientId.empty()) {
                     // Legacy client without ID — accept without pairing
                     // (backwards compatible)
@@ -278,10 +279,13 @@ void Network::streamThread() {
                 uint8_t type = (uint8_t)buf[1];
                 if (type == PACKET_CONTROL && received >= 17) {
                     uint8_t cmd = (uint8_t)buf[16];
+                    printf("[NET] Control command: 0x%02X\n", cmd);
                     if (cmd == CTRL_PAUSE) {
+                        printf("[NET] -> PAUSE stream\n");
                         paused_ = true;
                         if (onPause_) onPause_(true);
                     } else if (cmd == CTRL_RESUME) {
+                        printf("[NET] -> RESUME stream\n");
                         paused_ = false;
                         if (onPause_) onPause_(false);
                     } else if (cmd == CTRL_DISCONNECT) {
@@ -289,8 +293,13 @@ void Network::streamThread() {
                         paused_ = false;
                         if (onDisconnect_) onDisconnect_();
                     } else if (cmd >= CTRL_MEDIA_PLAY_PAUSE && cmd <= CTRL_MEDIA_PREV) {
+                        printf("[NET] -> Media command 0x%02X, callback=%s\n", cmd, onMediaCommand_ ? "YES" : "NO");
                         if (onMediaCommand_) onMediaCommand_(cmd);
+                    } else {
+                        printf("[NET] -> Unknown control command 0x%02X\n", cmd);
                     }
+                } else if (type == PACKET_CONTROL && received < 17) {
+                    printf("[NET] Control packet too short: %d bytes (need 17)\n", received);
                 } else if (type == PACKET_MIC_AUDIO && received >= 16) {
                     uint16_t payloadLen;
                     memcpy(&payloadLen, buf + 14, 2);
@@ -353,6 +362,21 @@ void Network::sendKeepalive() {
 
     std::lock_guard<std::mutex> lock(clientMutex_);
     sendto(streamSocket_, (char*)packet, 16, 0,
+           (sockaddr*)&clientAddr_, sizeof(clientAddr_));
+}
+
+void Network::sendMediaInfo(const std::string& json) {
+    if (!connected_) return;
+
+    uint8_t packet[2048];
+    int payloadLen = (int)json.size();
+    if (payloadLen + 16 > (int)sizeof(packet)) return;
+
+    writeHeader(packet, PACKET_MEDIA_INFO, (uint16_t)payloadLen);
+    memcpy(packet + 16, json.c_str(), payloadLen);
+
+    std::lock_guard<std::mutex> lock(clientMutex_);
+    sendto(streamSocket_, (char*)packet, 16 + payloadLen, 0,
            (sockaddr*)&clientAddr_, sizeof(clientAddr_));
 }
 
@@ -486,12 +510,19 @@ bool Network::isPeerApproved(const std::string& clientId) const {
     return (now - it->second.lastConnected) <= expirySeconds;
 }
 
+std::string Network::getPeerName(const std::string& clientId) const {
+    std::lock_guard<std::mutex> lock(peersMutex_);
+    auto it = approvedPeers_.find(clientId);
+    if (it != approvedPeers_.end()) return it->second.clientName;
+    return "";
+}
+
 void Network::touchPeer(const std::string& clientId, const std::string& clientName) {
     std::lock_guard<std::mutex> lock(peersMutex_);
     auto it = approvedPeers_.find(clientId);
     if (it != approvedPeers_.end()) {
+        // Only update timestamp — name is locked at approval time
         it->second.lastConnected = std::time(nullptr);
-        it->second.clientName = clientName;
     } else {
         ApprovedPeer peer;
         peer.clientId = clientId;

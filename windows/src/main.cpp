@@ -15,16 +15,42 @@
 #include "network.h"
 #include "gui.h"
 
+#include <shellapi.h>
 #pragma comment(lib, "dbghelp.lib")
 
-static std::string getCrashLogPath() {
+#include <winrt/Windows.Foundation.h>
+#include <winrt/Windows.Media.Control.h>
+
+using namespace winrt::Windows::Media::Control;
+
+static std::string getExeDir() {
     char exePath[MAX_PATH];
     GetModuleFileNameA(nullptr, exePath, MAX_PATH);
     std::string path(exePath);
     size_t lastSlash = path.find_last_of("\\/");
     if (lastSlash != std::string::npos)
         path = path.substr(0, lastSlash + 1);
-    return path + "audiobridge_crash.log";
+    return path;
+}
+
+static std::string getCrashLogPath() {
+    return getExeDir() + "audiobridge_crash.log";
+}
+
+static FILE* g_logFile = nullptr;
+
+static void logPrintf(const char* fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    vprintf(fmt, args);
+    va_end(args);
+
+    if (g_logFile) {
+        va_start(args, fmt);
+        vfprintf(g_logFile, fmt, args);
+        va_end(args);
+        fflush(g_logFile);
+    }
 }
 
 static LONG WINAPI CrashHandler(EXCEPTION_POINTERS* ex) {
@@ -55,6 +81,18 @@ static LONG WINAPI CrashHandler(EXCEPTION_POINTERS* ex) {
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
     SetUnhandledExceptionFilter(CrashHandler);
+
+    // Open log file
+    std::string logPath = getExeDir() + "audiobridge.log";
+    g_logFile = fopen(logPath.c_str(), "a");
+    if (g_logFile) {
+        time_t now = std::time(nullptr);
+        char timeBuf[64];
+        ctime_s(timeBuf, sizeof(timeBuf), &now);
+        fprintf(g_logFile, "\n=== AudioBridge started at %s", timeBuf);
+        fflush(g_logFile);
+    }
+    logPrintf("[DEBUG] AudioBridge starting\n");
 
     // Initialize COM as STA (required by WebView2)
     HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
@@ -117,6 +155,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     std::atomic<float> peakLevel{0.0f};
     std::string clientName;
 
+    // Pending media key to send from the main/GUI thread
+
+
     // Set up GUI callbacks
     gui.setJitterChangeCallback([&](int bufferMs) {
         gui.addLogMessage("Jitter buffer target: " + std::to_string(bufferMs) + " ms");
@@ -166,22 +207,43 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
             gui.showPairRequest(clientId, name);
         },
         [&](uint8_t cmd) {
-            WORD vk = 0;
             const char* cmdName = "";
             switch (cmd) {
-                case CTRL_MEDIA_PLAY_PAUSE: vk = VK_MEDIA_PLAY_PAUSE; cmdName = "Play/Pause"; break;
-                case CTRL_MEDIA_NEXT:       vk = VK_MEDIA_NEXT_TRACK; cmdName = "Next Track"; break;
-                case CTRL_MEDIA_PREV:       vk = VK_MEDIA_PREV_TRACK; cmdName = "Prev Track"; break;
+                case CTRL_MEDIA_PLAY_PAUSE: cmdName = "Play/Pause"; break;
+                case CTRL_MEDIA_NEXT:       cmdName = "Next Track"; break;
+                case CTRL_MEDIA_PREV:       cmdName = "Prev Track"; break;
             }
-            if (vk) {
-                INPUT input[2] = {};
-                input[0].type = INPUT_KEYBOARD;
-                input[0].ki.wVk = vk;
-                input[1].type = INPUT_KEYBOARD;
-                input[1].ki.wVk = vk;
-                input[1].ki.dwFlags = KEYEVENTF_KEYUP;
-                SendInput(2, input, sizeof(INPUT));
-                gui.addLogMessage(std::string("Media: ") + cmdName);
+            logPrintf("[MEDIA] cmd=0x%02X name=%s\n", cmd, cmdName);
+            try {
+                thread_local bool comInit = false;
+                if (!comInit) {
+                    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+                    comInit = true;
+                }
+                auto manager = GlobalSystemMediaTransportControlsSessionManager::RequestAsync().get();
+                auto session = manager.GetCurrentSession();
+                if (!session) {
+                    logPrintf("[MEDIA] No active media session found\n");
+                    gui.addLogMessage("Media: No active session");
+                    return;
+                }
+                bool ok = false;
+                switch (cmd) {
+                    case CTRL_MEDIA_PLAY_PAUSE:
+                        ok = session.TryTogglePlayPauseAsync().get();
+                        break;
+                    case CTRL_MEDIA_NEXT:
+                        ok = session.TrySkipNextAsync().get();
+                        break;
+                    case CTRL_MEDIA_PREV:
+                        ok = session.TrySkipPreviousAsync().get();
+                        break;
+                }
+                logPrintf("[MEDIA] SMTC %s: %s\n", cmdName, ok ? "OK" : "FAILED");
+                gui.addLogMessage(std::string("Media: ") + cmdName + (ok ? " OK" : " failed"));
+            } catch (const winrt::hresult_error& ex) {
+                logPrintf("[MEDIA] SMTC error: 0x%08X\n", (unsigned)ex.code());
+                gui.addLogMessage("Media: error");
             }
         }
     );
@@ -412,10 +474,84 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         gui.updateStats(stats);
     });
 
+    // Media info polling thread (must run on MTA thread, not GUI STA thread)
+    std::atomic<bool> mediaThreadRunning{true};
+    std::thread mediaInfoThread([&]() {
+        CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        std::string lastJson;
+        while (mediaThreadRunning) {
+            if (network.isConnected()) {
+                try {
+                    auto manager = GlobalSystemMediaTransportControlsSessionManager::RequestAsync().get();
+                    auto session = manager.GetCurrentSession();
+                    std::string json;
+                    if (session) {
+                        auto info = session.TryGetMediaPropertiesAsync().get();
+                        auto playback = session.GetPlaybackInfo();
+                        auto timeline = session.GetTimelineProperties();
+
+                        auto toUtf8 = [](winrt::hstring const& hs) -> std::string {
+                            if (hs.empty()) return "";
+                            int len = WideCharToMultiByte(CP_UTF8, 0, hs.c_str(), (int)hs.size(), nullptr, 0, nullptr, nullptr);
+                            std::string s(len, 0);
+                            WideCharToMultiByte(CP_UTF8, 0, hs.c_str(), (int)hs.size(), &s[0], len, nullptr, nullptr);
+                            return s;
+                        };
+                        auto escJson = [](const std::string& s) -> std::string {
+                            std::string out;
+                            for (char c : s) {
+                                if (c == '"') out += "\\\"";
+                                else if (c == '\\') out += "\\\\";
+                                else if (c == '\n') out += "\\n";
+                                else out += c;
+                            }
+                            return out;
+                        };
+
+                        std::string title = toUtf8(info.Title());
+                        std::string artist = toUtf8(info.Artist());
+                        std::string album = toUtf8(info.AlbumTitle());
+
+                        int status = 0;
+                        if (playback) {
+                            auto ps = playback.PlaybackStatus();
+                            if (ps == GlobalSystemMediaTransportControlsSessionPlaybackStatus::Playing) status = 1;
+                            else if (ps == GlobalSystemMediaTransportControlsSessionPlaybackStatus::Paused) status = 2;
+                        }
+
+                        long long posMs = 0, durMs = 0;
+                        if (timeline) {
+                            posMs = std::chrono::duration_cast<std::chrono::milliseconds>(timeline.Position()).count();
+                            durMs = std::chrono::duration_cast<std::chrono::milliseconds>(timeline.EndTime()).count();
+                        }
+
+                        json = "{\"t\":\"" + escJson(title) +
+                               "\",\"a\":\"" + escJson(artist) +
+                               "\",\"al\":\"" + escJson(album) +
+                               "\",\"s\":" + std::to_string(status) +
+                               ",\"p\":" + std::to_string(posMs) +
+                               ",\"d\":" + std::to_string(durMs) + "}";
+                    } else {
+                        json = "{\"t\":\"\",\"a\":\"\",\"al\":\"\",\"s\":0,\"p\":0,\"d\":0}";
+                    }
+
+                    if (json != lastJson) {
+                        lastJson = json;
+                        network.sendMediaInfo(json);
+                    }
+                } catch (...) {}
+            }
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+        }
+        CoUninitialize();
+    });
+
     // Run webview event loop (blocks until window closed)
     gui.run();
 
     // Cleanup
+    mediaThreadRunning = false;
+    mediaInfoThread.join();
     render.stop();
     capture.stop();
     network.shutdown();
