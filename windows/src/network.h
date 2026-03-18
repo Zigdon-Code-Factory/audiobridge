@@ -38,6 +38,7 @@ enum ControlCmd : uint8_t {
     CTRL_MEDIA_PLAY_PAUSE = 0x10,
     CTRL_MEDIA_NEXT       = 0x11,
     CTRL_MEDIA_PREV       = 0x12,
+    CTRL_MEDIA_INFO_REQ   = 0x13,
 };
 
 struct ApprovedPeer {
@@ -56,6 +57,7 @@ public:
     // call approvePeer()/rejectPeer() from any thread.
     using PairRequestCallback = std::function<void(const std::string& clientId, const std::string& clientName)>;
     using MediaCommandCallback = std::function<void(uint8_t cmd)>;
+    using MediaInfoRequestCallback = std::function<void()>;
 
     static constexpr int PEER_EXPIRY_DAYS = 30;
 
@@ -68,13 +70,15 @@ public:
     void setCallbacks(ConnectCallback onConnect, DisconnectCallback onDisconnect,
                       PauseCallback onPause, MicAudioCallback onMicAudio,
                       PairRequestCallback onPairRequest = nullptr,
-                      MediaCommandCallback onMediaCommand = nullptr) {
+                      MediaCommandCallback onMediaCommand = nullptr,
+                      MediaInfoRequestCallback onMediaInfoRequest = nullptr) {
         onConnect_ = onConnect;
         onDisconnect_ = onDisconnect;
         onPause_ = onPause;
         onMicAudio_ = onMicAudio;
         onPairRequest_ = onPairRequest;
         onMediaCommand_ = onMediaCommand;
+        onMediaInfoRequest_ = onMediaInfoRequest;
     }
 
     // Call from any thread to approve/reject a pending peer
@@ -139,6 +143,7 @@ private:
     MicAudioCallback onMicAudio_;
     PairRequestCallback onPairRequest_;
     MediaCommandCallback onMediaCommand_;
+    MediaInfoRequestCallback onMediaInfoRequest_;
 
     // Approved peers (clientId -> ApprovedPeer)
     std::map<std::string, ApprovedPeer> approvedPeers_;

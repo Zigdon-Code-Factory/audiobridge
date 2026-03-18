@@ -652,6 +652,13 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
   void _sendMediaCommand(int cmd) {
     if (_state != ConnectionState_.connected || _serverAddress.isEmpty) return;
     _sendControlCommand(cmd);
+    // Request fresh media info after a short delay for the action to take effect
+    Future.delayed(const Duration(milliseconds: 300), _requestMediaInfo);
+  }
+
+  void _requestMediaInfo() {
+    if (_state != ConnectionState_.connected || _serverAddress.isEmpty) return;
+    _sendControlCommand(0x13); // CTRL_MEDIA_INFO_REQ
   }
 
   void _sendControlCommand(int cmd) {
@@ -860,7 +867,9 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
 
             // Now playing info
             if (_nowPlayingTitle.isNotEmpty) ...[
-              Container(
+              GestureDetector(
+              onTap: _requestMediaInfo,
+              child: Container(
                 width: double.infinity,
                 margin: const EdgeInsets.symmetric(horizontal: 20),
                 padding: const EdgeInsets.all(16),
@@ -928,6 +937,7 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
                     ],
                   ],
                 ),
+              ),
               ),
               const SizedBox(height: 16),
             ],

@@ -155,8 +155,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     std::atomic<float> peakLevel{0.0f};
     std::string clientName;
 
-    // Pending media key to send from the main/GUI thread
-
+    // Media info refresh signaling
+    std::atomic<bool> mediaInfoRequested{false};
+    std::mutex mediaWakeMutex;
+    std::condition_variable mediaWakeCv;
 
     // Set up GUI callbacks
     gui.setJitterChangeCallback([&](int bufferMs) {
@@ -245,6 +247,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                 logPrintf("[MEDIA] SMTC error: 0x%08X\n", (unsigned)ex.code());
                 gui.addLogMessage("Media: error");
             }
+        },
+        [&]() {
+            mediaInfoRequested.store(true);
+            mediaWakeCv.notify_one();
         }
     );
 
@@ -476,10 +482,32 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     // Media info polling thread (must run on MTA thread, not GUI STA thread)
     std::atomic<bool> mediaThreadRunning{true};
+
     std::thread mediaInfoThread([&]() {
         CoInitializeEx(nullptr, COINIT_MULTITHREADED);
         std::string lastJson;
+
+        auto toUtf8 = [](winrt::hstring const& hs) -> std::string {
+            if (hs.empty()) return "";
+            int len = WideCharToMultiByte(CP_UTF8, 0, hs.c_str(), (int)hs.size(), nullptr, 0, nullptr, nullptr);
+            std::string s(len, 0);
+            WideCharToMultiByte(CP_UTF8, 0, hs.c_str(), (int)hs.size(), &s[0], len, nullptr, nullptr);
+            return s;
+        };
+        auto escJson = [](const std::string& s) -> std::string {
+            std::string out;
+            for (char c : s) {
+                if (c == '"') out += "\\\"";
+                else if (c == '\\') out += "\\\\";
+                else if (c == '\n') out += "\\n";
+                else out += c;
+            }
+            return out;
+        };
+
         while (mediaThreadRunning) {
+            bool forced = mediaInfoRequested.exchange(false);
+
             if (network.isConnected()) {
                 try {
                     auto manager = GlobalSystemMediaTransportControlsSessionManager::RequestAsync().get();
@@ -489,24 +517,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                         auto info = session.TryGetMediaPropertiesAsync().get();
                         auto playback = session.GetPlaybackInfo();
                         auto timeline = session.GetTimelineProperties();
-
-                        auto toUtf8 = [](winrt::hstring const& hs) -> std::string {
-                            if (hs.empty()) return "";
-                            int len = WideCharToMultiByte(CP_UTF8, 0, hs.c_str(), (int)hs.size(), nullptr, 0, nullptr, nullptr);
-                            std::string s(len, 0);
-                            WideCharToMultiByte(CP_UTF8, 0, hs.c_str(), (int)hs.size(), &s[0], len, nullptr, nullptr);
-                            return s;
-                        };
-                        auto escJson = [](const std::string& s) -> std::string {
-                            std::string out;
-                            for (char c : s) {
-                                if (c == '"') out += "\\\"";
-                                else if (c == '\\') out += "\\\\";
-                                else if (c == '\n') out += "\\n";
-                                else out += c;
-                            }
-                            return out;
-                        };
 
                         std::string title = toUtf8(info.Title());
                         std::string artist = toUtf8(info.Artist());
@@ -535,13 +545,18 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                         json = "{\"t\":\"\",\"a\":\"\",\"al\":\"\",\"s\":0,\"p\":0,\"d\":0}";
                     }
 
-                    if (json != lastJson) {
+                    if (forced || json != lastJson) {
                         lastJson = json;
                         network.sendMediaInfo(json);
                     }
                 } catch (...) {}
             }
-            std::this_thread::sleep_for(std::chrono::seconds(2));
+
+            // Wait up to 2 seconds, but wake immediately on request
+            std::unique_lock<std::mutex> lock(mediaWakeMutex);
+            mediaWakeCv.wait_for(lock, std::chrono::seconds(2), [&] {
+                return mediaInfoRequested.load() || !mediaThreadRunning.load();
+            });
         }
         CoUninitialize();
     });
@@ -551,6 +566,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     // Cleanup
     mediaThreadRunning = false;
+    mediaWakeCv.notify_one();
     mediaInfoThread.join();
     render.stop();
     capture.stop();

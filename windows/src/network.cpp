@@ -295,6 +295,9 @@ void Network::streamThread() {
                     } else if (cmd >= CTRL_MEDIA_PLAY_PAUSE && cmd <= CTRL_MEDIA_PREV) {
                         printf("[NET] -> Media command 0x%02X, callback=%s\n", cmd, onMediaCommand_ ? "YES" : "NO");
                         if (onMediaCommand_) onMediaCommand_(cmd);
+                    } else if (cmd == CTRL_MEDIA_INFO_REQ) {
+                        printf("[NET] -> Media info request\n");
+                        if (onMediaInfoRequest_) onMediaInfoRequest_();
                     } else {
                         printf("[NET] -> Unknown control command 0x%02X\n", cmd);
                     }
