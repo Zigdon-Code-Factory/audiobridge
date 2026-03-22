@@ -89,8 +89,16 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
   String _deviceName = 'AudioBridge';
   bool _isRecording = true; // mic on by default
   bool _isMuted = false; // audio output mute
+  double _volume = 1.0; // app-level output volume 0.0–1.0
   bool _isPaused = false; // stream paused
   String _micSource = 'auto'; // 'auto', 'phone', 'bluetooth'
+
+  // Latency breakdown
+  double _rttMs = 0.0;
+  double _jitterBufferMs = 0.0;
+  double _outputBufferMs = 0.0;
+  double _serverCaptureMs = 10.0; // WASAPI default
+  int _lastPingSentUs = 0;
 
   // Now playing info from server
   String _nowPlayingTitle = '';
@@ -492,15 +500,23 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
 
       _updateServiceState();
 
-      _keepaliveTimer = Timer.periodic(const Duration(milliseconds: 1000), (_) {
+      _keepaliveTimer = Timer.periodic(const Duration(milliseconds: 1000), (timer) {
         _sendKeepalive(address, port);
+        // Send ping every 2 seconds (every other keepalive)
+        if (timer.tick % 2 == 0) {
+          _sendPing(address, port);
+        }
       });
 
       _latencyTimer = Timer.periodic(const Duration(milliseconds: 500), (_) async {
         try {
-          final latency = await _channel.invokeMethod<double>('getLatency');
-          if (latency != null && mounted) {
-            setState(() => _latencyMs = latency);
+          final breakdown = await _channel.invokeMethod<Map>('getLatencyBreakdown');
+          if (breakdown != null && mounted) {
+            setState(() {
+              _jitterBufferMs = (breakdown['jitterBufferMs'] as num?)?.toDouble() ?? 0.0;
+              _outputBufferMs = (breakdown['outputBufferMs'] as num?)?.toDouble() ?? 0.0;
+              _latencyMs = (_rttMs / 2) + _jitterBufferMs + _outputBufferMs + _serverCaptureMs;
+            });
           }
         } catch (_) {}
       });
@@ -557,6 +573,31 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
           );
         }
       }
+    } else if (type == 0x06) {
+      // PING from server — respond with PONG echoing timestamp
+      final pong = Uint8List(16);
+      pong[0] = 0x01;
+      pong[1] = 0x07; // PONG
+      // Copy timestamp from ping
+      for (int i = 2; i < 16; i++) pong[i] = data[i];
+      if (_audioSocket != null && _serverAddress.isNotEmpty) {
+        _audioSocket!.send(pong, InternetAddress(_serverAddress), 4012);
+      }
+    } else if (type == 0x07) {
+      // PONG from server — compute RTT
+      if (_lastPingSentUs > 0) {
+        final nowUs = DateTime.now().microsecondsSinceEpoch;
+        final rtt = (nowUs - _lastPingSentUs) / 1000.0;
+        if (mounted) {
+          setState(() {
+            if (_rttMs == 0.0) {
+              _rttMs = rtt;
+            } else {
+              _rttMs = _rttMs * 0.7 + rtt * 0.3; // EWMA
+            }
+          });
+        }
+      }
     } else if (type == 0x05 && data.length > 16) {
       // Media info packet
       try {
@@ -574,6 +615,86 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
         }
       } catch (_) {}
     }
+  }
+
+  void _showLatencyBreakdown(ColorScheme cs) {
+    final networkOneWay = _rttMs / 2;
+    final total = networkOneWay + _serverCaptureMs + _jitterBufferMs + _outputBufferMs;
+
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: cs.surfaceContainerHigh,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (context) {
+        return Padding(
+          padding: const EdgeInsets.fromLTRB(24, 20, 24, 32),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Center(
+                child: Container(
+                  width: 40, height: 4,
+                  decoration: BoxDecoration(
+                    color: cs.onSurface.withOpacity(0.2),
+                    borderRadius: BorderRadius.circular(2),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 16),
+              Text('Latency Breakdown',
+                style: Theme.of(context).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.bold),
+              ),
+              const SizedBox(height: 16),
+              _latencyRow('Network (one-way)', networkOneWay, cs),
+              _latencyRow('Server capture buffer', _serverCaptureMs, cs),
+              _latencyRow('Jitter buffer', _jitterBufferMs, cs),
+              _latencyRow('Audio output buffer', _outputBufferMs, cs),
+              const SizedBox(height: 8),
+              Divider(color: cs.outlineVariant.withOpacity(0.3)),
+              const SizedBox(height: 8),
+              _latencyRow('Estimated total', total, cs, bold: true),
+              const SizedBox(height: 12),
+              _latencyRow('Network RTT', _rttMs, cs, dim: true),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _latencyRow(String label, double ms, ColorScheme cs, {bool bold = false, bool dim = false}) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 4),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+        children: [
+          Text(label,
+            style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+              color: dim ? cs.onSurface.withOpacity(0.4) : cs.onSurface.withOpacity(0.7),
+              fontWeight: bold ? FontWeight.bold : FontWeight.normal,
+            ),
+          ),
+          Text('${ms.toStringAsFixed(1)} ms',
+            style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+              fontFamily: 'monospace',
+              fontWeight: bold ? FontWeight.bold : FontWeight.w500,
+              color: dim ? cs.onSurface.withOpacity(0.4) : cs.onSurface,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _sendPing(InternetAddress address, int port) {
+    final packet = Uint8List(16);
+    packet[0] = 0x01;
+    packet[1] = 0x06; // PING
+    _lastPingSentUs = DateTime.now().microsecondsSinceEpoch;
+    _audioSocket?.send(packet, address, port);
   }
 
   void _sendKeepalive(InternetAddress address, int port) {
@@ -641,6 +762,17 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
       _isMuted = !_isMuted;
     });
     try {
+      await _channel.invokeMethod('setMuted', _isMuted);
+    } catch (_) {}
+  }
+
+  Future<void> _setVolume(double vol) async {
+    setState(() {
+      _volume = vol;
+      _isMuted = vol == 0.0;
+    });
+    try {
+      await _channel.invokeMethod('setVolume', vol);
       await _channel.invokeMethod('setMuted', _isMuted);
     } catch (_) {}
   }
@@ -722,6 +854,11 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
         _statusMessage = 'Disconnected';
         _isPaused = false;
         _isMuted = false;
+        _volume = 1.0;
+        _rttMs = 0.0;
+        _jitterBufferMs = 0.0;
+        _outputBufferMs = 0.0;
+        _lastPingSentUs = 0;
         _nowPlayingTitle = '';
         _nowPlayingArtist = '';
         _nowPlayingAlbum = '';
@@ -809,7 +946,9 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
               child: Icon(
                 _isPaused
                     ? Icons.pause_rounded
-                    : (_isMuted ? Icons.volume_off_rounded : Icons.volume_up_rounded),
+                    : (_isMuted || _volume == 0.0
+                        ? Icons.volume_off_rounded
+                        : (_volume < 0.5 ? Icons.volume_down_rounded : Icons.volume_up_rounded)),
                 size: 48,
                 color: _isPaused ? cs.onSurface.withOpacity(0.4) : Colors.white,
               ),
@@ -840,27 +979,32 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
             ),
             const SizedBox(height: 28),
 
-            // Latency pill
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
-              decoration: BoxDecoration(
-                color: cs.surfaceContainerHighest,
-                borderRadius: BorderRadius.circular(12),
-                border: Border.all(color: cs.outlineVariant.withOpacity(0.2)),
-              ),
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Icon(Icons.speed_rounded, size: 16, color: cs.primary),
-                  const SizedBox(width: 8),
-                  Text(
-                    '${_latencyMs.toStringAsFixed(0)} ms',
-                    style: Theme.of(context).textTheme.titleMedium?.copyWith(
-                          fontFamily: 'monospace',
-                          fontWeight: FontWeight.w600,
-                        ),
-                  ),
-                ],
+            // Latency pill (tappable for breakdown)
+            GestureDetector(
+              onTap: () => _showLatencyBreakdown(cs),
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
+                decoration: BoxDecoration(
+                  color: cs.surfaceContainerHighest,
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(color: cs.outlineVariant.withOpacity(0.2)),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(Icons.speed_rounded, size: 16, color: cs.primary),
+                    const SizedBox(width: 8),
+                    Text(
+                      '${_latencyMs.toStringAsFixed(0)} ms',
+                      style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                            fontFamily: 'monospace',
+                            fontWeight: FontWeight.w600,
+                          ),
+                    ),
+                    const SizedBox(width: 6),
+                    Icon(Icons.expand_more_rounded, size: 16, color: cs.onSurface.withOpacity(0.3)),
+                  ],
+                ),
               ),
             ),
             const SizedBox(height: 24),
@@ -993,26 +1137,54 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
             ),
             const SizedBox(height: 16),
 
-            // Mic & Volume controls row
+            // Mic control
+            _buildControlButton(
+              icon: _isRecording ? Icons.mic_rounded : Icons.mic_off_rounded,
+              label: _isRecording ? 'Mic On' : 'Mic Off',
+              isActive: _isRecording,
+              activeColor: cs.primary,
+              onTap: () => _toggleMic(!_isRecording),
+              cs: cs,
+            ),
+            const SizedBox(height: 16),
+
+            // Volume slider
             Row(
-              mainAxisAlignment: MainAxisAlignment.center,
               children: [
-                _buildControlButton(
-                  icon: _isRecording ? Icons.mic_rounded : Icons.mic_off_rounded,
-                  label: _isRecording ? 'Mic On' : 'Mic Off',
-                  isActive: _isRecording,
-                  activeColor: cs.primary,
-                  onTap: () => _toggleMic(!_isRecording),
-                  cs: cs,
-                ),
-                const SizedBox(width: 24),
-                _buildControlButton(
-                  icon: _isMuted ? Icons.volume_off_rounded : Icons.volume_up_rounded,
-                  label: _isMuted ? 'Muted' : 'Sound',
-                  isActive: !_isMuted,
-                  activeColor: cs.primary,
+                GestureDetector(
                   onTap: _toggleMute,
-                  cs: cs,
+                  child: Icon(
+                    _isMuted || _volume == 0.0
+                        ? Icons.volume_off_rounded
+                        : (_volume < 0.5 ? Icons.volume_down_rounded : Icons.volume_up_rounded),
+                    size: 24,
+                    color: _isMuted ? cs.onSurface.withOpacity(0.35) : cs.primary,
+                  ),
+                ),
+                Expanded(
+                  child: SliderTheme(
+                    data: SliderTheme.of(context).copyWith(
+                      activeTrackColor: cs.primary,
+                      inactiveTrackColor: cs.surfaceContainerHighest,
+                      thumbColor: cs.primary,
+                      overlayColor: cs.primary.withOpacity(0.12),
+                      trackHeight: 4,
+                      thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 8),
+                    ),
+                    child: Slider(
+                      value: _isMuted ? 0.0 : _volume,
+                      onChanged: (v) => _setVolume(v),
+                    ),
+                  ),
+                ),
+                SizedBox(
+                  width: 36,
+                  child: Text(
+                    '${(_isMuted ? 0 : (_volume * 100).round())}%',
+                    style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                      color: cs.onSurface.withOpacity(0.5),
+                    ),
+                  ),
                 ),
               ],
             ),

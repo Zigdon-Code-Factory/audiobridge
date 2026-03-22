@@ -38,6 +38,8 @@ class MainActivity : FlutterActivity() {
     private external fun nativeStartRecording(serverIp: String, port: Int): Boolean
     private external fun nativeStopRecording()
     private external fun nativeSetMuted(muted: Boolean)
+    private external fun nativeSetVolume(volume: Float)
+    private external fun nativeGetLatencyBreakdown(): DoubleArray
 
     private fun isBluetoothHeadsetConnected(): Boolean {
         try {
@@ -135,6 +137,20 @@ class MainActivity : FlutterActivity() {
                 "getLatency" -> {
                     result.success(if (nativeStarted) nativeGetLatency() else 0.0)
                 }
+                "getLatencyBreakdown" -> {
+                    if (nativeStarted) {
+                        val breakdown = nativeGetLatencyBreakdown()
+                        result.success(mapOf(
+                            "jitterBufferMs" to breakdown[0],
+                            "outputBufferMs" to breakdown[1]
+                        ))
+                    } else {
+                        result.success(mapOf(
+                            "jitterBufferMs" to 0.0,
+                            "outputBufferMs" to 0.0
+                        ))
+                    }
+                }
                 "startRecording" -> {
                     if (ContextCompat.checkSelfPermission(this@MainActivity, android.Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
                         requestPermissions(arrayOf(android.Manifest.permission.RECORD_AUDIO), 102)
@@ -177,6 +193,11 @@ class MainActivity : FlutterActivity() {
                 "setMuted" -> {
                     val muted = call.arguments as? Boolean ?: false
                     nativeSetMuted(muted)
+                    result.success(null)
+                }
+                "setVolume" -> {
+                    val volume = (call.arguments as? Double)?.toFloat() ?: 1.0f
+                    nativeSetVolume(volume)
                     result.success(null)
                 }
                 "updateServiceState" -> {

@@ -311,6 +311,30 @@ void Network::streamThread() {
                     }
                 } else if (type == PACKET_KEEPALIVE) {
                     // Just update lastClientPacket_ (already done above)
+                } else if (type == PACKET_PING) {
+                    // Respond with PONG immediately
+                    uint8_t pong[16];
+                    writeHeader(pong, PACKET_PONG, 0);
+                    // Copy the client's timestamp into pong so they can measure RTT
+                    memcpy(pong + 6, buf + 6, 8);
+                    std::lock_guard<std::mutex> lock(clientMutex_);
+                    sendto(streamSocket_, (char*)pong, 16, 0,
+                           (sockaddr*)&clientAddr_, sizeof(clientAddr_));
+                } else if (type == PACKET_PONG) {
+                    // Client responded to our ping — compute RTT
+                    if (pingPending_) {
+                        auto now = std::chrono::steady_clock::now();
+                        double rtt = std::chrono::duration<double, std::milli>(
+                            now - lastPingSent_).count();
+                        pingPending_ = false;
+                        // EWMA smoothing (alpha = 0.3)
+                        double prev = clientRttMs_.load();
+                        if (prev == 0.0) {
+                            clientRttMs_.store(rtt);
+                        } else {
+                            clientRttMs_.store(prev * 0.7 + rtt * 0.3);
+                        }
+                    }
                 }
             }
         }
@@ -362,6 +386,20 @@ void Network::sendKeepalive() {
 
     uint8_t packet[16];
     writeHeader(packet, PACKET_KEEPALIVE, 0);
+
+    std::lock_guard<std::mutex> lock(clientMutex_);
+    sendto(streamSocket_, (char*)packet, 16, 0,
+           (sockaddr*)&clientAddr_, sizeof(clientAddr_));
+}
+
+void Network::sendPing() {
+    if (!connected_) return;
+
+    uint8_t packet[16];
+    writeHeader(packet, PACKET_PING, 0);
+
+    lastPingSent_ = std::chrono::steady_clock::now();
+    pingPending_ = true;
 
     std::lock_guard<std::mutex> lock(clientMutex_);
     sendto(streamSocket_, (char*)packet, 16, 0,

@@ -29,6 +29,8 @@ enum PacketType : uint8_t {
     PACKET_CONTROL   = 0x03,
     PACKET_MIC_AUDIO = 0x04,
     PACKET_MEDIA_INFO = 0x05,
+    PACKET_PING      = 0x06,
+    PACKET_PONG      = 0x07,
 };
 
 enum ControlCmd : uint8_t {
@@ -99,6 +101,12 @@ public:
     // Send keepalive
     void sendKeepalive();
 
+    // Send ping for RTT measurement
+    void sendPing();
+
+    // Get smoothed client RTT in milliseconds
+    double getClientRtt() const { return clientRttMs_.load(); }
+
     // Send media info to connected client
     void sendMediaInfo(const std::string& json);
 
@@ -136,6 +144,11 @@ private:
     uint32_t sequence_ = 0;
     std::chrono::steady_clock::time_point streamStart_;
     std::chrono::steady_clock::time_point lastClientPacket_;
+
+    // RTT measurement
+    std::atomic<double> clientRttMs_{0.0};
+    std::chrono::steady_clock::time_point lastPingSent_;
+    bool pingPending_ = false;
 
     ConnectCallback onConnect_;
     DisconnectCallback onDisconnect_;

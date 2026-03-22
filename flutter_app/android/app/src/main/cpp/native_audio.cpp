@@ -133,9 +133,10 @@ private:
 
 class AudioPlayer : public oboe::AudioStreamDataCallback, public oboe::AudioStreamErrorCallback {
 public:
-    AudioPlayer() : decoder_(nullptr), running_(false), latencyMs_(0.0), muted_(false) {}
+    AudioPlayer() : decoder_(nullptr), running_(false), latencyMs_(0.0), muted_(false), volume_(1.0f) {}
 
     void setMuted(bool muted) { muted_.store(muted); }
+    void setVolume(float vol) { volume_.store(vol < 0.0f ? 0.0f : (vol > 1.0f ? 1.0f : vol)); }
 
     bool start() {
         int error;
@@ -246,6 +247,11 @@ public:
         return latencyMs_.load();
     }
 
+    double getOutputBufferMs() const {
+        if (!stream_) return 0.0;
+        return stream_->getBufferSizeInFrames() * 1000.0 / SAMPLE_RATE;
+    }
+
     // Oboe callback
     oboe::DataCallbackResult onAudioReady(
             oboe::AudioStream* stream,
@@ -296,6 +302,15 @@ public:
             framesWritten += framesToWrite;
         }
 
+        // Apply volume scaling
+        float vol = volume_.load();
+        if (vol < 1.0f) {
+            int totalSamples = numFrames * CHANNELS;
+            for (int i = 0; i < totalSamples; i++) {
+                output[i] = static_cast<int16_t>(output[i] * vol);
+            }
+        }
+
         return oboe::DataCallbackResult::Continue;
     }
 
@@ -320,6 +335,7 @@ private:
     std::atomic<bool> running_;
     std::atomic<double> latencyMs_;
     std::atomic<bool> muted_;
+    std::atomic<float> volume_;
 };
 
 // --- AudioRecorder (Microphone to PC) ---
@@ -577,6 +593,24 @@ JNIEXPORT void JNICALL
 Java_com_audiobridge_audiobridge_MainActivity_nativeSetMuted(
         JNIEnv* env, jobject thiz, jboolean muted) {
     g_player.setMuted(muted == JNI_TRUE);
+}
+
+JNIEXPORT void JNICALL
+Java_com_audiobridge_audiobridge_MainActivity_nativeSetVolume(
+        JNIEnv* env, jobject thiz, jfloat volume) {
+    g_player.setVolume(volume);
+}
+
+JNIEXPORT jdoubleArray JNICALL
+Java_com_audiobridge_audiobridge_MainActivity_nativeGetLatencyBreakdown(
+        JNIEnv* env, jobject thiz) {
+    jdoubleArray result = env->NewDoubleArray(2);
+    double values[2] = {
+        g_player.getLatency(),        // [0] jitter buffer ms
+        g_player.getOutputBufferMs()  // [1] output buffer ms
+    };
+    env->SetDoubleArrayRegion(result, 0, 2, values);
+    return result;
 }
 
 } // extern "C"

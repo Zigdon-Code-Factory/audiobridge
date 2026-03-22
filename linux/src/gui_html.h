@@ -117,7 +117,7 @@ body {
 .device-row label {
     font-size: 14px;
     color: var(--text-dim);
-    width: 70px;
+    width: 85px;
     flex-shrink: 0;
 }
 .device-row select {
@@ -233,11 +233,11 @@ input[type=range]::-webkit-slider-thumb {
 <div class="card">
     <div class="card-header">AUDIO DEVICES</div>
     <div class="device-row">
-        <label>Input:</label>
+        <label>Sending:</label>
         <select id="deviceSelect"></select>
     </div>
     <div class="device-row">
-        <label>Output:</label>
+        <label>Receiving:</label>
         <select id="outDeviceSelect"></select>
     </div>
 </div>

@@ -26,6 +26,7 @@ struct ServerStats {
     double uptimeSeconds = 0.0;
     std::string serverName;
     std::string serverMac;
+    double clientRttMs = 0.0;
 };
 
 struct PairRequest {

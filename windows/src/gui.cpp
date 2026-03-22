@@ -182,7 +182,7 @@ void ServerGui::setupBindings() {
         return "{}";
     });
 
-    // _selectDevice: user changed input device dropdown
+    // _selectDevice: user changed sending device dropdown
     webview_->bind("_selectDevice", [this](const std::string& args) -> std::string {
         int index = parseFirstInt(args);
         std::wstring deviceId;
@@ -198,7 +198,7 @@ void ServerGui::setupBindings() {
         return "{}";
     });
 
-    // _selectOutDevice: user changed output device dropdown
+    // _selectOutDevice: user changed receiving device dropdown
     webview_->bind("_selectOutDevice", [this](const std::string& args) -> std::string {
         int index = parseFirstInt(args);
         std::wstring deviceId;
@@ -262,6 +262,7 @@ std::string ServerGui::buildStateJson() {
     s += "\"uptimeSeconds\":" + jsonFloat(stats_.uptimeSeconds) + ",";
     s += "\"serverName\":\"" + escapeJson(stats_.serverName) + "\",";
     s += "\"serverMac\":\"" + escapeJson(stats_.serverMac) + "\",";
+    s += "\"clientRttMs\":" + jsonFloat(stats_.clientRttMs) + ",";
 
     // Pair request
     s += "\"pairRequest\":{";

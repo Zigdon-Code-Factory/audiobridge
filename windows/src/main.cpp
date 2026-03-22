@@ -144,7 +144,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     AudioRender render;
     if (!render.initialize()) {
-        gui.addLogMessage("Warning: Default playback device init failed");
+        gui.addLogMessage("Warning: Default receiving device init failed");
     } else {
         render.start();
     }
@@ -348,21 +348,21 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         render.cleanup();
 
         if (!render.initialize(deviceId)) {
-            gui.addLogMessage("ERROR: Failed to init output, trying default...");
+            gui.addLogMessage("ERROR: Failed to init receiving device, trying default...");
             if (!deviceId.empty() && render.initialize(L"")) {
                 currentOutDeviceId = L"";
-                gui.addLogMessage("Fell back to default output device");
+                gui.addLogMessage("Fell back to default receiving device");
             } else {
-                gui.addLogMessage("ERROR: No output device available");
+                gui.addLogMessage("ERROR: No receiving device available");
                 refreshOutDeviceList();
                 return false;
             }
         }
 
-        gui.addLogMessage("Output device switched");
+        gui.addLogMessage("Receiving device switched");
 
         if (!render.start()) {
-            gui.addLogMessage("ERROR: Failed to start audio output");
+            gui.addLogMessage("ERROR: Failed to start receiving device");
             refreshOutDeviceList();
             return false;
         }
@@ -383,13 +383,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     // Wire GUI device change callbacks
     gui.setDeviceChangeCallback([&](const std::wstring& deviceId) {
         currentDeviceId = deviceId;
-        gui.addLogMessage("Switching audio input device...");
+        gui.addLogMessage("Switching sending device...");
         reinitAudio(deviceId);
     });
 
     gui.setOutDeviceChangeCallback([&](const std::wstring& deviceId) {
         currentOutDeviceId = deviceId;
-        gui.addLogMessage("Switching audio output device...");
+        gui.addLogMessage("Switching receiving device...");
         reinitOutAudio(deviceId);
     });
 
@@ -411,31 +411,32 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     auto startTime = std::chrono::steady_clock::now();
     auto lastKeepalive = startTime;
     auto lastPeakReset = startTime;
+    auto lastPing = startTime;
 
     // Tick callback: performs all periodic work previously in the main loop
     gui.setTickCallback([&]() {
         auto now = std::chrono::steady_clock::now();
 
-        // Handle input device invalidation
+        // Handle sending device invalidation
         if (deviceInvalidated.exchange(false)) {
             if (currentDeviceId.empty()) {
-                gui.addLogMessage("Default audio device changed, reinitializing...");
+                gui.addLogMessage("Default sending device changed, reinitializing...");
                 reinitAudio(L"");
             } else {
-                gui.addLogMessage("Audio device disconnected. Select a new device.");
+                gui.addLogMessage("Sending device disconnected. Select a new device.");
                 capture.stop();
                 capture.cleanup();
                 refreshDeviceList();
             }
         }
 
-        // Handle output device invalidation
+        // Handle receiving device invalidation
         if (outDeviceInvalidated.exchange(false)) {
             if (currentOutDeviceId.empty()) {
-                gui.addLogMessage("Default output device changed, reinitializing...");
+                gui.addLogMessage("Default receiving device changed, reinitializing...");
                 reinitOutAudio(L"");
             } else {
-                gui.addLogMessage("Output device disconnected. Select a new device.");
+                gui.addLogMessage("Receiving device disconnected. Select a new device.");
                 render.stop();
                 render.cleanup();
                 refreshOutDeviceList();
@@ -450,6 +451,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         if (keepaliveElapsed >= 500 && network.isConnected() && sinceAudio >= 100) {
             network.sendKeepalive();
             lastKeepalive = now;
+        }
+
+        // Send ping every 2 seconds for RTT measurement
+        auto pingElapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            now - lastPing).count();
+        if (pingElapsed >= 2000 && network.isConnected()) {
+            network.sendPing();
+            lastPing = now;
         }
 
         // Reset peak level every 2 seconds
@@ -476,6 +485,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
             now - startTime).count() / 1000.0;
         stats.serverName = computerName;
         stats.serverMac = network.getServerMac();
+        stats.clientRttMs = network.getClientRtt();
 
         gui.updateStats(stats);
     });
