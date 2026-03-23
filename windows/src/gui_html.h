@@ -233,6 +233,13 @@ input[type=range]::-webkit-slider-thumb {
 <div class="card">
     <div class="card-header">AUDIO DEVICES</div>
     <div class="device-row">
+        <label>Mode:</label>
+        <select id="captureModeSelect">
+            <option value="loopback">Loopback (system audio)</option>
+            <option value="recording">Recording device</option>
+        </select>
+    </div>
+    <div class="device-row">
         <label>Sending:</label>
         <select id="deviceSelect"></select>
     </div>
@@ -275,7 +282,8 @@ input[type=range]::-webkit-slider-thumb {
         <div class="dim">Waiting for events...</div>
     </div>
 </div>
-<script>
+)html"
+R"html(<script>
 let lastLogCount = 0;
 let lastPeerJson = '';
 let currentPairId = '';
@@ -286,6 +294,10 @@ let currentOutDeviceIndex = -1;
 document.getElementById('jitterSlider').addEventListener('input', function() {
     document.getElementById('jitterValue').textContent = this.value + ' ms';
     window._setJitter(this.value);
+});
+
+document.getElementById('captureModeSelect').addEventListener('change', function() {
+    window._setCaptureMode(this.value);
 });
 
 document.getElementById('deviceSelect').addEventListener('change', function() {

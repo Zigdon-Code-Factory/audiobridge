@@ -42,6 +42,7 @@ public:
     using PairDenyCallback = std::function<void(const std::string& clientId)>;
     using RevokeCallback = std::function<void(const std::string& clientId)>;
     using DeviceChangeCallback = std::function<void(const std::wstring& deviceId)>;
+    using CaptureModeCallback = std::function<void(bool loopback)>;
     using TickCallback = std::function<void()>;
 
     ServerGui();
@@ -70,6 +71,7 @@ public:
     void setRevokeCallback(RevokeCallback cb) { onRevoke_ = cb; }
     void setDeviceChangeCallback(DeviceChangeCallback cb) { onDeviceChange_ = cb; }
     void setOutDeviceChangeCallback(DeviceChangeCallback cb) { onOutDeviceChange_ = cb; }
+    void setCaptureModeCallback(CaptureModeCallback cb) { onCaptureMode_ = cb; }
     void setTickCallback(TickCallback cb) { onTick_ = cb; }
     int getJitterBufferMs() const { return jitterBufferMs_; }
 
@@ -110,5 +112,6 @@ private:
     RevokeCallback onRevoke_;
     DeviceChangeCallback onDeviceChange_;
     DeviceChangeCallback onOutDeviceChange_;
+    CaptureModeCallback onCaptureMode_;
     TickCallback onTick_;
 };

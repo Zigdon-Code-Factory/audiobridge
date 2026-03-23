@@ -1,5 +1,8 @@
 #include "audio_capture.h"
 #include <Functiondiscoverykeys_devpkey.h>
+#include <mmreg.h>
+#include <ks.h>
+#include <ksmedia.h>
 #include <avrt.h>
 #include <cstdio>
 #include <cstring>
@@ -30,9 +33,11 @@ void AudioCapture::cleanup() {
     peakSampleCount_ = 0;
     sampleRate_ = 0;
     channels_ = 0;
+    isFloat_ = true;
+    bitsPerSample_ = 32;
 }
 
-std::vector<AudioDeviceInfo> AudioCapture::getDevices() {
+std::vector<AudioDeviceInfo> AudioCapture::getDevices(bool loopback) {
     std::vector<AudioDeviceInfo> devices;
 
     IMMDeviceEnumerator* enumerator = nullptr;
@@ -42,7 +47,7 @@ std::vector<AudioDeviceInfo> AudioCapture::getDevices() {
     if (FAILED(hr)) return devices;
 
     IMMDeviceCollection* collection = nullptr;
-    hr = enumerator->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &collection);
+    hr = enumerator->EnumAudioEndpoints(loopback ? eRender : eCapture, DEVICE_STATE_ACTIVE, &collection);
     if (FAILED(hr)) {
         enumerator->Release();
         return devices;
@@ -92,7 +97,8 @@ std::vector<AudioDeviceInfo> AudioCapture::getDevices() {
     return devices;
 }
 
-bool AudioCapture::initialize(const std::wstring& deviceId) {
+bool AudioCapture::initialize(const std::wstring& deviceId, bool loopback) {
+    loopback_ = loopback;
     if (!enumerator_) {
         HRESULT hr = CoCreateInstance(CLSID_MMDeviceEnumerator, nullptr,
                                       CLSCTX_ALL, IID_IMMDeviceEnumerator,
@@ -105,7 +111,7 @@ bool AudioCapture::initialize(const std::wstring& deviceId) {
 
     HRESULT hr;
     if (deviceId.empty()) {
-        hr = enumerator_->GetDefaultAudioEndpoint(eRender, eConsole, &device_);
+        hr = enumerator_->GetDefaultAudioEndpoint(loopback_ ? eRender : eCapture, eConsole, &device_);
     } else {
         hr = enumerator_->GetDevice(deviceId.c_str(), &device_);
     }
@@ -129,14 +135,26 @@ bool AudioCapture::initialize(const std::wstring& deviceId) {
 
     sampleRate_ = mixFormat->nSamplesPerSec;
     channels_ = mixFormat->nChannels;
+    bitsPerSample_ = mixFormat->wBitsPerSample;
 
-    printf("Audio device: %u Hz, %u channels, %u bits\n",
-           sampleRate_, channels_, mixFormat->wBitsPerSample);
+    // Determine if format is float
+    if (mixFormat->wFormatTag == WAVE_FORMAT_IEEE_FLOAT) {
+        isFloat_ = true;
+    } else if (mixFormat->wFormatTag == WAVE_FORMAT_EXTENSIBLE) {
+        auto* ext = reinterpret_cast<WAVEFORMATEXTENSIBLE*>(mixFormat);
+        isFloat_ = (ext->SubFormat == KSDATAFORMAT_SUBTYPE_IEEE_FLOAT);
+    } else {
+        isFloat_ = false;
+    }
 
-    // Initialize in shared loopback mode with a small buffer
+    fprintf(stderr, "Audio device: %u Hz, %u channels, %u bits, %s\n",
+           sampleRate_, channels_, bitsPerSample_, isFloat_ ? "float" : "int");
+    fflush(stderr);
+
+    // Initialize in shared mode with a small buffer
     REFERENCE_TIME bufferDuration = 100000; // 10ms in 100ns units
     hr = audioClient_->Initialize(AUDCLNT_SHAREMODE_SHARED,
-                                   AUDCLNT_STREAMFLAGS_LOOPBACK,
+                                   loopback_ ? AUDCLNT_STREAMFLAGS_LOOPBACK : 0,
                                    bufferDuration, 0, mixFormat, nullptr);
     if (FAILED(hr)) {
         printf("Failed to initialize audio client: 0x%08lx\n", hr);
@@ -205,10 +223,18 @@ void AudioCapture::captureThread() {
                 // Deliver silence matching actual device format
                 std::vector<float> silence(numFrames * channels_, 0.0f);
                 resampleAndDeliver(silence.data(), numFrames, channels_, sampleRate_);
-            } else {
-                // Data is float (WASAPI shared mode mix format is typically float32)
+            } else if (isFloat_) {
                 const float* floatData = reinterpret_cast<const float*>(data);
                 resampleAndDeliver(floatData, numFrames, channels_, sampleRate_);
+            } else {
+                // Convert int16 to float
+                const int16_t* intData = reinterpret_cast<const int16_t*>(data);
+                uint32_t totalSamples = numFrames * channels_;
+                std::vector<float> floatBuf(totalSamples);
+                for (uint32_t i = 0; i < totalSamples; i++) {
+                    floatBuf[i] = intData[i] / 32768.0f;
+                }
+                resampleAndDeliver(floatBuf.data(), numFrames, channels_, sampleRate_);
             }
 
             captureClient_->ReleaseBuffer(numFrames);
@@ -228,14 +254,34 @@ void AudioCapture::resampleAndDeliver(const float* src, uint32_t srcFrames,
     const uint32_t targetChannels = 2;
     const uint32_t targetFrameSize = 480;
 
+    if (srcFrames == 0 || srcChannels == 0) return;
+
     if (srcRate == targetRate && srcChannels == targetChannels) {
         // No conversion needed — just accumulate and deliver in 480-sample chunks
         for (uint32_t i = 0; i < srcFrames * targetChannels; i++) {
             resampleBuf_.push_back(src[i]);
         }
+    } else if (srcRate == targetRate) {
+        // Same rate, different channels — just upmix/downmix without resampling
+        for (uint32_t i = 0; i < srcFrames; i++) {
+            float sample = src[i * srcChannels]; // take first channel
+            for (uint32_t ch = 0; ch < targetChannels; ch++) {
+                if (ch < srcChannels) {
+                    resampleBuf_.push_back(src[i * srcChannels + ch]);
+                } else {
+                    resampleBuf_.push_back(sample); // duplicate mono to stereo
+                }
+            }
+        }
     } else {
         // Resample: simple linear interpolation
         double ratio = (double)srcRate / (double)targetRate;
+
+        if (srcFrames < 2) {
+            // Too few frames to interpolate
+            resamplePos_ = 0.0;
+            return;
+        }
 
         for (uint32_t i = 0; ; i++) {
             double srcPos = resamplePos_ + i * ratio;
@@ -246,16 +292,17 @@ void AudioCapture::resampleAndDeliver(const float* src, uint32_t srcFrames,
 
             uint32_t idx = (uint32_t)srcPos;
             float frac = (float)(srcPos - idx);
+            uint32_t idx1 = idx + 1 < srcFrames ? idx + 1 : idx;
 
             for (uint32_t ch = 0; ch < targetChannels; ch++) {
                 float s0 = 0.0f, s1 = 0.0f;
                 if (ch < srcChannels) {
                     s0 = src[idx * srcChannels + ch];
-                    s1 = src[(idx + 1) * srcChannels + ch];
+                    s1 = src[idx1 * srcChannels + ch];
                 } else if (srcChannels == 1) {
                     // Mono to stereo: duplicate
                     s0 = src[idx * srcChannels];
-                    s1 = src[(idx + 1) * srcChannels];
+                    s1 = src[idx1 * srcChannels];
                 }
                 resampleBuf_.push_back(s0 + frac * (s1 - s0));
             }

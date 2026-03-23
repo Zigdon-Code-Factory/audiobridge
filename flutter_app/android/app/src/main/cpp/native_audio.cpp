@@ -151,7 +151,7 @@ public:
         oboe::AudioStreamBuilder builder;
         builder.setDirection(oboe::Direction::Output)
                ->setPerformanceMode(oboe::PerformanceMode::LowLatency)
-               ->setSharingMode(oboe::SharingMode::Exclusive)
+               ->setSharingMode(oboe::SharingMode::Shared)
                ->setFormat(oboe::AudioFormat::I16)
                ->setChannelCount(CHANNELS)
                ->setSampleRate(SAMPLE_RATE)
@@ -388,11 +388,11 @@ public:
         oboe::AudioStreamBuilder builder;
         builder.setDirection(oboe::Direction::Input)
                ->setPerformanceMode(oboe::PerformanceMode::LowLatency)
-               ->setSharingMode(oboe::SharingMode::Exclusive)
+               ->setSharingMode(oboe::SharingMode::Shared)
                ->setFormat(oboe::AudioFormat::I16)
                ->setChannelCount(MIC_CHANNELS)
                ->setSampleRate(SAMPLE_RATE)
-               ->setInputPreset(oboe::InputPreset::VoiceCommunication)
+               ->setInputPreset(oboe::InputPreset::Unprocessed)
                ->setFramesPerCallback(FRAME_SIZE)
                ->setDataCallback(this)
                ->setErrorCallback(this);
@@ -575,11 +575,19 @@ Java_com_audiobridge_audiobridge_MainActivity_nativeGetLatency(
 JNIEXPORT jboolean JNICALL
 Java_com_audiobridge_audiobridge_MainActivity_nativeStartRecording(
         JNIEnv* env, jobject thiz, jstring serverIp, jint port) {
-    
+
     const char* ipStr = env->GetStringUTFChars(serverIp, nullptr);
     bool result = g_recorder.start(ipStr, port);
     env->ReleaseStringUTFChars(serverIp, ipStr);
-    
+
+    // Opening an input stream can disrupt the output stream on some devices.
+    // Force-restart the player to ensure playback continues.
+    if (result) {
+        LOGI("Restarting player after recording start to ensure playback");
+        g_player.stop();
+        g_player.start();
+    }
+
     return result ? JNI_TRUE : JNI_FALSE;
 }
 

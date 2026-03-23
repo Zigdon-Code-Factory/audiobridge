@@ -23,9 +23,9 @@ public:
     AudioCapture();
     ~AudioCapture();
 
-    static std::vector<AudioDeviceInfo> getDevices();
+    static std::vector<AudioDeviceInfo> getDevices(bool loopback = true);
 
-    bool initialize(const std::wstring& deviceId = L"");
+    bool initialize(const std::wstring& deviceId = L"", bool loopback = true);
     void cleanup();
     bool start(FrameCallback callback);
     void stop();
@@ -46,6 +46,9 @@ private:
 
     uint32_t sampleRate_ = 0;
     uint32_t channels_ = 0;
+    bool loopback_ = true;
+    bool isFloat_ = true;
+    uint32_t bitsPerSample_ = 32;
 
     FrameCallback callback_;
     std::atomic<bool> running_{false};

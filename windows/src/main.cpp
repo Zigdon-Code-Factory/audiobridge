@@ -269,6 +269,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     std::atomic<bool> deviceInvalidated{false};
     std::wstring currentOutDeviceId;
     std::atomic<bool> outDeviceInvalidated{false};
+    bool loopbackMode = true;
 
     // Capture callback
     uint8_t opusBuf[4000];
@@ -295,7 +296,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     // Helper: refresh device lists in GUI
     auto refreshDeviceList = [&]() {
-        auto devs = AudioCapture::getDevices();
+        auto devs = AudioCapture::getDevices(loopbackMode);
         std::vector<std::pair<std::wstring, std::wstring>> devList;
         for (const auto& d : devs) {
             devList.push_back({d.id, d.name});
@@ -314,12 +315,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     // Helper: reinitialize audio capture with error recovery
     auto reinitAudio = [&](const std::wstring& deviceId) -> bool {
+        logPrintf("[REINIT] stop+cleanup\n");
         capture.stop();
         capture.cleanup();
 
-        if (!capture.initialize(deviceId)) {
+        logPrintf("[REINIT] initialize(loopback=%d)\n", loopbackMode);
+        if (!capture.initialize(deviceId, loopbackMode)) {
             gui.addLogMessage("ERROR: Failed to init device, trying default...");
-            if (!deviceId.empty() && capture.initialize(L"")) {
+            if (!deviceId.empty() && capture.initialize(L"", loopbackMode)) {
                 currentDeviceId = L"";
                 gui.addLogMessage("Fell back to default audio device");
             } else {
@@ -329,15 +332,19 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
             }
         }
 
+        logPrintf("[REINIT] initialized OK: %u Hz, %u ch\n", capture.getSampleRate(), capture.getChannels());
         gui.addLogMessage("Audio device: " + std::to_string(capture.getSampleRate()) + " Hz, " +
                           std::to_string(capture.getChannels()) + " ch");
 
+        logPrintf("[REINIT] starting capture...\n");
         if (!capture.start(captureCallback)) {
+            logPrintf("[REINIT] start FAILED\n");
             gui.addLogMessage("ERROR: Failed to start audio capture");
             refreshDeviceList();
             return false;
         }
 
+        logPrintf("[REINIT] capture started OK\n");
         refreshDeviceList();
         return true;
     };
@@ -391,6 +398,16 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         currentOutDeviceId = deviceId;
         gui.addLogMessage("Switching receiving device...");
         reinitOutAudio(deviceId);
+    });
+
+    gui.setCaptureModeCallback([&](bool loopback) {
+        logPrintf("[MODE] Switching capture mode to %s\n", loopback ? "loopback" : "recording");
+        loopbackMode = loopback;
+        currentDeviceId = L"";
+        gui.addLogMessage(loopback ? "Switched to loopback mode" : "Switched to recording device mode");
+        logPrintf("[MODE] Calling reinitAudio...\n");
+        bool ok = reinitAudio(L"");
+        logPrintf("[MODE] reinitAudio returned %s\n", ok ? "true" : "false");
     });
 
     // Populate initial device list

@@ -182,6 +182,14 @@ void ServerGui::setupBindings() {
         return "{}";
     });
 
+    // _setCaptureMode: user changed capture mode dropdown
+    webview_->bind("_setCaptureMode", [this](const std::string& args) -> std::string {
+        std::string mode = parseFirstString(args);
+        bool loopback = (mode != "recording");
+        if (onCaptureMode_) onCaptureMode_(loopback);
+        return "{}";
+    });
+
     // _selectDevice: user changed sending device dropdown
     webview_->bind("_selectDevice", [this](const std::string& args) -> std::string {
         int index = parseFirstInt(args);
