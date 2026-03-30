@@ -81,8 +81,46 @@ body {
     height: 6px;
     background: var(--separator);
     border-radius: 3px;
-    margin: 12px 0 10px;
     overflow: hidden;
+}
+.level-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 4px 0;
+}
+.level-label {
+    font-size: 11px;
+    color: var(--text-dim);
+    width: 68px;
+    flex-shrink: 0;
+}
+.level-row .level-bar {
+    flex: 1;
+}
+.levels-container {
+    margin: 10px 0;
+}
+.encryption-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 11px;
+    font-weight: 600;
+    padding: 2px 8px;
+    border-radius: 6px;
+    margin-left: 8px;
+    vertical-align: middle;
+}
+.encryption-badge.encrypted {
+    background: rgba(76, 175, 80, 0.15);
+    color: #4caf50;
+    border: 1px solid rgba(76, 175, 80, 0.3);
+}
+.encryption-badge.unencrypted {
+    background: rgba(255, 152, 0, 0.15);
+    color: #ff9800;
+    border: 1px solid rgba(255, 152, 0, 0.3);
 }
 .level-fill {
     height: 100%;
@@ -220,7 +258,16 @@ input[type=range]::-webkit-slider-thumb {
     </div>
     <div id="connectedInfo" style="display:none">
         <div class="client-info" id="clientInfo"></div>
-        <div class="level-bar"><div class="level-fill" id="levelFill"></div></div>
+        <div class="levels-container">
+            <div class="level-row">
+                <span class="level-label">Sending</span>
+                <div class="level-bar"><div class="level-fill" id="sendLevelFill"></div></div>
+            </div>
+            <div class="level-row">
+                <span class="level-label">Receiving</span>
+                <div class="level-bar"><div class="level-fill" id="recvLevelFill"></div></div>
+            </div>
+        </div>
         <div class="stats-row" id="statsRow1"></div>
         <div class="stats-row" id="statsRow2"></div>
     </div>
@@ -353,13 +400,20 @@ function updateStatusCard(s) {
         conn.style.display = '';
         disc.style.display = 'none';
 
-        document.getElementById('clientInfo').textContent =
-            s.clientName + '  \u2022  ' + s.clientAddress;
+        var clientInfoEl = document.getElementById('clientInfo');
+        clientInfoEl.innerHTML = s.clientName + '  \u2022  ' + s.clientAddress +
+            '<span class="encryption-badge ' + (s.encrypted ? 'encrypted' : 'unencrypted') + '">' +
+            (s.encrypted ? '\u{1F512} DTLS' : '\u{1F513} Open') + '</span>';
 
-        var level = Math.min(s.peakLevel, 1.0);
-        var fill = document.getElementById('levelFill');
-        fill.style.width = (level * 100) + '%';
-        fill.style.background = level > 0.9 ? 'var(--red)' : (level > 0.7 ? 'var(--orange)' : 'var(--green)');
+        var sendLevel = Math.min(s.peakLevel, 1.0);
+        var sendFill = document.getElementById('sendLevelFill');
+        sendFill.style.width = (sendLevel * 100) + '%';
+        sendFill.style.background = sendLevel > 0.9 ? 'var(--red)' : (sendLevel > 0.7 ? 'var(--orange)' : 'var(--green)');
+
+        var recvLevel = Math.min(s.micPeakLevel, 1.0);
+        var recvFill = document.getElementById('recvLevelFill');
+        recvFill.style.width = (recvLevel * 100) + '%';
+        recvFill.style.background = recvLevel > 0.9 ? 'var(--red)' : (recvLevel > 0.7 ? 'var(--orange)' : 'var(--green)');
 
         document.getElementById('statsRow1').textContent =
             s.packetsSent + ' pkts   ' + formatBytes(s.bytesSent) + '   ' +

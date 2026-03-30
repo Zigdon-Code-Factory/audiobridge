@@ -44,6 +44,7 @@ class ServerInfo {
   DateTime lastConnected;
   bool active; // currently discovered on LAN
   bool macVerified; // MAC matches stored record
+  String pskHex; // stored PSK for DTLS reconnection
 
   ServerInfo({
     required this.name,
@@ -52,6 +53,7 @@ class ServerInfo {
     required this.lastConnected,
     this.active = false,
     this.macVerified = false,
+    this.pskHex = '',
   });
 
   Map<String, dynamic> toJson() => {
@@ -59,6 +61,7 @@ class ServerInfo {
         'macAddress': macAddress,
         'lastIp': lastIp,
         'lastConnected': lastConnected.toIso8601String(),
+        'pskHex': pskHex,
       };
 
   factory ServerInfo.fromJson(Map<String, dynamic> json) => ServerInfo(
@@ -66,6 +69,7 @@ class ServerInfo {
         macAddress: json['macAddress'] ?? '',
         lastIp: json['lastIp'] ?? '',
         lastConnected: DateTime.tryParse(json['lastConnected'] ?? '') ?? DateTime.now(),
+        pskHex: json['pskHex'] ?? '',
       );
 }
 
@@ -89,16 +93,21 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
   String _deviceName = 'AudioBridge';
   bool _isRecording = true; // mic on by default
   bool _isMuted = false; // audio output mute
-  double _volume = 1.0; // app-level output volume 0.0–1.0
+  double _volume = 1.0; // app-level output volume 0.0-1.0
   bool _isPaused = false; // stream paused
+  bool _isEncrypted = false; // DTLS active
   String _micSource = 'auto'; // 'auto', 'phone', 'bluetooth'
+
+  // Audio level meters
+  double _outputLevel = 0.0; // 0.0-1.0 receiving level
+  double _inputLevel = 0.0;  // 0.0-1.0 sending level
 
   // Latency breakdown
   double _rttMs = 0.0;
   double _jitterBufferMs = 0.0;
   double _outputBufferMs = 0.0;
   double _serverCaptureMs = 10.0; // WASAPI default
-  int _lastPingSentUs = 0;
+  int _serverJitterMs = 0; // Jitter target from server
 
   // Now playing info from server
   String _nowPlayingTitle = '';
@@ -109,7 +118,6 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
   int _nowPlayingDurationMs = 0;
 
   RawDatagramSocket? _discoverySocket;
-  RawDatagramSocket? _audioSocket;
   Timer? _discoveryTimer;
   Timer? _keepaliveTimer;
   Timer? _timeoutTimer;
@@ -134,22 +142,73 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
     _loadHistory();
     _loadOrCreateDeviceId();
     _loadDeviceName();
+    _requestPermissions();
 
-    // Handle media actions from notification
+    // Handle callbacks from native and media notification actions
     _channel.setMethodCallHandler((call) async {
-      if (call.method == 'onMediaAction') {
-        final action = call.arguments as String?;
-        switch (action) {
-          case 'toggleMic':
-            _toggleMic(!_isRecording);
-            break;
-          case 'togglePause':
-            _mediaPlayPause();
-            break;
-          case 'disconnect':
-            _disconnect();
-            break;
-        }
+      switch (call.method) {
+        case 'onMediaAction':
+          final action = call.arguments as String?;
+          switch (action) {
+            case 'toggleMic':
+              _toggleMic(!_isRecording);
+              break;
+            case 'togglePause':
+              _mediaPlayPause();
+              break;
+            case 'disconnect':
+              _disconnect();
+              break;
+          }
+          break;
+
+        case 'onMediaInfo':
+          // Media info packet from native recv thread
+          try {
+            final jsonStr = call.arguments as String? ?? '';
+            if (jsonStr.isNotEmpty) {
+              final info = jsonDecode(jsonStr) as Map<String, dynamic>;
+              if (mounted) {
+                setState(() {
+                  _nowPlayingTitle = (info['t'] as String?) ?? '';
+                  _nowPlayingArtist = (info['a'] as String?) ?? '';
+                  _nowPlayingAlbum = (info['al'] as String?) ?? '';
+                  _nowPlayingStatus = (info['s'] as int?) ?? 0;
+                  _nowPlayingPositionMs = (info['p'] as int?) ?? 0;
+                  _nowPlayingDurationMs = (info['d'] as int?) ?? 0;
+                });
+              }
+            }
+          } catch (_) {}
+          break;
+
+        case 'onDisconnected':
+          // Server disconnect or DTLS error from native
+          final reason = call.arguments as String? ?? '';
+          _handleNativeDisconnect(reason);
+          break;
+
+        case 'onPairPending':
+          // Pair pending notification from native connect thread
+          if (mounted) {
+            setState(() {
+              _state = ConnectionState_.pairPending;
+              _statusMessage = 'Waiting for server approval...';
+            });
+          }
+          break;
+
+        case 'onSettingsUpdate':
+          // Server sent jitter buffer setting
+          try {
+            final jitterMs = int.tryParse(call.arguments as String? ?? '') ?? 0;
+            if (jitterMs > 0 && mounted) {
+              setState(() {
+                _serverJitterMs = jitterMs;
+              });
+            }
+          } catch (_) {}
+          break;
       }
       return null;
     });
@@ -160,6 +219,62 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
     _pulseController.dispose();
     _disconnect();
     super.dispose();
+  }
+
+  void _handleNativeDisconnect(String reason) {
+    _keepaliveTimer?.cancel();
+    _keepaliveTimer = null;
+    _latencyTimer?.cancel();
+    _latencyTimer = null;
+    _timeoutTimer?.cancel();
+    _timeoutTimer = null;
+
+    try {
+      _channel.invokeMethod('stopAudio');
+      _channel.invokeMethod('stopRecording');
+      _channel.invokeMethod('disconnect');
+    } catch (_) {}
+
+    if (mounted) {
+      setState(() {
+        _state = ConnectionState_.disconnected;
+        _latencyMs = 0;
+        _serverName = '';
+        _serverAddress = '';
+        _serverMac = '';
+        _statusMessage = 'Disconnected';
+        _isPaused = false;
+        _isMuted = false;
+        _isEncrypted = false;
+        _volume = 1.0;
+        _rttMs = 0.0;
+        _outputLevel = 0.0;
+        _inputLevel = 0.0;
+        _jitterBufferMs = 0.0;
+        _outputBufferMs = 0.0;
+        _serverJitterMs = 0;
+        _nowPlayingTitle = '';
+        _nowPlayingArtist = '';
+        _nowPlayingAlbum = '';
+        _nowPlayingStatus = 0;
+        _nowPlayingPositionMs = 0;
+        _nowPlayingDurationMs = 0;
+      });
+
+      final message = reason == 'server_disconnect'
+          ? 'Server disconnected'
+          : reason == 'dtls_error'
+              ? 'Connection lost (encryption error)'
+              : reason == 'timeout'
+                  ? 'Server not responding'
+                  : 'Connection lost';
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(message),
+          behavior: SnackBarBehavior.floating,
+        ),
+      );
+    }
   }
 
   // --- Persistence ---
@@ -205,6 +320,12 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
           setState(() => _deviceName = name);
         }
       }
+    } catch (_) {}
+  }
+
+  Future<void> _requestPermissions() async {
+    try {
+      await _channel.invokeMethod('requestPermissions');
     } catch (_) {}
   }
 
@@ -273,21 +394,33 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
     } catch (e) {}
   }
 
-  void _recordConnection(String name, String mac, String ip) {
+  void _recordConnection(String name, String mac, String ip, {String pskHex = ''}) {
     final existing = _knownServers.where((s) => s.macAddress == mac).toList();
     if (existing.isNotEmpty) {
       existing.first.name = name;
       existing.first.lastIp = ip;
       existing.first.lastConnected = DateTime.now();
+      if (pskHex.isNotEmpty) {
+        existing.first.pskHex = pskHex;
+      }
     } else {
       _knownServers.add(ServerInfo(
         name: name,
         macAddress: mac,
         lastIp: ip,
         lastConnected: DateTime.now(),
+        pskHex: pskHex,
       ));
     }
     _saveHistory();
+  }
+
+  /// Look up stored PSK for a server by MAC address
+  String _getStoredPsk(String mac) {
+    if (mac.isEmpty) return '';
+    final matches = _knownServers.where((s) => s.macAddress == mac).toList();
+    if (matches.isNotEmpty) return matches.first.pskHex;
+    return '';
   }
 
   // --- Discovery ---
@@ -424,51 +557,31 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
     _stopDiscovery();
 
     try {
-      _audioSocket = await RawDatagramSocket.bind(InternetAddress.anyIPv4, 0);
-      final completer = Completer<String>();
-      _audioSocket!.listen((event) {
-        if (event == RawSocketEvent.read) {
-          final datagram = _audioSocket!.receive();
-          if (datagram != null) {
-            _lastPacketTime = DateTime.now();
-            final msg = String.fromCharCodes(datagram.data);
-            if (msg == 'AB_ACCEPT' && !completer.isCompleted) {
-              completer.complete('accepted');
-              return;
-            }
-            if (msg == 'AB_PAIR_PENDING' && !completer.isCompleted) {
-              if (mounted) {
-                setState(() {
-                  _state = ConnectionState_.pairPending;
-                  _statusMessage = 'Waiting for server approval...';
-                });
-              }
-              return;
-            }
-            if (msg.startsWith('AB_REJECT') && !completer.isCompleted) {
-              final reason = msg.contains('|') ? msg.split('|')[1] : 'Connection denied';
-              completer.complete('rejected:$reason');
-              return;
-            }
-            _handlePacket(datagram.data);
-          }
-        }
+      // Look up stored PSK for this server
+      final storedPsk = _getStoredPsk(mac);
+
+      // Delegate entire connection lifecycle to native
+      final result = await _channel.invokeMethod<String>('connect', {
+        'ip': address.address,
+        'port': port,
+        'deviceName': _deviceName,
+        'deviceId': _deviceId,
+        'pskHex': storedPsk,
       });
 
-      final connectMsg = Uint8List.fromList('AB_CONNECT|$_deviceName|$_deviceId'.codeUnits);
-      _audioSocket!.send(connectMsg, address, port);
-
-      final result = await completer.future.timeout(
-        const Duration(seconds: 35),
-        onTimeout: () => 'timeout',
-      );
-
-      if (result != 'accepted') {
+      if (result == null || (!result.startsWith('accepted'))) {
         String message;
         if (result == 'timeout') {
           message = 'Server did not respond';
-        } else if (result.startsWith('rejected:')) {
+        } else if (result != null && result.startsWith('rejected|')) {
           message = result.substring(9);
+        } else if (result == 'pair_pending') {
+          // This shouldn't happen since native blocks until accept/reject
+          message = 'Approval timed out';
+        } else if (result == 'dtls_failed') {
+          message = 'Encryption handshake failed';
+        } else if (result != null && result.startsWith('error|')) {
+          message = result.substring(6);
         } else {
           message = 'Connection failed';
         }
@@ -476,22 +589,37 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
           _state = ConnectionState_.disconnected;
           _statusMessage = message;
         });
-        _audioSocket?.close();
-        _audioSocket = null;
         return;
       }
 
+      // Extract PSK if this was a first pairing
+      String newPsk = '';
+      if (result.startsWith('accepted|') && result.length > 9) {
+        newPsk = result.substring(9);
+      }
+      // Check actual DTLS state from native (not just PSK presence)
+      try {
+        _isEncrypted = await _channel.invokeMethod<bool>('isDtlsActive') ?? false;
+      } catch (_) {
+        _isEncrypted = false;
+      }
+
+      // Start audio playback
       await _channel.invokeMethod('startAudio', {'serverName': name});
+
+      // Start mic recording if enabled
       if (_isRecording) {
         try {
           await _channel.invokeMethod('startRecording', {
             'ip': address.address,
             'port': port,
+            'micSource': _micSource,
           });
         } catch (_) {}
       }
 
-      _recordConnection(name, mac, address.address);
+      // Record connection with PSK
+      _recordConnection(name, mac, address.address, pskHex: newPsk.isNotEmpty ? newPsk : storedPsk);
 
       setState(() {
         _state = ConnectionState_.connected;
@@ -499,20 +627,29 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
       });
 
       _updateServiceState();
+      _lastPacketTime = DateTime.now();
 
+      // Start keepalive and ping timers (using native send methods)
       _keepaliveTimer = Timer.periodic(const Duration(milliseconds: 1000), (timer) {
-        _sendKeepalive(address, port);
+        _channel.invokeMethod('sendKeepalive');
         // Send ping every 2 seconds (every other keepalive)
         if (timer.tick % 2 == 0) {
-          _sendPing(address, port);
+          _channel.invokeMethod('sendPing');
         }
       });
 
+      // Poll latency breakdown and RTT from native
       _latencyTimer = Timer.periodic(const Duration(milliseconds: 500), (_) async {
         try {
-          final breakdown = await _channel.invokeMethod<Map>('getLatencyBreakdown');
+          final results = await Future.wait([
+            _channel.invokeMethod<Map>('getLatencyBreakdown'),
+            _channel.invokeMethod<double>('getRtt'),
+          ]);
+          final breakdown = results[0] as Map?;
+          final rtt = results[1] as double? ?? 0.0;
           if (breakdown != null && mounted) {
             setState(() {
+              _rttMs = rtt;
               _jitterBufferMs = (breakdown['jitterBufferMs'] as num?)?.toDouble() ?? 0.0;
               _outputBufferMs = (breakdown['outputBufferMs'] as num?)?.toDouble() ?? 0.0;
               _latencyMs = (_rttMs / 2) + _jitterBufferMs + _outputBufferMs + _serverCaptureMs;
@@ -521,19 +658,14 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
         } catch (_) {}
       });
 
-      _timeoutTimer = Timer.periodic(const Duration(seconds: 1), (_) {
-        if (_lastPacketTime != null &&
-            DateTime.now().difference(_lastPacketTime!).inSeconds > 5) {
-          _disconnect();
-          if (mounted) {
-            ScaffoldMessenger.of(context).showSnackBar(
-              const SnackBar(
-                content: Text('Server disconnected (timeout)'),
-                behavior: SnackBarBehavior.floating,
-              ),
-            );
+      // Check native connection status periodically for timeout detection
+      _timeoutTimer = Timer.periodic(const Duration(seconds: 2), (_) async {
+        try {
+          final connected = await _channel.invokeMethod<bool>('isConnected') ?? false;
+          if (!connected && _state == ConnectionState_.connected) {
+            _handleNativeDisconnect('timeout');
           }
-        }
+        } catch (_) {}
       });
     } catch (e) {
       setState(() {
@@ -548,72 +680,6 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
           ),
         );
       }
-    }
-  }
-
-  void _handlePacket(Uint8List data) {
-    if (data.length < 16) return;
-
-    final version = data[0];
-    final type = data[1];
-
-    if (version != 0x01) return;
-
-    if (type == 0x01) {
-      _channel.invokeMethod('feedAudio', data);
-    } else if (type == 0x03) {
-      if (data.length >= 17 && data[16] == 0x03) {
-        _disconnect();
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(
-              content: Text('Server disconnected'),
-              behavior: SnackBarBehavior.floating,
-            ),
-          );
-        }
-      }
-    } else if (type == 0x06) {
-      // PING from server — respond with PONG echoing timestamp
-      final pong = Uint8List(16);
-      pong[0] = 0x01;
-      pong[1] = 0x07; // PONG
-      // Copy timestamp from ping
-      for (int i = 2; i < 16; i++) pong[i] = data[i];
-      if (_audioSocket != null && _serverAddress.isNotEmpty) {
-        _audioSocket!.send(pong, InternetAddress(_serverAddress), 4012);
-      }
-    } else if (type == 0x07) {
-      // PONG from server — compute RTT
-      if (_lastPingSentUs > 0) {
-        final nowUs = DateTime.now().microsecondsSinceEpoch;
-        final rtt = (nowUs - _lastPingSentUs) / 1000.0;
-        if (mounted) {
-          setState(() {
-            if (_rttMs == 0.0) {
-              _rttMs = rtt;
-            } else {
-              _rttMs = _rttMs * 0.7 + rtt * 0.3; // EWMA
-            }
-          });
-        }
-      }
-    } else if (type == 0x05 && data.length > 16) {
-      // Media info packet
-      try {
-        final jsonStr = utf8.decode(data.sublist(16));
-        final info = jsonDecode(jsonStr) as Map<String, dynamic>;
-        if (mounted) {
-          setState(() {
-            _nowPlayingTitle = (info['t'] as String?) ?? '';
-            _nowPlayingArtist = (info['a'] as String?) ?? '';
-            _nowPlayingAlbum = (info['al'] as String?) ?? '';
-            _nowPlayingStatus = (info['s'] as int?) ?? 0;
-            _nowPlayingPositionMs = (info['p'] as int?) ?? 0;
-            _nowPlayingDurationMs = (info['d'] as int?) ?? 0;
-          });
-        }
-      } catch (_) {}
     }
   }
 
@@ -650,7 +716,7 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
               const SizedBox(height: 16),
               _latencyRow('Network (one-way)', networkOneWay, cs),
               _latencyRow('Server capture buffer', _serverCaptureMs, cs),
-              _latencyRow('Jitter buffer', _jitterBufferMs, cs),
+              _latencyRow('Jitter buffer${_serverJitterMs > 0 ? ' (target: ${_serverJitterMs}ms)' : ''}', _jitterBufferMs, cs),
               _latencyRow('Audio output buffer', _outputBufferMs, cs),
               const SizedBox(height: 8),
               Divider(color: cs.outlineVariant.withOpacity(0.3)),
@@ -662,6 +728,37 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
           ),
         );
       },
+    );
+  }
+
+  Widget _buildLevelBar(String label, double level, Color color, ColorScheme cs) {
+    return Row(
+      children: [
+        SizedBox(
+          width: 68,
+          child: Text(
+            label,
+            style: Theme.of(context).textTheme.labelSmall?.copyWith(
+              color: cs.onSurface.withOpacity(0.5),
+            ),
+          ),
+        ),
+        Expanded(
+          child: ClipRRect(
+            borderRadius: BorderRadius.circular(3),
+            child: SizedBox(
+              height: 6,
+              child: LinearProgressIndicator(
+                value: level.clamp(0.0, 1.0),
+                backgroundColor: cs.surfaceContainerHighest,
+                valueColor: AlwaysStoppedAnimation(
+                  level > 0.8 ? Colors.red : (level > 0.5 ? Colors.amber : color),
+                ),
+              ),
+            ),
+          ),
+        ),
+      ],
     );
   }
 
@@ -687,25 +784,6 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
         ],
       ),
     );
-  }
-
-  void _sendPing(InternetAddress address, int port) {
-    final packet = Uint8List(16);
-    packet[0] = 0x01;
-    packet[1] = 0x06; // PING
-    _lastPingSentUs = DateTime.now().microsecondsSinceEpoch;
-    _audioSocket?.send(packet, address, port);
-  }
-
-  void _sendKeepalive(InternetAddress address, int port) {
-    final packet = Uint8List(16);
-    final view = ByteData.view(packet.buffer);
-    packet[0] = 0x01;
-    packet[1] = 0x02;
-    view.setUint32(2, 0, Endian.little);
-    view.setUint64(6, 0, Endian.little);
-    view.setUint16(14, 0, Endian.little);
-    _audioSocket?.send(packet, address, port);
   }
 
   // --- Media Controls ---
@@ -794,15 +872,8 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
   }
 
   void _sendControlCommand(int cmd) {
-    final packet = Uint8List(17);
-    packet[0] = 0x01; // version
-    packet[1] = 0x03; // control
-    packet[14] = 1; // payload length
-    packet[15] = 0;
-    packet[16] = cmd;
-
     try {
-      _audioSocket?.send(packet, InternetAddress(_serverAddress), 4012);
+      _channel.invokeMethod('sendControl', cmd);
     } catch (_) {}
   }
 
@@ -826,23 +897,10 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
     _stopDiscovery();
 
     try {
-      await _channel.invokeMethod('stopAudio');
       await _channel.invokeMethod('stopRecording');
+      await _channel.invokeMethod('stopAudio');
+      await _channel.invokeMethod('disconnect');
     } catch (_) {}
-
-    if (_audioSocket != null && _serverAddress.isNotEmpty) {
-      try {
-        final disconnectMsg = Uint8List.fromList('AB_DISCONNECT'.codeUnits);
-        _audioSocket!.send(
-          disconnectMsg,
-          InternetAddress(_serverAddress),
-          4012,
-        );
-      } catch (_) {}
-    }
-
-    _audioSocket?.close();
-    _audioSocket = null;
 
     if (mounted) {
       setState(() {
@@ -854,11 +912,14 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
         _statusMessage = 'Disconnected';
         _isPaused = false;
         _isMuted = false;
+        _isEncrypted = false;
         _volume = 1.0;
         _rttMs = 0.0;
+        _outputLevel = 0.0;
+        _inputLevel = 0.0;
         _jitterBufferMs = 0.0;
         _outputBufferMs = 0.0;
-        _lastPingSentUs = 0;
+        _serverJitterMs = 0;
         _nowPlayingTitle = '';
         _nowPlayingArtist = '';
         _nowPlayingAlbum = '';
@@ -969,13 +1030,54 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
                     fontWeight: FontWeight.bold,
                   ),
             ),
-            const SizedBox(height: 2),
-            Text(
-              _serverAddress,
-              style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                    color: cs.onSurface.withOpacity(0.35),
-                    fontFamily: 'monospace',
+            const SizedBox(height: 6),
+            // Server address + encryption badge
+            Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(
+                  _serverAddress,
+                  style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                        color: cs.onSurface.withOpacity(0.35),
+                        fontFamily: 'monospace',
+                      ),
+                ),
+                const SizedBox(width: 8),
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                  decoration: BoxDecoration(
+                    color: _isEncrypted
+                        ? Colors.green.withOpacity(0.15)
+                        : Colors.orange.withOpacity(0.15),
+                    borderRadius: BorderRadius.circular(6),
+                    border: Border.all(
+                      color: _isEncrypted
+                          ? Colors.green.withOpacity(0.4)
+                          : Colors.orange.withOpacity(0.4),
+                      width: 0.5,
+                    ),
                   ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(
+                        _isEncrypted ? Icons.lock_rounded : Icons.lock_open_rounded,
+                        size: 11,
+                        color: _isEncrypted ? Colors.green : Colors.orange,
+                      ),
+                      const SizedBox(width: 3),
+                      Text(
+                        _isEncrypted ? 'DTLS' : 'Open',
+                        style: TextStyle(
+                          fontSize: 10,
+                          fontWeight: FontWeight.w600,
+                          color: _isEncrypted ? Colors.green : Colors.orange,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
             ),
             const SizedBox(height: 28),
 

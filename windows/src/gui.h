@@ -21,7 +21,9 @@ struct ServerStats {
     uint64_t bytesSent = 0;
     double kbps = 0.0;
     float peakLevel = 0.0f;
-    int jitterBufferMs = 10;
+    float micPeakLevel = 0.0f;
+    bool encrypted = false;
+    int jitterBufferMs = 20;
     uint32_t sequenceNum = 0;
     double uptimeSeconds = 0.0;
     std::string serverName;
@@ -74,6 +76,7 @@ public:
     void setCaptureModeCallback(CaptureModeCallback cb) { onCaptureMode_ = cb; }
     void setTickCallback(TickCallback cb) { onTick_ = cb; }
     int getJitterBufferMs() const { return jitterBufferMs_; }
+    void setJitterBufferMs(int ms) { jitterBufferMs_ = ms; }
 
 private:
     void setupBindings();

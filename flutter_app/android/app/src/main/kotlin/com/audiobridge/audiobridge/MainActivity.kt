@@ -30,7 +30,7 @@ class MainActivity : FlutterActivity() {
         }
     }
 
-    // Native methods
+    // Existing native methods
     private external fun nativeStartAudio(): Boolean
     private external fun nativeStopAudio()
     private external fun nativeFeedAudio(data: ByteArray)
@@ -40,6 +40,32 @@ class MainActivity : FlutterActivity() {
     private external fun nativeSetMuted(muted: Boolean)
     private external fun nativeSetVolume(volume: Float)
     private external fun nativeGetLatencyBreakdown(): DoubleArray
+    private external fun nativeGetOutputPeakLevel(): Float
+    private external fun nativeGetInputPeakLevel(): Float
+
+    // New ConnectionManager native methods
+    private external fun nativeConnect(serverIp: String, serverPort: Int,
+                                       deviceName: String, deviceId: String,
+                                       pskHex: String): String
+    private external fun nativeDisconnect()
+    private external fun nativeSendControl(cmd: Int)
+    private external fun nativeSendKeepalive()
+    private external fun nativeSendPing()
+    private external fun nativeGetRtt(): Double
+    private external fun nativeIsConnected(): Boolean
+    private external fun nativeIsDtlsActive(): Boolean
+
+    // Called from native recv thread via JNI to notify Dart of events
+    @Suppress("unused")
+    fun onNativeEvent(method: String, data: String) {
+        runOnUiThread {
+            try {
+                methodChannel?.invokeMethod(method, data)
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to invoke Dart method '$method': ${e.message}")
+            }
+        }
+    }
 
     private fun isBluetoothHeadsetConnected(): Boolean {
         try {
@@ -94,6 +120,26 @@ class MainActivity : FlutterActivity() {
 
         channel.setMethodCallHandler { call, result ->
             when (call.method) {
+                "requestPermissions" -> {
+                    val perms = mutableListOf<String>()
+                    if (ContextCompat.checkSelfPermission(this@MainActivity, android.Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+                        perms.add(android.Manifest.permission.RECORD_AUDIO)
+                    }
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                        if (ContextCompat.checkSelfPermission(this@MainActivity, android.Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                            perms.add(android.Manifest.permission.POST_NOTIFICATIONS)
+                        }
+                    }
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                        if (ContextCompat.checkSelfPermission(this@MainActivity, android.Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
+                            perms.add(android.Manifest.permission.BLUETOOTH_CONNECT)
+                        }
+                    }
+                    if (perms.isNotEmpty()) {
+                        requestPermissions(perms.toTypedArray(), 100)
+                    }
+                    result.success(null)
+                }
                 "startAudio" -> {
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                         if (ContextCompat.checkSelfPermission(this@MainActivity, android.Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
@@ -176,13 +222,9 @@ class MainActivity : FlutterActivity() {
                             "phone" -> { /* no SCO, use built-in mic */ }
                         }
 
-                        val ip = args?.get("ip") as? String
-                        val port = args?.get("port") as? Int
-                        if (ip != null && port != null) {
-                            result.success(nativeStartRecording(ip, port))
-                        } else {
-                            result.error("INVALID_ARGS", "Missing ip or port", null)
-                        }
+                        val ip = args?.get("ip") as? String ?: ""
+                        val port = args?.get("port") as? Int ?: 0
+                        result.success(nativeStartRecording(ip, port))
                     }
                 }
                 "stopRecording" -> {
@@ -212,6 +254,55 @@ class MainActivity : FlutterActivity() {
                         startService(updateIntent)
                     }
                     result.success(null)
+                }
+                // New ConnectionManager methods
+                "connect" -> {
+                    val args = call.arguments as? Map<String, Any>
+                    val ip = args?.get("ip") as? String ?: ""
+                    val port = args?.get("port") as? Int ?: 4012
+                    val devName = args?.get("deviceName") as? String ?: "AudioBridge"
+                    val devId = args?.get("deviceId") as? String ?: ""
+                    val psk = args?.get("pskHex") as? String ?: ""
+
+                    // Run nativeConnect on a background thread since it blocks
+                    Thread {
+                        val connectResult = nativeConnect(ip, port, devName, devId, psk)
+                        runOnUiThread {
+                            result.success(connectResult)
+                        }
+                    }.start()
+                }
+                "disconnect" -> {
+                    nativeDisconnect()
+                    result.success(null)
+                }
+                "sendControl" -> {
+                    val cmd = call.arguments as? Int ?: 0
+                    nativeSendControl(cmd)
+                    result.success(null)
+                }
+                "sendKeepalive" -> {
+                    nativeSendKeepalive()
+                    result.success(null)
+                }
+                "sendPing" -> {
+                    nativeSendPing()
+                    result.success(null)
+                }
+                "getRtt" -> {
+                    result.success(nativeGetRtt())
+                }
+                "isConnected" -> {
+                    result.success(nativeIsConnected())
+                }
+                "isDtlsActive" -> {
+                    result.success(nativeIsDtlsActive())
+                }
+                "getAudioLevels" -> {
+                    result.success(mapOf(
+                        "output" to nativeGetOutputPeakLevel().toDouble(),
+                        "input" to nativeGetInputPeakLevel().toDouble()
+                    ))
                 }
                 else -> result.notImplemented()
             }

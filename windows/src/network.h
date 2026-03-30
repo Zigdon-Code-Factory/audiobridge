@@ -10,7 +10,9 @@
 #include <functional>
 #include <chrono>
 #include <map>
+#include <memory>
 #include <condition_variable>
+#include "dtls_session.h"
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "iphlpapi.lib")
@@ -31,6 +33,7 @@ enum PacketType : uint8_t {
     PACKET_MEDIA_INFO = 0x05,
     PACKET_PING      = 0x06,
     PACKET_PONG      = 0x07,
+    PACKET_SETTINGS  = 0x08,
 };
 
 enum ControlCmd : uint8_t {
@@ -47,6 +50,7 @@ struct ApprovedPeer {
     std::string clientId;   // MAC address or UUID
     std::string clientName;
     int64_t lastConnected;  // unix timestamp (seconds)
+    std::string pskHex;     // 64-char hex string, empty for legacy peers
 };
 
 class Network {
@@ -94,6 +98,7 @@ public:
 
     bool isConnected() const { return connected_; }
     bool isPaused() const { return paused_; }
+    bool isDtlsActive() const { return dtlsActive_; }
 
     // Send audio packet (16-byte header + opus payload)
     void sendAudio(const uint8_t* opusData, int opusLen);
@@ -110,6 +115,9 @@ public:
     // Send media info to connected client
     void sendMediaInfo(const std::string& json);
 
+    // Send jitter buffer settings to connected client (ms)
+    void sendSettings(int jitterMs);
+
     std::string getClientAddress() const;
     std::string getServerMac() const { return macAddress_; }
 
@@ -117,7 +125,16 @@ private:
     void discoveryThread();
     void streamThread();
     void writeHeader(uint8_t* buf, uint8_t type, uint16_t payloadLen);
+    void sendPacket(const uint8_t* data, size_t len);
     static std::string getMacAddress();
+
+    // DTLS
+    bool startDtlsHandshake(const sockaddr_in& clientAddr, const std::string& clientId);
+    void endDtlsSession();
+    void endDtlsSessionLocked(); // Must be called with dtlsMutex_ held
+    bool pskLookup(const std::string& identity, std::vector<uint8_t>& outPsk);
+    std::string getPeerPsk(const std::string& clientId) const;
+    void setPeerPsk(const std::string& clientId, const std::string& pskHex);
 
     // Peer persistence
     void loadApprovedPeers();
@@ -139,7 +156,7 @@ private:
     std::thread streamThread_;
 
     sockaddr_in clientAddr_{};
-    std::mutex clientMutex_;
+    mutable std::mutex clientMutex_;
 
     uint32_t sequence_ = 0;
     std::chrono::steady_clock::time_point streamStart_;
@@ -174,4 +191,16 @@ private:
     PendingPeer pendingPeer_;
     std::mutex pendingMutex_;
     std::condition_variable pendingCv_;
+
+    // DTLS session (protected by dtlsMutex_)
+    std::mutex dtlsMutex_;
+    std::unique_ptr<DtlsSession> dtlsSession_;
+    bool dtlsActive_ = false;
+    std::string connectedClientId_;
+
+    // Per-connection diagnostic counters (reset on each new connection)
+    std::atomic<int> dtlsRecvCount_{0};
+    std::atomic<int> dtlsDecryptCount_{0};
+    std::atomic<int> dtlsSendCount_{0};
+    std::atomic<int> dtlsSendErrCount_{0};
 };

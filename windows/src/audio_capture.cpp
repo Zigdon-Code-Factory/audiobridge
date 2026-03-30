@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cmath>
+#include <chrono>
 
 #pragma comment(lib, "avrt.lib")
 
@@ -196,17 +197,32 @@ void AudioCapture::stop() {
 }
 
 void AudioCapture::captureThread() {
+    printf("[CAPTURE] Thread started (tid=%lu, rate=%u, ch=%u, %s)\n",
+           GetCurrentThreadId(), sampleRate_, channels_, isFloat_ ? "float" : "int");
+
     // Boost thread priority for low latency
     DWORD taskIndex = 0;
     HANDLE task = AvSetMmThreadCharacteristicsW(L"Pro Audio", &taskIndex);
+    if (!task) {
+        printf("[CAPTURE] WARN: AvSetMmThreadCharacteristics failed (err=%lu)\n", GetLastError());
+    }
+
+    // Diagnostic counters
+    uint64_t totalFrames = 0;
+    uint64_t silenceFrames = 0;
+    uint64_t deliveryCount = 0;
+    uint64_t getBufferFailCount = 0;
+    auto lastStatsTime = std::chrono::steady_clock::now();
 
     while (running_) {
         UINT32 packetLength = 0;
         HRESULT hr = captureClient_->GetNextPacketSize(&packetLength);
         if (FAILED(hr)) {
             if (hr == AUDCLNT_E_DEVICE_INVALIDATED) {
-                printf("Audio device invalidated\n");
+                printf("[CAPTURE] Audio device invalidated (AUDCLNT_E_DEVICE_INVALIDATED)\n");
                 if (onDeviceInvalidated_) onDeviceInvalidated_();
+            } else {
+                printf("[CAPTURE] GetNextPacketSize failed: 0x%08lx\n", hr);
             }
             break;
         }
@@ -217,15 +233,26 @@ void AudioCapture::captureThread() {
             DWORD flags = 0;
 
             hr = captureClient_->GetBuffer(&data, &numFrames, &flags, nullptr, nullptr);
-            if (FAILED(hr)) break;
+            if (FAILED(hr)) {
+                getBufferFailCount++;
+                if (getBufferFailCount <= 5 || (getBufferFailCount % 100) == 0) {
+                    printf("[CAPTURE] GetBuffer failed #%llu: 0x%08lx\n", getBufferFailCount, hr);
+                }
+                break;
+            }
+
+            totalFrames += numFrames;
 
             if (flags & AUDCLNT_BUFFERFLAGS_SILENT) {
+                silenceFrames += numFrames;
                 // Deliver silence matching actual device format
                 std::vector<float> silence(numFrames * channels_, 0.0f);
                 resampleAndDeliver(silence.data(), numFrames, channels_, sampleRate_);
+                deliveryCount++;
             } else if (isFloat_) {
                 const float* floatData = reinterpret_cast<const float*>(data);
                 resampleAndDeliver(floatData, numFrames, channels_, sampleRate_);
+                deliveryCount++;
             } else {
                 // Convert int16 to float
                 const int16_t* intData = reinterpret_cast<const int16_t*>(data);
@@ -235,15 +262,28 @@ void AudioCapture::captureThread() {
                     floatBuf[i] = intData[i] / 32768.0f;
                 }
                 resampleAndDeliver(floatBuf.data(), numFrames, channels_, sampleRate_);
+                deliveryCount++;
             }
 
             captureClient_->ReleaseBuffer(numFrames);
             captureClient_->GetNextPacketSize(&packetLength);
         }
 
+        // Periodic stats logging (every 5 seconds)
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - lastStatsTime).count();
+        if (elapsed >= 5) {
+            printf("[CAPTURE] Stats: frames=%llu, silence=%llu (%.1f%%), deliveries=%llu, getBufFails=%llu, resBuf=%zu\n",
+                   totalFrames, silenceFrames,
+                   totalFrames > 0 ? (100.0 * silenceFrames / totalFrames) : 0.0,
+                   deliveryCount, getBufferFailCount, resampleBuf_.size());
+            lastStatsTime = now;
+        }
+
         Sleep(1); // ~1ms poll
     }
 
+    printf("[CAPTURE] Thread exiting (total frames=%llu)\n", totalFrames);
     if (task) AvRevertMmThreadCharacteristics(task);
 }
 

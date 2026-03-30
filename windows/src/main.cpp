@@ -79,6 +79,50 @@ static LONG WINAPI CrashHandler(EXCEPTION_POINTERS* ex) {
     return EXCEPTION_EXECUTE_HANDLER;
 }
 
+// --- Settings persistence ---
+
+struct AppSettings {
+    int jitterBufferMs = 20;
+    bool loopbackMode = true;
+    std::string inputDeviceName;   // empty = default
+    std::string outputDeviceName;  // empty = default
+};
+
+static std::string getSettingsPath() {
+    return getExeDir() + "audiobridge_settings.txt";
+}
+
+static AppSettings loadSettings() {
+    AppSettings s;
+    std::ifstream file(getSettingsPath());
+    if (!file.is_open()) return s;
+
+    std::string line;
+    while (std::getline(file, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        auto eq = line.find('=');
+        if (eq == std::string::npos) continue;
+        std::string key = line.substr(0, eq);
+        std::string val = line.substr(eq + 1);
+        if (key == "jitter") { try { s.jitterBufferMs = std::stoi(val); } catch (...) {} }
+        else if (key == "mode") { s.loopbackMode = (val != "recording"); }
+        else if (key == "input") { s.inputDeviceName = val; }
+        else if (key == "output") { s.outputDeviceName = val; }
+    }
+    return s;
+}
+
+static void saveSettings(const AppSettings& s) {
+    std::ofstream file(getSettingsPath(), std::ios::trunc);
+    if (!file.is_open()) return;
+    file << "# AudioBridge settings\n";
+    file << "jitter=" << s.jitterBufferMs << "\n";
+    file << "mode=" << (s.loopbackMode ? "loopback" : "recording") << "\n";
+    file << "input=" << s.inputDeviceName << "\n";
+    file << "output=" << s.outputDeviceName << "\n";
+}
+
+
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
     SetUnhandledExceptionFilter(CrashHandler);
 
@@ -91,6 +135,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         ctime_s(timeBuf, sizeof(timeBuf), &now);
         fprintf(g_logFile, "\n=== AudioBridge started at %s", timeBuf);
         fflush(g_logFile);
+        // Redirect stdout/stderr to log file so printf() from network.cpp is captured
+        freopen(logPath.c_str(), "a", stdout);
+        freopen(logPath.c_str(), "a", stderr);
+        setvbuf(stdout, nullptr, _IONBF, 0); // unbuffered
+        setvbuf(stderr, nullptr, _IONBF, 0);
     }
     logPrintf("[DEBUG] AudioBridge starting\n");
 
@@ -117,12 +166,38 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     gui.addLogMessage("AudioBridge Server v1.0 starting...");
 
-    // Initialize components
+    // Load saved settings
+    AppSettings settings = loadSettings();
+    logPrintf("[SETTINGS] Loaded: jitter=%d, mode=%s, input='%s', output='%s'\n",
+             settings.jitterBufferMs, settings.loopbackMode ? "loopback" : "recording",
+             settings.inputDeviceName.c_str(), settings.outputDeviceName.c_str());
+
+    // Initialize components — use saved capture mode from settings
     AudioCapture capture;
-    if (!capture.initialize()) {
-        MessageBoxA(nullptr, "Failed to initialize audio capture", "AudioBridge Error", MB_OK | MB_ICONERROR);
-        CoUninitialize();
-        return 1;
+    {
+        // Find saved input device ID if set
+        std::wstring initDeviceId;
+        if (!settings.inputDeviceName.empty()) {
+            for (const auto& d : AudioCapture::getDevices(settings.loopbackMode)) {
+                std::string name;
+                for (wchar_t wc : d.name) name += (wc < 128 ? (char)wc : '?');
+                if (name == settings.inputDeviceName) { initDeviceId = d.id; break; }
+            }
+        }
+        if (!capture.initialize(initDeviceId, settings.loopbackMode)) {
+            // Fallback to default loopback
+            logPrintf("[SETTINGS] Saved device failed, falling back to default loopback\n");
+            settings.loopbackMode = true;
+            settings.inputDeviceName.clear();
+            initDeviceId.clear();
+            if (!capture.initialize(L"", true)) {
+                MessageBoxA(nullptr, "Failed to initialize audio capture", "AudioBridge Error", MB_OK | MB_ICONERROR);
+                CoUninitialize();
+                return 1;
+            }
+        }
+        // Track which device we initialized with
+        // (will be set properly after reinitAudio lambdas are defined)
     }
     gui.addLogMessage("Audio capture initialized: " + std::to_string(capture.getSampleRate()) + " Hz, " +
                       std::to_string(capture.getChannels()) + " ch");
@@ -153,6 +228,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     std::atomic<uint64_t> packetsSent{0};
     std::atomic<uint64_t> bytesSent{0};
     std::atomic<float> peakLevel{0.0f};
+    std::atomic<float> micPeakLevel{0.0f};
     std::string clientName;
 
     // Media info refresh signaling
@@ -163,6 +239,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     // Set up GUI callbacks
     gui.setJitterChangeCallback([&](int bufferMs) {
         gui.addLogMessage("Jitter buffer target: " + std::to_string(bufferMs) + " ms");
+        settings.jitterBufferMs = bufferMs;
+        saveSettings(settings);
+        // Push updated jitter to connected client
+        network.sendSettings(bufferMs);
     });
 
     gui.setPairApproveCallback([&](const std::string& clientId) {
@@ -189,6 +269,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
             bytesSent = 0;
             gui.addLogMessage("Client connected: " + name + " (" + network.getClientAddress() + ")");
             gui.updateApprovedPeers(network.getApprovedPeers());
+            // Send current jitter setting to client
+            network.sendSettings(settings.jitterBufferMs);
         },
         [&]() {
             gui.addLogMessage("Client disconnected: " + clientName);
@@ -202,6 +284,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
             int frames = decoder.decode(opusData, opusLen, pcmOutput, 960);
             if (frames > 0) {
                 render.pushAudio(pcmOutput, frames);
+                // Track mic peak level for UI meter
+                float peak = 0.0f;
+                for (int i = 0; i < frames; i++) {
+                    float abs = pcmOutput[i] < 0 ? -pcmOutput[i] : pcmOutput[i];
+                    if (abs > peak) peak = abs;
+                }
+                float prev = micPeakLevel.load();
+                micPeakLevel.store(peak > prev ? peak : prev * 0.85f + peak * 0.15f);
             }
         },
         [&](const std::string& clientId, const std::string& name) {
@@ -269,7 +359,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     std::atomic<bool> deviceInvalidated{false};
     std::wstring currentOutDeviceId;
     std::atomic<bool> outDeviceInvalidated{false};
-    bool loopbackMode = true;
+    bool loopbackMode = settings.loopbackMode;
 
     // Capture callback
     uint8_t opusBuf[4000];
@@ -392,27 +482,63 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         currentDeviceId = deviceId;
         gui.addLogMessage("Switching sending device...");
         reinitAudio(deviceId);
+        settings.inputDeviceName.clear();
+        for (const auto& d : AudioCapture::getDevices(loopbackMode)) {
+            if (d.id == deviceId) {
+                for (wchar_t wc : d.name) settings.inputDeviceName += (wc < 128 ? (char)wc : '?');
+                break;
+            }
+        }
+        saveSettings(settings);
     });
 
     gui.setOutDeviceChangeCallback([&](const std::wstring& deviceId) {
         currentOutDeviceId = deviceId;
         gui.addLogMessage("Switching receiving device...");
         reinitOutAudio(deviceId);
+        settings.outputDeviceName.clear();
+        for (const auto& [devId, devName] : AudioRender::getDevices()) {
+            if (devId == deviceId) {
+                for (wchar_t wc : devName) settings.outputDeviceName += (wc < 128 ? (char)wc : '?');
+                break;
+            }
+        }
+        saveSettings(settings);
     });
 
     gui.setCaptureModeCallback([&](bool loopback) {
         logPrintf("[MODE] Switching capture mode to %s\n", loopback ? "loopback" : "recording");
         loopbackMode = loopback;
         currentDeviceId = L"";
+        settings.loopbackMode = loopback;
+        settings.inputDeviceName.clear();
+        saveSettings(settings);
         gui.addLogMessage(loopback ? "Switched to loopback mode" : "Switched to recording device mode");
         logPrintf("[MODE] Calling reinitAudio...\n");
         bool ok = reinitAudio(L"");
         logPrintf("[MODE] reinitAudio returned %s\n", ok ? "true" : "false");
     });
 
-    // Populate initial device list
+    // Apply saved jitter buffer
+    gui.setJitterBufferMs(settings.jitterBufferMs);
+
+    // Populate device lists
     refreshDeviceList();
     refreshOutDeviceList();
+
+    // Restore saved output device
+    if (!settings.outputDeviceName.empty()) {
+        for (const auto& [devId, devName] : AudioRender::getDevices()) {
+            std::string name;
+            for (wchar_t wc : devName) name += (wc < 128 ? (char)wc : '?');
+            if (name == settings.outputDeviceName) {
+                currentOutDeviceId = devId;
+                reinitOutAudio(devId);
+                logPrintf("[SETTINGS] Restored output device: %s\n", settings.outputDeviceName.c_str());
+                break;
+            }
+        }
+    }
 
     bool captureStarted = capture.start(captureCallback);
 
@@ -483,6 +609,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
             now - lastPeakReset).count();
         if (peakElapsed >= 2000) {
             peakLevel.store(0.0f);
+            micPeakLevel.store(0.0f);
             lastPeakReset = now;
         }
 
@@ -496,6 +623,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         stats.bytesSent = bytesSent;
         stats.kbps = (double)bytesSent * 8.0 / 1000.0;
         stats.peakLevel = peakLevel.load();
+        stats.micPeakLevel = micPeakLevel.load();
+        stats.encrypted = network.isDtlsActive();
         stats.jitterBufferMs = gui.getJitterBufferMs();
         stats.sequenceNum = (uint32_t)packetsSent.load();
         stats.uptimeSeconds = std::chrono::duration_cast<std::chrono::milliseconds>(

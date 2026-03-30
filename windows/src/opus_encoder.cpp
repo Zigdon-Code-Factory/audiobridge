@@ -26,8 +26,25 @@ bool OpusEncoderWrapper::initialize() {
 int OpusEncoderWrapper::encode(const float* pcm, uint32_t frameSize, uint8_t* output, int maxOutput) {
     int encoded = opus_encode_float(encoder_, pcm, frameSize, output, maxOutput);
     if (encoded < 0) {
-        printf("Opus encode error: %s\n", opus_strerror(encoded));
+        printf("[OPUS-ENC] Encode error: %s (frameSize=%u)\n", opus_strerror(encoded), frameSize);
         return 0;
+    }
+    // Periodic logging to help diagnose audio quality issues
+    static int encodeCount = 0;
+    encodeCount++;
+    if (encodeCount <= 5 || (encodeCount % 500) == 0) {
+        // Log PCM input stats and opus output bytes
+        float maxPcm = 0.0f, minPcm = 0.0f;
+        for (uint32_t i = 0; i < frameSize * 2; i++) {
+            if (pcm[i] > maxPcm) maxPcm = pcm[i];
+            if (pcm[i] < minPcm) minPcm = pcm[i];
+        }
+        printf("[OPUS-ENC] #%d: frameSize=%u, encoded=%d bytes, PCM=[%.4f, %.4f], opus[0..3]=%02x %02x %02x %02x\n",
+               encodeCount, frameSize, encoded, minPcm, maxPcm,
+               encoded > 0 ? output[0] : 0,
+               encoded > 1 ? output[1] : 0,
+               encoded > 2 ? output[2] : 0,
+               encoded > 3 ? output[3] : 0);
     }
     return encoded;
 }

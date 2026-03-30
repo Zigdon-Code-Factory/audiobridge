@@ -265,6 +265,8 @@ std::string ServerGui::buildStateJson() {
     s += "\"bytesSent\":" + std::to_string(stats_.bytesSent) + ",";
     s += "\"kbps\":" + jsonFloat(stats_.kbps) + ",";
     s += "\"peakLevel\":" + jsonFloat(stats_.peakLevel) + ",";
+    s += "\"micPeakLevel\":" + jsonFloat(stats_.micPeakLevel) + ",";
+    s += "\"encrypted\":" + std::string(stats_.encrypted ? "true" : "false") + ",";
     s += "\"jitterBufferMs\":" + std::to_string(stats_.jitterBufferMs) + ",";
     s += "\"sequenceNum\":" + std::to_string(stats_.sequenceNum) + ",";
     s += "\"uptimeSeconds\":" + jsonFloat(stats_.uptimeSeconds) + ",";

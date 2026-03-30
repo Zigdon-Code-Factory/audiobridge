@@ -17,6 +17,17 @@ set(OPUS_BUILD_PROGRAMS OFF CACHE BOOL "" FORCE)
 set(OPUS_INSTALL OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(opus)
 
+# Fetch mbedTLS
+FetchContent_Declare(
+    mbedtls
+    GIT_REPOSITORY https://github.com/Mbed-TLS/mbedtls.git
+    GIT_TAG        v3.6.2
+)
+set(ENABLE_TESTING OFF CACHE BOOL "" FORCE)
+set(ENABLE_PROGRAMS OFF CACHE BOOL "" FORCE)
+set(MBEDTLS_FATAL_WARNINGS OFF CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(mbedtls)
+
 # Fetch webview
 FetchContent_Declare(
     webview
@@ -36,10 +47,13 @@ add_executable(audiobridge WIN32
     src/opus_decoder.cpp
     src/network.cpp
     src/gui.cpp
+    ../common/dtls_session.cpp
 )
 
 target_include_directories(audiobridge PRIVATE
     ${opus_SOURCE_DIR}/include
+    ${mbedtls_SOURCE_DIR}/include
+    ../common
     src
 )
 
@@ -51,6 +65,9 @@ target_link_libraries(audiobridge PRIVATE
     avrt
     iphlpapi
     windowsapp
+    mbedtls
+    mbedcrypto
+    mbedx509
 )
 
 target_compile_definitions(audiobridge PRIVATE

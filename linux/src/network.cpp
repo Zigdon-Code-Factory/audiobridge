@@ -77,6 +77,7 @@ void Network::shutdown() {
     running_ = false;
     if (discoveryThread_.joinable()) discoveryThread_.join();
     if (streamThread_.joinable()) streamThread_.join();
+    endDtlsSession();
     if (discoverySocket_ >= 0) { close(discoverySocket_); discoverySocket_ = -1; }
     if (streamSocket_ >= 0) { close(streamSocket_); streamSocket_ = -1; }
 }
@@ -121,9 +122,75 @@ void Network::streamThread() {
                                      (sockaddr*)&senderAddr, &addrLen);
 
         if (received > 0) {
+            uint8_t firstByte = (uint8_t)buf[0];
+
+            // DTLS record (content types 20-25) — feed to DTLS engine
+            if (dtlsActive_ && dtlsSession_ && firstByte >= 20 && firstByte <= 25) {
+                dtlsSession_->pushReceivedData((const uint8_t*)buf, received);
+                uint8_t plainBuf[2048];
+                int n = dtlsSession_->recv(plainBuf, sizeof(plainBuf));
+                if (n > 0) {
+                    lastClientPacket_ = std::chrono::steady_clock::now();
+                    // Process decrypted application data (same as binary packet handling)
+                    if (n >= 16) {
+                        uint8_t type = plainBuf[1];
+                        if (type == PACKET_CONTROL && n >= 17) {
+                            uint8_t cmd = plainBuf[16];
+                            printf("[NET] Control command: 0x%02X\n", cmd);
+                            if (cmd == CTRL_PAUSE) {
+                                paused_ = true;
+                                if (onPause_) onPause_(true);
+                            } else if (cmd == CTRL_RESUME) {
+                                paused_ = false;
+                                if (onPause_) onPause_(false);
+                            } else if (cmd == CTRL_DISCONNECT) {
+                                endDtlsSession();
+                                connected_ = false;
+                                paused_ = false;
+                                if (onDisconnect_) onDisconnect_();
+                            } else if (cmd >= CTRL_MEDIA_PLAY_PAUSE && cmd <= CTRL_MEDIA_PREV) {
+                                if (onMediaCommand_) onMediaCommand_(cmd);
+                            } else if (cmd == CTRL_MEDIA_INFO_REQ) {
+                                if (onMediaInfoRequest_) onMediaInfoRequest_();
+                            }
+                        } else if (type == PACKET_MIC_AUDIO) {
+                            uint16_t payloadLen;
+                            memcpy(&payloadLen, plainBuf + 14, 2);
+                            if (n >= 16 + payloadLen && onMicAudio_) {
+                                onMicAudio_(plainBuf + 16, payloadLen);
+                            }
+                        }
+                        // PACKET_KEEPALIVE: lastClientPacket_ already updated above
+                    }
+                } else if (n < 0) {
+                    // DTLS session broken
+                    printf("[NET] DTLS recv error, disconnecting\n");
+                    endDtlsSession();
+                    connected_ = false;
+                    paused_ = false;
+                    if (onDisconnect_) onDisconnect_();
+                }
+                goto check_timeout;
+            }
+
+            // During DTLS handshake (not yet established), feed DTLS records
+            if (dtlsSession_ && !dtlsActive_ && firstByte >= 20 && firstByte <= 25) {
+                dtlsSession_->pushReceivedData((const uint8_t*)buf, received);
+                // Handshake is driven by startDtlsHandshake(), not here
+                goto check_timeout;
+            }
+
             buf[received] = '\0';
 
             if (strncmp(buf, "AB_CONNECT|", 11) == 0) {
+                // Disconnect existing client if any
+                if (connected_) {
+                    endDtlsSession();
+                    connected_ = false;
+                    paused_ = false;
+                    if (onDisconnect_) onDisconnect_();
+                }
+
                 std::string payload(buf + 11);
                 std::string clientName = payload;
                 std::string clientId;
@@ -135,26 +202,39 @@ void Network::streamThread() {
                 }
 
                 if (!clientId.empty() && isPeerApproved(clientId)) {
+                    // Known peer — auto-accept
                     std::string storedName = getPeerName(clientId);
+                    std::string pskHex = getPeerPsk(clientId);
                     touchPeer(clientId, clientName);
 
                     {
                         std::lock_guard<std::mutex> lock(clientMutex_);
                         clientAddr_ = senderAddr;
                     }
-                    connected_ = true;
-                    paused_ = false;
-                    sequence_ = 0;
-                    streamStart_ = std::chrono::steady_clock::now();
-                    lastClientPacket_ = streamStart_;
 
-                    const char* accept = "AB_ACCEPT";
-                    sendto(streamSocket_, accept, strlen(accept), 0,
+                    if (pskHex.empty()) {
+                        pskHex = DtlsSession::generatePsk();
+                        setPeerPsk(clientId, pskHex);
+                    }
+                    // Always send PSK so client is guaranteed to have it
+                    std::string acceptMsg = "AB_ACCEPT|" + DtlsSession::pskToBase64(pskHex);
+                    sendto(streamSocket_, acceptMsg.c_str(), acceptMsg.size(), 0,
                            (sockaddr*)&senderAddr, addrLen);
+                    printf("Accepted peer with PSK: %s (%s)\n", storedName.c_str(), clientId.c_str());
 
-                    printf("Auto-accepted known peer: %s (%s)\n", storedName.c_str(), clientId.c_str());
-                    if (onConnect_) onConnect_(storedName);
+                    // Perform DTLS handshake
+                    if (startDtlsHandshake(senderAddr, clientId)) {
+                        connected_ = true;
+                        paused_ = false;
+                        sequence_ = 0;
+                        streamStart_ = std::chrono::steady_clock::now();
+                        lastClientPacket_ = streamStart_;
+                        if (onConnect_) onConnect_(storedName);
+                    } else {
+                        printf("DTLS handshake failed with %s\n", storedName.c_str());
+                    }
                 } else if (clientId.empty()) {
+                    // Legacy client without ID — no DTLS
                     {
                         std::lock_guard<std::mutex> lock(clientMutex_);
                         clientAddr_ = senderAddr;
@@ -172,6 +252,7 @@ void Network::streamThread() {
                     printf("Accepted legacy client (no ID): %s\n", clientName.c_str());
                     if (onConnect_) onConnect_(clientName);
                 } else {
+                    // Unknown peer — require approval
                     const char* pending = "AB_PAIR_PENDING";
                     sendto(streamSocket_, pending, strlen(pending), 0,
                            (sockaddr*)&senderAddr, addrLen);
@@ -200,23 +281,32 @@ void Network::streamThread() {
                         });
 
                         if (pendingPeer_.responded && pendingPeer_.approved) {
+                            // Generate PSK for new peer
+                            std::string pskHex = DtlsSession::generatePsk();
                             touchPeer(clientId, clientName);
+                            setPeerPsk(clientId, pskHex);
 
                             {
                                 std::lock_guard<std::mutex> lock2(clientMutex_);
                                 clientAddr_ = senderAddr;
                             }
-                            connected_ = true;
-                            paused_ = false;
-                            sequence_ = 0;
-                            streamStart_ = std::chrono::steady_clock::now();
-                            lastClientPacket_ = streamStart_;
 
-                            const char* accept = "AB_ACCEPT";
-                            sendto(streamSocket_, accept, strlen(accept), 0,
+                            // Send accept with PSK
+                            std::string acceptMsg = "AB_ACCEPT|" + DtlsSession::pskToBase64(pskHex);
+                            sendto(streamSocket_, acceptMsg.c_str(), acceptMsg.size(), 0,
                                    (sockaddr*)&senderAddr, addrLen);
 
-                            if (onConnect_) onConnect_(clientName);
+                            // Perform DTLS handshake
+                            if (startDtlsHandshake(senderAddr, clientId)) {
+                                connected_ = true;
+                                paused_ = false;
+                                sequence_ = 0;
+                                streamStart_ = std::chrono::steady_clock::now();
+                                lastClientPacket_ = streamStart_;
+                                if (onConnect_) onConnect_(clientName);
+                            } else {
+                                printf("DTLS handshake failed with new peer %s\n", clientName.c_str());
+                            }
                         } else {
                             const char* reject = pendingPeer_.responded
                                 ? "AB_REJECT|Denied by server"
@@ -231,6 +321,7 @@ void Network::streamThread() {
 
             if (strcmp(buf, "AB_DISCONNECT") == 0) {
                 if (connected_) {
+                    endDtlsSession();
                     connected_ = false;
                     paused_ = false;
                     if (onDisconnect_) onDisconnect_();
@@ -238,8 +329,8 @@ void Network::streamThread() {
                 continue;
             }
 
-            // Binary packet from client
-            if (connected_ && received >= 16) {
+            // Unencrypted binary packet from client (legacy mode, no DTLS)
+            if (connected_ && !dtlsActive_ && received >= 16) {
                 bool sameClient;
                 {
                     std::lock_guard<std::mutex> lock(clientMutex_);
@@ -278,12 +369,14 @@ void Network::streamThread() {
             }
         }
 
+check_timeout:
         // Client timeout
         if (connected_) {
             auto now = std::chrono::steady_clock::now();
             auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                 now - lastClientPacket_).count();
             if (elapsed > 5000) {
+                endDtlsSession();
                 connected_ = false;
                 paused_ = false;
                 printf("Client timed out\n");
@@ -306,6 +399,16 @@ void Network::writeHeader(uint8_t* buf, uint8_t type, uint16_t payloadLen) {
     sequence_++;
 }
 
+void Network::sendPacket(const uint8_t* data, size_t len) {
+    // Must be called with clientMutex_ held
+    if (dtlsActive_ && dtlsSession_) {
+        dtlsSession_->send(data, len);
+    } else {
+        sendto(streamSocket_, (const char*)data, len, 0,
+               (sockaddr*)&clientAddr_, sizeof(clientAddr_));
+    }
+}
+
 void Network::sendAudio(const uint8_t* opusData, int opusLen) {
     if (!connected_ || paused_) return;
 
@@ -316,8 +419,7 @@ void Network::sendAudio(const uint8_t* opusData, int opusLen) {
     memcpy(packet + 16, opusData, opusLen);
 
     std::lock_guard<std::mutex> lock(clientMutex_);
-    sendto(streamSocket_, (char*)packet, 16 + opusLen, 0,
-           (sockaddr*)&clientAddr_, sizeof(clientAddr_));
+    sendPacket(packet, 16 + opusLen);
 }
 
 void Network::sendKeepalive() {
@@ -327,8 +429,7 @@ void Network::sendKeepalive() {
     writeHeader(packet, PACKET_KEEPALIVE, 0);
 
     std::lock_guard<std::mutex> lock(clientMutex_);
-    sendto(streamSocket_, (char*)packet, 16, 0,
-           (sockaddr*)&clientAddr_, sizeof(clientAddr_));
+    sendPacket(packet, 16);
 }
 
 void Network::sendMediaInfo(const std::string& json) {
@@ -342,8 +443,7 @@ void Network::sendMediaInfo(const std::string& json) {
     memcpy(packet + 16, json.c_str(), payloadLen);
 
     std::lock_guard<std::mutex> lock(clientMutex_);
-    sendto(streamSocket_, (char*)packet, 16 + payloadLen, 0,
-           (sockaddr*)&clientAddr_, sizeof(clientAddr_));
+    sendPacket(packet, 16 + payloadLen);
 }
 
 std::string Network::getClientAddress() const {
@@ -422,10 +522,11 @@ void Network::loadApprovedPeers() {
         if (line.empty() || line[0] == '#') continue;
 
         std::istringstream iss(line);
-        std::string id, name, tsStr;
+        std::string id, name, tsStr, pskHex;
         if (!std::getline(iss, id, '|')) continue;
         if (!std::getline(iss, name, '|')) continue;
         if (!std::getline(iss, tsStr, '|')) continue;
+        std::getline(iss, pskHex, '|'); // Optional 4th field
 
         int64_t ts = 0;
         try { ts = std::stoll(tsStr); } catch (...) { continue; }
@@ -436,6 +537,7 @@ void Network::loadApprovedPeers() {
         peer.clientId = id;
         peer.clientName = name;
         peer.lastConnected = ts;
+        peer.pskHex = pskHex;
         approvedPeers_[id] = peer;
         loaded++;
     }
@@ -456,9 +558,10 @@ void Network::saveApprovedPeers() {
     if (!file.is_open()) return;
 
     file << "# AudioBridge approved peers\n";
-    file << "# Format: clientId|clientName|lastConnected(unix)\n";
+    file << "# Format: clientId|clientName|lastConnected(unix)|psk_hex\n";
     for (const auto& [id, peer] : approvedPeers_) {
-        file << peer.clientId << "|" << peer.clientName << "|" << peer.lastConnected << "\n";
+        file << peer.clientId << "|" << peer.clientName << "|" << peer.lastConnected
+             << "|" << peer.pskHex << "\n";
     }
 }
 
@@ -491,6 +594,104 @@ void Network::touchPeer(const std::string& clientId, const std::string& clientNa
         approvedPeers_[clientId] = peer;
     }
     saveApprovedPeers();
+}
+
+// --- DTLS ---
+
+bool Network::startDtlsHandshake(const sockaddr_in& clientAddr, const std::string& clientId) {
+    endDtlsSession(); // Clean up any existing session
+
+    dtlsSession_ = std::make_unique<DtlsSession>();
+    connectedClientId_ = clientId;
+
+    auto lookupFn = [this](const std::string& identity, std::vector<uint8_t>& outPsk) -> bool {
+        return pskLookup(identity, outPsk);
+    };
+
+    if (!dtlsSession_->init(streamSocket_, clientAddr, lookupFn)) {
+        printf("[NET] DTLS init failed\n");
+        dtlsSession_.reset();
+        connectedClientId_.clear();
+        return false;
+    }
+
+    printf("[NET] Waiting for DTLS handshake...\n");
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+
+    while (!dtlsSession_->isEstablished() && running_) {
+        if (std::chrono::steady_clock::now() > deadline) {
+            printf("[NET] DTLS handshake timed out\n");
+            dtlsSession_->teardown();
+            dtlsSession_.reset();
+            connectedClientId_.clear();
+            return false;
+        }
+
+        // Read a datagram from the socket
+        char buf[2048];
+        sockaddr_in sender{};
+        socklen_t slen = sizeof(sender);
+        ssize_t n = recvfrom(streamSocket_, buf, sizeof(buf), 0, (sockaddr*)&sender, &slen);
+        if (n <= 0) continue;
+
+        uint8_t firstByte = (uint8_t)buf[0];
+        if (firstByte >= 20 && firstByte <= 25) {
+            // DTLS record — feed to session
+            dtlsSession_->pushReceivedData((const uint8_t*)buf, n);
+            int ret = dtlsSession_->continueHandshake();
+            if (ret == 0) {
+                // Handshake complete
+                dtlsActive_ = true;
+                printf("[NET] DTLS handshake complete\n");
+                return true;
+            }
+            if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
+                printf("[NET] DTLS handshake error: -0x%04X\n", -ret);
+                dtlsSession_->teardown();
+                dtlsSession_.reset();
+                connectedClientId_.clear();
+                return false;
+            }
+        }
+        // Ignore non-DTLS packets during handshake
+    }
+
+    return false;
+}
+
+void Network::endDtlsSession() {
+    if (dtlsSession_) {
+        dtlsSession_->teardown();
+        dtlsSession_.reset();
+    }
+    dtlsActive_ = false;
+    connectedClientId_.clear();
+}
+
+bool Network::pskLookup(const std::string& identity, std::vector<uint8_t>& outPsk) {
+    std::lock_guard<std::mutex> lock(peersMutex_);
+    auto it = approvedPeers_.find(identity);
+    if (it == approvedPeers_.end() || it->second.pskHex.empty()) {
+        return false;
+    }
+    outPsk = DtlsSession::hexToBytes(it->second.pskHex);
+    return !outPsk.empty();
+}
+
+std::string Network::getPeerPsk(const std::string& clientId) const {
+    std::lock_guard<std::mutex> lock(peersMutex_);
+    auto it = approvedPeers_.find(clientId);
+    if (it != approvedPeers_.end()) return it->second.pskHex;
+    return "";
+}
+
+void Network::setPeerPsk(const std::string& clientId, const std::string& pskHex) {
+    std::lock_guard<std::mutex> lock(peersMutex_);
+    auto it = approvedPeers_.find(clientId);
+    if (it != approvedPeers_.end()) {
+        it->second.pskHex = pskHex;
+        saveApprovedPeers();
+    }
 }
 
 void Network::approvePeer(const std::string& clientId) {

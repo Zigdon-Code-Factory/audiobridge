@@ -13,7 +13,9 @@
 #include <functional>
 #include <chrono>
 #include <map>
+#include <memory>
 #include <condition_variable>
+#include "dtls_session.h"
 
 struct PacketHeader {
     uint8_t version;    // 0x01
@@ -45,6 +47,7 @@ struct ApprovedPeer {
     std::string clientId;
     std::string clientName;
     int64_t lastConnected;
+    std::string pskHex; // 64-char hex string, empty for legacy peers
 };
 
 class Network {
@@ -100,7 +103,15 @@ private:
     void discoveryThread();
     void streamThread();
     void writeHeader(uint8_t* buf, uint8_t type, uint16_t payloadLen);
+    void sendPacket(const uint8_t* data, size_t len);
     static std::string getMacAddress();
+
+    // DTLS
+    bool startDtlsHandshake(const sockaddr_in& clientAddr, const std::string& clientId);
+    void endDtlsSession();
+    bool pskLookup(const std::string& identity, std::vector<uint8_t>& outPsk);
+    std::string getPeerPsk(const std::string& clientId) const;
+    void setPeerPsk(const std::string& clientId, const std::string& pskHex);
 
     void loadApprovedPeers();
     void saveApprovedPeers();
@@ -150,4 +161,9 @@ private:
 
     std::map<std::string, ApprovedPeer> approvedPeers_;
     mutable std::mutex peersMutex_;
+
+    // DTLS session
+    std::unique_ptr<DtlsSession> dtlsSession_;
+    bool dtlsActive_ = false;
+    std::string connectedClientId_;
 };
