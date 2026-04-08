@@ -53,6 +53,7 @@ private:
     FrameCallback callback_;
     std::atomic<bool> running_{false};
     std::thread thread_;
+    HANDLE captureEvent_ = nullptr; // event-driven WASAPI signaling
 
     std::function<void()> onDeviceInvalidated_;
 

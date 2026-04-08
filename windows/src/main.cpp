@@ -1,5 +1,7 @@
 #include <Windows.h>
 #include <DbgHelp.h>
+#include <timeapi.h>
+#pragma comment(lib, "Winmm.lib")
 #include <cstdio>
 #include <cstring>
 #include <ctime>
@@ -125,6 +127,11 @@ static void saveSettings(const AppSettings& s) {
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
     SetUnhandledExceptionFilter(CrashHandler);
+
+    // Set 1ms Windows timer resolution so Sleep(1) in the capture thread actually
+    // sleeps ~1ms instead of the default ~15.6ms — without this, WASAPI's 10ms
+    // capture buffer overflows every poll cycle causing DATA_DISCONTINUITY gaps.
+    timeBeginPeriod(1);
 
     // Open log file
     std::string logPath = getExeDir() + "audiobridge.log";
@@ -728,6 +735,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     capture.stop();
     network.shutdown();
     CoUninitialize();
+    timeEndPeriod(1);
 
     return 0;
 }

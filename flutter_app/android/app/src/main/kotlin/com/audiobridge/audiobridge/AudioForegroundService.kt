@@ -14,6 +14,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.net.wifi.WifiManager
 import android.os.PowerManager
 import androidx.core.app.NotificationCompat
 
@@ -23,6 +24,7 @@ class AudioForegroundService : Service() {
     private val NOTIFICATION_ID = 1
 
     private var wakeLock: PowerManager.WakeLock? = null
+    private var wifiLock: WifiManager.WifiLock? = null
     private var serverName: String = "AudioBridge"
     private var isMicMuted: Boolean = false
     private var isPaused: Boolean = false
@@ -182,12 +184,28 @@ class AudioForegroundService : Service() {
         wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "AudioBridge::AudioWaitLock").apply {
             acquire(24 * 60 * 60 * 1000L)
         }
+
+        // Prevent Wi-Fi from entering power save mode — without this, the Wi-Fi chip
+        // sleeps between packets and causes 50-200ms blackouts in UDP reception (audible pops).
+        // WIFI_MODE_FULL_LOW_LATENCY disables PSM and DTIM coalescing entirely.
+        val wifiManager = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+        val lockMode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q)
+            WifiManager.WIFI_MODE_FULL_LOW_LATENCY
+        else
+            WifiManager.WIFI_MODE_FULL_HIGH_PERF
+        wifiLock = wifiManager.createWifiLock(lockMode, "AudioBridge::WifiLock").apply {
+            acquire()
+        }
     }
 
     private fun releaseWakeLock() {
         if (wakeLock?.isHeld == true) {
             wakeLock?.release()
             wakeLock = null
+        }
+        if (wifiLock?.isHeld == true) {
+            wifiLock?.release()
+            wifiLock = null
         }
     }
 }

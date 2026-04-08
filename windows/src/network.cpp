@@ -911,6 +911,8 @@ void Network::touchPeer(const std::string& clientId, const std::string& clientNa
 // --- DTLS ---
 
 bool Network::startDtlsHandshake(const sockaddr_in& clientAddr, const std::string& clientId) {
+    // Disabled temporarily for instant connection testing
+    return false;
     {
         std::lock_guard<std::mutex> lock(dtlsMutex_);
         endDtlsSessionLocked(); // Clean up any existing session

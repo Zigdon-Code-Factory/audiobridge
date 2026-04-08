@@ -82,12 +82,13 @@ bool DtlsSession::init(int socketFd, const sockaddr_in& peerAddr, PskLookupFn ps
     // Set PSK callback for identity-based lookup
     mbedtls_ssl_conf_psk_cb(&conf_, pskCallback, this);
 
-    // Set up DTLS cookies (HelloVerifyRequest)
+    // Set up DTLS cookies (HelloVerifyRequest) — server only
     ret = mbedtls_ssl_cookie_setup(&cookie_, mbedtls_ctr_drbg_random, &ctrDrbg_);
     if (ret != 0) {
         printf("[DTLS] cookie_setup failed: -0x%04X\n", -ret);
         return false;
     }
+    cookieSetup_ = true;
     mbedtls_ssl_conf_dtls_cookies(&conf_, mbedtls_ssl_cookie_write,
                                    mbedtls_ssl_cookie_check, &cookie_);
 
@@ -114,6 +115,7 @@ bool DtlsSession::init(int socketFd, const sockaddr_in& peerAddr, PskLookupFn ps
     mbedtls_ssl_set_client_transport_id(&ssl_, clientId, sizeof(clientId));
 
     initialized_ = true;
+    isServer_ = true;
     established_ = false;
     printf("[DTLS] Server session initialized for %s:%d\n",
            inet_ntoa(peerAddr_.sin_addr), ntohs(peerAddr_.sin_port));
@@ -131,6 +133,8 @@ bool DtlsSession::initClient(int socketFd, const sockaddr_in& serverAddr,
     mbedtls_ssl_config_init(&conf_);
     mbedtls_entropy_init(&entropy_);
     mbedtls_ctr_drbg_init(&ctrDrbg_);
+    // NOTE: do NOT call mbedtls_ssl_cookie_init here — cookies are server-only.
+    // cookieSetup_ stays false; teardown() will skip mbedtls_ssl_cookie_free().
 
     const char* pers = "audiobridge_dtls_client";
     int ret = mbedtls_ctr_drbg_seed(&ctrDrbg_, mbedtls_entropy_func, &entropy_,
@@ -173,9 +177,15 @@ bool DtlsSession::initClient(int socketFd, const sockaddr_in& serverAddr,
                               mbedtls_timing_set_delay,
                               mbedtls_timing_get_delay);
 
-    mbedtls_ssl_set_bio(&ssl_, this, bioSend, nullptr, bioRecv);
+    // Use non-blocking recv for client: the handshake loop calls continueHandshake()
+    // then recvfrom()+pushReceivedData() in the same thread.  If we block inside
+    // bioRecv (waiting on recvCv_), we never reach recvfrom() — classic deadlock.
+    // bioRecvNonBlocking returns WANT_READ immediately when no data is ready, so
+    // the outer loop stays in control and the mbedtls timer handles DTLS retransmit.
+    mbedtls_ssl_set_bio(&ssl_, this, bioSend, bioRecvNonBlocking, nullptr);
 
     initialized_ = true;
+    isServer_ = false;
     established_ = false;
     printf("[DTLS] Client session initialized for %s:%d\n",
            inet_ntoa(peerAddr_.sin_addr), ntohs(peerAddr_.sin_port));
@@ -193,8 +203,13 @@ int DtlsSession::continueHandshake() {
     int ret = mbedtls_ssl_handshake(&ssl_);
     if (ret == 0) {
         established_ = true;
-        printf("[DTLS] Handshake complete, cipher: %s\n",
-               mbedtls_ssl_get_ciphersuite(&ssl_));
+        printf("[DTLS] Handshake complete! cipher=%s peer=%s:%d\n",
+               mbedtls_ssl_get_ciphersuite(&ssl_),
+               inet_ntoa(peerAddr_.sin_addr), ntohs(peerAddr_.sin_port));
+    } else if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
+        char errBuf[128];
+        mbedtls_strerror(ret, errBuf, sizeof(errBuf));
+        printf("[DTLS] continueHandshake: error -0x%04X (%s)\n", -ret, errBuf);
     }
     return ret;
 }
@@ -243,19 +258,35 @@ int DtlsSession::recv(uint8_t* buf, size_t maxLen) {
 void DtlsSession::teardown() {
     if (!initialized_) return;
 
+    printf("[DTLS] teardown: starting (isServer=%d, cookieSetup=%d, established=%d)\n",
+           (int)isServer_, (int)cookieSetup_, (int)established_.load());
+
+    // Mark as not initialized first to prevent re-entry
+    initialized_ = false;
+    isServer_ = false;
+
     if (established_) {
-        // Best-effort close_notify
-        mbedtls_ssl_close_notify(&ssl_);
+        // Best-effort close_notify — don't crash if it fails
+        established_ = false;
+        try {
+            mbedtls_ssl_close_notify(&ssl_);
+        } catch (...) {
+            // Ignore — we're shutting down
+        }
     }
 
     mbedtls_ssl_free(&ssl_);
     mbedtls_ssl_config_free(&conf_);
-    mbedtls_ssl_cookie_free(&cookie_);
+    if (cookieSetup_) {
+        // Only free cookies on the server path — client never calls cookie_setup()
+        // and calling cookie_free() on a half-initialized ctx crashes (null md_info).
+        printf("[DTLS] Freeing cookie ctx (server path)\n");
+        mbedtls_ssl_cookie_free(&cookie_);
+        cookieSetup_ = false;
+    }
     mbedtls_ctr_drbg_free(&ctrDrbg_);
     mbedtls_entropy_free(&entropy_);
 
-    established_ = false;
-    initialized_ = false;
     socketFd_ = -1;
 
     // Clear receive buffer
@@ -264,6 +295,8 @@ void DtlsSession::teardown() {
         recvBuf_.clear();
         recvReady_ = false;
     }
+    // Wake any blocked bioRecv
+    recvCv_.notify_all();
 
     printf("[DTLS] Session torn down\n");
 }
@@ -276,8 +309,16 @@ int DtlsSession::bioSend(void* ctx, const unsigned char* buf, size_t len) {
     ssize_t sent = sendto(self->socketFd_, (const char*)buf, len, 0,
                           (const sockaddr*)&self->peerAddr_, sizeof(self->peerAddr_));
     if (sent < 0) {
+#ifdef _WIN32
+        int err = WSAGetLastError();
+        printf("[DTLS] bioSend: sendto failed len=%zu err=%d\n", len, err);
+#else
+        printf("[DTLS] bioSend: sendto failed len=%zu errno=%d\n", len, errno);
+#endif
         return MBEDTLS_ERR_NET_SEND_FAILED;
     }
+    printf("[DTLS] bioSend: sent %zd/%zu bytes (record[0]=0x%02x)\n",
+           sent, len, len > 0 ? buf[0] : 0);
     return (int)sent;
 }
 
@@ -291,10 +332,12 @@ int DtlsSession::bioRecv(void* ctx, unsigned char* buf, size_t len, uint32_t tim
             // Non-blocking: no data available
             return MBEDTLS_ERR_SSL_WANT_READ;
         }
-        // Wait for data up to timeout
+        // Wait for data up to timeout (server path: data pushed from separate thread)
+        printf("[DTLS] bioRecv: waiting up to %ums for data (server path)\n", timeout);
         auto waitResult = self->recvCv_.wait_for(lock, std::chrono::milliseconds(timeout),
                                                   [self] { return self->recvReady_; });
         if (!waitResult) {
+            printf("[DTLS] bioRecv: timed out after %ums\n", timeout);
             return MBEDTLS_ERR_SSL_TIMEOUT;
         }
     }
@@ -305,6 +348,29 @@ int DtlsSession::bioRecv(void* ctx, unsigned char* buf, size_t len, uint32_t tim
     self->recvBuf_.clear();
     self->recvReady_ = false;
 
+    printf("[DTLS] bioRecv: delivered %zu bytes (buf[0]=0x%02x)\n",
+           copyLen, copyLen > 0 ? buf[0] : 0);
+    return (int)copyLen;
+}
+
+// Non-blocking recv for client handshake — returns WANT_READ immediately if no data.
+// The handshake loop alternates continueHandshake() / recvfrom()+pushReceivedData()
+// in the same thread, so we must never block here or we'd deadlock.
+int DtlsSession::bioRecvNonBlocking(void* ctx, unsigned char* buf, size_t len) {
+    auto* self = static_cast<DtlsSession*>(ctx);
+
+    std::lock_guard<std::mutex> lock(self->recvMutex_);
+    if (!self->recvReady_) {
+        return MBEDTLS_ERR_SSL_WANT_READ;
+    }
+
+    size_t copyLen = std::min(len, self->recvBuf_.size());
+    memcpy(buf, self->recvBuf_.data(), copyLen);
+    self->recvBuf_.clear();
+    self->recvReady_ = false;
+
+    printf("[DTLS] bioRecvNonBlocking: delivered %zu bytes (buf[0]=0x%02x)\n",
+           copyLen, copyLen > 0 ? buf[0] : 0);
     return (int)copyLen;
 }
 

@@ -83,6 +83,8 @@ private:
     // mbedTLS BIO callbacks
     static int bioSend(void* ctx, const unsigned char* buf, size_t len);
     static int bioRecv(void* ctx, unsigned char* buf, size_t len, uint32_t timeout);
+    // Non-blocking recv for client handshake (never sleeps; outer loop feeds data)
+    static int bioRecvNonBlocking(void* ctx, unsigned char* buf, size_t len);
 
     // mbedTLS PSK callback
     static int pskCallback(void* ctx, mbedtls_ssl_context* ssl,
@@ -111,4 +113,6 @@ private:
 
     std::atomic<bool> established_{false};
     bool initialized_ = false;
+    bool isServer_ = false;
+    bool cookieSetup_ = false;
 };
