@@ -1,30 +1,40 @@
-// This is a basic Flutter widget test.
-//
-// To perform an interaction with a widget in your test, use the WidgetTester
-// utility in the flutter_test package. For example, you can send tap and scroll
-// gestures. You can also use WidgetTester to find child widgets in the widget
-// tree, read text, and verify that the values of widget properties are correct.
-
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
-
 import 'package:audiobridge/main.dart';
 
 void main() {
-  testWidgets('Counter increments smoke test', (WidgetTester tester) async {
-    // Build our app and trigger a frame.
-    await tester.pumpWidget(const MyApp());
-
-    // Verify that our counter starts at 0.
-    expect(find.text('0'), findsOneWidget);
-    expect(find.text('1'), findsNothing);
-
-    // Tap the '+' icon and trigger a frame.
-    await tester.tap(find.byIcon(Icons.add));
+  TestWidgetsFlutterBinding.ensureInitialized();
+  const channel = MethodChannel('com.audiobridge/audio');
+  testWidgets('Shows disconnected AudioBridge and cleans up audio', (tester) async {
+    final calls = <String>[];
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, (call) async {
+      calls.add(call.method);
+      return null;
+    });
+    addTearDown(() {
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(channel, null);
+    });
+    await tester.pumpWidget(const AudioBridgeApp());
     await tester.pump();
-
-    // Verify that our counter has incremented.
-    expect(find.text('0'), findsNothing);
-    expect(find.text('1'), findsOneWidget);
+    expect(find.text('AudioBridge'), findsWidgets);
+    expect(find.text('Scan for Servers'), findsOneWidget);
+    expect(calls, contains('requestPermissions'));
+    await tester.pumpWidget(const SizedBox.shrink());
+    await tester.pump();
+    expect(calls, containsAll(['stopAudio', 'stopRecording', 'disconnect']));
+    expect(tester.takeException(), isNull);
+  });
+  test('Server history round-trips identity and pairing key', () {
+    final server = ServerInfo(name: 'PC', macAddress: 'aa:bb:cc:dd:ee:ff',
+        lastIp: '192.168.1.5', lastConnected: DateTime.utc(2026, 9, 7),
+        pskHex: '0123456789abcdef', active: true, macVerified: true);
+    final restored = ServerInfo.fromJson(server.toJson());
+    expect(restored.toJson(), server.toJson());
+    expect(restored.active, isFalse);
+    expect(restored.macVerified, isFalse);
+    expect(ServerInfo.fromJson({}).pskHex, isEmpty);
   });
 }

@@ -116,7 +116,7 @@ public:
     void sendMediaInfo(const std::string& json);
 
     // Send jitter buffer settings to connected client (ms)
-    void sendSettings(int jitterMs);
+    void sendSettings(int jitterMs, int frameSizeMs = 10);
 
     std::string getClientAddress() const;
     std::string getServerMac() const { return macAddress_; }

@@ -3,7 +3,6 @@ import 'package:flutter/services.dart';
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
-import 'dart:typed_data';
 import 'dart:math';
 
 void main() {
@@ -108,6 +107,7 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
   double _outputBufferMs = 0.0;
   double _serverCaptureMs = 10.0; // WASAPI default
   int _serverJitterMs = 0; // Jitter target from server
+  int _serverFrameSizeMs = 10; // Frame size from server
 
   // Now playing info from server
   String _nowPlayingTitle = '';
@@ -209,6 +209,19 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
             }
           } catch (_) {}
           break;
+
+        case 'onFrameSizeUpdate':
+          // Server sent frame size setting
+          try {
+            final frameMs = int.tryParse(call.arguments as String? ?? '') ?? 10;
+            if (mounted) {
+              setState(() {
+                _serverFrameSizeMs = frameMs;
+                _serverCaptureMs = frameMs.toDouble();
+              });
+            }
+          } catch (_) {}
+          break;
       }
       return null;
     });
@@ -216,8 +229,9 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
 
   @override
   void dispose() {
-    _pulseController.dispose();
     _disconnect();
+    _pulseController.dispose();
+    _channel.setMethodCallHandler(null);
     super.dispose();
   }
 
@@ -715,7 +729,7 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
               ),
               const SizedBox(height: 16),
               _latencyRow('Network (one-way)', networkOneWay, cs),
-              _latencyRow('Server capture buffer', _serverCaptureMs, cs),
+              _latencyRow('Server frame (${_serverFrameSizeMs}ms)', _serverCaptureMs, cs),
               _latencyRow('Jitter buffer${_serverJitterMs > 0 ? ' (target: ${_serverJitterMs}ms)' : ''}', _jitterBufferMs, cs),
               _latencyRow('Audio output buffer', _outputBufferMs, cs),
               const SizedBox(height: 8),

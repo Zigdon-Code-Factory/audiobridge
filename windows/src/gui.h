@@ -24,6 +24,7 @@ struct ServerStats {
     float micPeakLevel = 0.0f;
     bool encrypted = false;
     int jitterBufferMs = 20;
+    int frameSizeMs = 10;
     uint32_t sequenceNum = 0;
     double uptimeSeconds = 0.0;
     std::string serverName;
@@ -40,6 +41,7 @@ struct PairRequest {
 class ServerGui {
 public:
     using JitterChangeCallback = std::function<void(int bufferMs)>;
+    using FrameSizeChangeCallback = std::function<void(int frameSizeMs)>;
     using PairApproveCallback = std::function<void(const std::string& clientId)>;
     using PairDenyCallback = std::function<void(const std::string& clientId)>;
     using RevokeCallback = std::function<void(const std::string& clientId)>;
@@ -68,6 +70,7 @@ public:
 
     // Set callbacks
     void setJitterChangeCallback(JitterChangeCallback cb) { onJitterChange_ = cb; }
+    void setFrameSizeChangeCallback(FrameSizeChangeCallback cb) { onFrameSizeChange_ = cb; }
     void setPairApproveCallback(PairApproveCallback cb) { onPairApprove_ = cb; }
     void setPairDenyCallback(PairDenyCallback cb) { onPairDeny_ = cb; }
     void setRevokeCallback(RevokeCallback cb) { onRevoke_ = cb; }
@@ -77,6 +80,8 @@ public:
     void setTickCallback(TickCallback cb) { onTick_ = cb; }
     int getJitterBufferMs() const { return jitterBufferMs_; }
     void setJitterBufferMs(int ms) { jitterBufferMs_ = ms; }
+    int getFrameSizeMs() const { return frameSizeMs_; }
+    void setFrameSizeMs(int ms) { frameSizeMs_ = ms; }
 
 private:
     void setupBindings();
@@ -89,6 +94,7 @@ private:
 
     std::unique_ptr<webview::webview> webview_;
     int jitterBufferMs_ = 10;
+    int frameSizeMs_ = 10;
 
     // Thread-safe data
     mutable std::mutex dataMutex_;
@@ -110,6 +116,7 @@ private:
 
     // Callbacks
     JitterChangeCallback onJitterChange_;
+    FrameSizeChangeCallback onFrameSizeChange_;
     PairApproveCallback onPairApprove_;
     PairDenyCallback onPairDeny_;
     RevokeCallback onRevoke_;

@@ -147,9 +147,18 @@ void ServerGui::setupBindings() {
     webview_->bind("_setJitter", [this](const std::string& args) -> std::string {
         int ms = parseFirstInt(args);
         if (ms < 0) ms = 0;
-        if (ms > 50) ms = 50;
+        if (ms > 150) ms = 150;
         jitterBufferMs_ = ms;
         if (onJitterChange_) onJitterChange_(ms);
+        return "{}";
+    });
+
+    // _setFrameSize: user changed frame size select
+    webview_->bind("_setFrameSize", [this](const std::string& args) -> std::string {
+        int ms = parseFirstInt(args);
+        if (ms != 5 && ms != 10 && ms != 20) ms = 10;
+        frameSizeMs_ = ms;
+        if (onFrameSizeChange_) onFrameSizeChange_(ms);
         return "{}";
     });
 
@@ -268,6 +277,7 @@ std::string ServerGui::buildStateJson() {
     s += "\"micPeakLevel\":" + jsonFloat(stats_.micPeakLevel) + ",";
     s += "\"encrypted\":" + std::string(stats_.encrypted ? "true" : "false") + ",";
     s += "\"jitterBufferMs\":" + std::to_string(stats_.jitterBufferMs) + ",";
+    s += "\"frameSizeMs\":" + std::to_string(stats_.frameSizeMs) + ",";
     s += "\"sequenceNum\":" + std::to_string(stats_.sequenceNum) + ",";
     s += "\"uptimeSeconds\":" + jsonFloat(stats_.uptimeSeconds) + ",";
     s += "\"serverName\":\"" + escapeJson(stats_.serverName) + "\",";

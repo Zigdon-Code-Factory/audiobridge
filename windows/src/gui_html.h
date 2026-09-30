@@ -207,6 +207,9 @@ input[type=range]::-webkit-slider-thumb {
 .btn.approve:hover { filter: brightness(1.1); }
 .btn.deny { background: var(--red); color: #0f0f14; }
 .btn.deny:hover { filter: brightness(1.1); }
+.btn.frame-btn { background: #2a2a3a; color: var(--text); border: 1px solid #3a3a4a; padding: 6px 16px; }
+.btn.frame-btn:hover { background: #3a3a4a; }
+.btn.frame-btn.active { background: var(--accent); color: #0f0f14; border-color: var(--accent); }
 .peer-item {
     display: flex;
     align-items: center;
@@ -302,7 +305,21 @@ input[type=range]::-webkit-slider-thumb {
         <span>JITTER BUFFER</span>
         <span class="accent" id="jitterValue">10 ms</span>
     </div>
-    <input type="range" id="jitterSlider" min="0" max="50" value="10">
+    <input type="range" id="jitterSlider" min="0" max="150" step="5" value="10">
+</div>
+
+<!-- Frame Size Card -->
+<div class="card">
+    <div class="card-header">
+        <span>FRAME SIZE</span>
+        <span class="accent" id="frameSizeValue">10 ms</span>
+    </div>
+    <div class="btn-row" style="justify-content:center;gap:8px;margin-top:4px">
+        <button class="btn frame-btn" id="frameBtn5" data-ms="5">5 ms</button>
+        <button class="btn frame-btn active" id="frameBtn10" data-ms="10">10 ms</button>
+        <button class="btn frame-btn" id="frameBtn20" data-ms="20">20 ms</button>
+    </div>
+    <div class="dim small" style="margin-top:6px;text-align:center">Lower = less latency &nbsp;|&nbsp; Higher = better compression</div>
 </div>
 
 <!-- Pair Request Card -->
@@ -341,6 +358,16 @@ let currentOutDeviceIndex = -1;
 document.getElementById('jitterSlider').addEventListener('input', function() {
     document.getElementById('jitterValue').textContent = this.value + ' ms';
     window._setJitter(this.value);
+});
+
+document.querySelectorAll('.frame-btn').forEach(function(btn) {
+    btn.addEventListener('click', function() {
+        var ms = parseInt(this.getAttribute('data-ms'));
+        document.querySelectorAll('.frame-btn').forEach(function(b) { b.classList.remove('active'); });
+        this.classList.add('active');
+        document.getElementById('frameSizeValue').textContent = ms + ' ms';
+        window._setFrameSize(String(ms));
+    });
 });
 
 document.getElementById('captureModeSelect').addEventListener('change', function() {
@@ -549,6 +576,9 @@ function escapeHtml(s) {
 }
 
 // Periodic tick
+var lastJitterMs = -1;
+var lastFrameSizeMs = -1;
+
 async function tick() {
     try {
         var result = await window._tick();
@@ -559,6 +589,21 @@ async function tick() {
         updateLogs(s.logs);
         updateDeviceList(s.devices || [], s.currentDeviceIndex || 0, s.devicesChanged);
         updateOutDeviceList(s.outDevices || [], s.currentOutDeviceIndex || 0, s.outDevicesChanged);
+        if (s.jitterBufferMs !== undefined && s.jitterBufferMs !== lastJitterMs) {
+            lastJitterMs = s.jitterBufferMs;
+            var slider = document.getElementById('jitterSlider');
+            if (slider && document.activeElement !== slider) {
+                slider.value = s.jitterBufferMs;
+                document.getElementById('jitterValue').textContent = s.jitterBufferMs + ' ms';
+            }
+        }
+        if (s.frameSizeMs !== undefined && s.frameSizeMs !== lastFrameSizeMs) {
+            lastFrameSizeMs = s.frameSizeMs;
+            document.querySelectorAll('.frame-btn').forEach(function(b) {
+                b.classList.toggle('active', parseInt(b.getAttribute('data-ms')) === s.frameSizeMs);
+            });
+            document.getElementById('frameSizeValue').textContent = s.frameSizeMs + ' ms';
+        }
     } catch(e) {
         console.error('tick error:', e);
     }

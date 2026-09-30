@@ -14,6 +14,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
+#include "playback_frame.h"
 
 #define LOG_TAG "AudioBridge"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
@@ -24,6 +25,7 @@ static constexpr int SAMPLE_RATE = 48000;
 static constexpr int CHANNELS = 2;
 static constexpr int FRAME_SIZE = 480; // 10ms at 48kHz
 static constexpr int SAMPLES_PER_FRAME = FRAME_SIZE * CHANNELS;
+static std::atomic<int> g_frameSizeMs{10}; // server-synced frame duration
 static constexpr int HEADER_SIZE = 16;
 static constexpr uint8_t PACKET_AUDIO = 0x01;
 static constexpr uint8_t PACKET_MIC_AUDIO = 0x04;
@@ -33,11 +35,6 @@ static constexpr int MIN_BUFFER_FRAMES = 0;  // 0 = pass-through, play immediate
 static constexpr int MAX_BUFFER_FRAMES = 3;  // 30ms max — accept some glitches over huge latency
 static constexpr int INITIAL_BUFFER_FRAMES = 1; // 10ms — single-frame startup
 
-struct AudioFrame {
-    int16_t samples[SAMPLES_PER_FRAME];
-    uint32_t sequence;
-    uint64_t timestamp;
-};
 
 class JitterBuffer {
 public:
@@ -136,9 +133,11 @@ public:
     void setTargetFrames(int frames) {
         std::lock_guard<std::mutex> lock(mutex_);
         if (frames < MIN_BUFFER_FRAMES) frames = MIN_BUFFER_FRAMES;
-        if (frames > MAX_BUFFER_FRAMES * 5) frames = MAX_BUFFER_FRAMES * 5; // Allow for larger explicit targets up to 150ms
+        const int frameMs = std::max(5, g_frameSizeMs.load());
+        const int maxFrames = (150 + frameMs - 1) / frameMs;
+        if (frames > maxFrames) frames = maxFrames;
         targetFrames_ = frames;
-        LOGI("[JITTER] Server set explicit target to %d frames (%d ms)", frames, frames * 10);
+        LOGI("[JITTER] Server set explicit target to %d frames (%d ms)", frames, frames * frameMs);
     }
 
     void logStats() {
@@ -181,7 +180,9 @@ public:
     void setVolume(float vol) { volume_.store(vol < 0.0f ? 0.0f : (vol > 1.0f ? 1.0f : vol)); }
 
     void setJitterBufferMs(int jitterMs) {
-        int frames = jitterMs / 10;
+        int fms = g_frameSizeMs.load();
+        if (fms <= 0) fms = 10;
+        int frames = (jitterMs + fms - 1) / fms;
         jitterBuffer_.setTargetFrames(frames);
     }
 
@@ -194,6 +195,7 @@ public:
         }
 
         jitterBuffer_.reset();
+        playbackFrame_.reset();
 
         oboe::AudioStreamBuilder builder;
         builder.setDirection(oboe::Direction::Output)
@@ -287,15 +289,16 @@ public:
 
         auto beforeDecode = std::chrono::steady_clock::now();
         int decoded = opus_decode(decoder_, opusData, payloadLen,
-                                  frame.samples, FRAME_SIZE, 0);
+                                  frame.samples, AudioFrame::maxFrames, 0);
         auto afterDecode = std::chrono::steady_clock::now();
         double decodeMs = std::chrono::duration<double, std::milli>(afterDecode - beforeDecode).count();
 
-        if (decoded < 0) {
+        if (decoded <= 0) {
             LOGE("Opus decode error: %s (payloadLen=%u)", opus_strerror(decoded), payloadLen);
             decodeErrors_++;
             return;
         }
+        frame.frameCount = decoded;
 
         if (decodeMs > 2.0) {
             slowDecodes_++;
@@ -304,7 +307,7 @@ public:
             }
         }
 
-        double bufferLatency = jitterBuffer_.size() * 10.0;
+        double bufferLatency = jitterBuffer_.size() * (double)g_frameSizeMs.load();
         latencyMs_.store(bufferLatency);
 
         jitterBuffer_.push(frame);
@@ -369,6 +372,7 @@ public:
         // If muted, output silence but still consume jitter buffer
         if (muted_.load()) {
             memset(output, 0, numFrames * CHANNELS * sizeof(int16_t));
+            playbackFrame_.reset();
             AudioFrame discard;
             while (jitterBuffer_.pop(discard)) {}
             return oboe::DataCallbackResult::Continue;
@@ -381,15 +385,17 @@ public:
         while (framesWritten < numFrames) {
             int framesToWrite = std::min(FRAME_SIZE, numFrames - framesWritten);
 
-            AudioFrame frame;
-            if (jitterBuffer_.pop(frame)) {
-                memcpy(output + framesWritten * CHANNELS,
-                       frame.samples,
-                       framesToWrite * CHANNELS * sizeof(int16_t));
+            if (playbackFrame_.empty()) {
+                playbackFrame_.reset();
+                jitterBuffer_.pop(playbackFrame_.frame);
+            }
+            if (!playbackFrame_.empty()) {
+                framesToWrite = playbackFrame_.copyTo(
+                    output + framesWritten * CHANNELS, numFrames - framesWritten);
 
                 // Track peak output level for diagnostics
                 for (int i = 0; i < framesToWrite * CHANNELS; i++) {
-                    int16_t s = frame.samples[i];
+                    int16_t s = output[framesWritten * CHANNELS + i];
                     int16_t abs_s = s < 0 ? -s : s;
                     if (abs_s > outputPeak_) outputPeak_ = abs_s;
                 }
@@ -482,6 +488,7 @@ private:
     OpusDecoder* decoder_;
     std::shared_ptr<oboe::AudioStream> stream_;
     JitterBuffer jitterBuffer_;
+    PlaybackFrame playbackFrame_;
     std::atomic<bool> running_;
     std::atomic<double> latencyMs_;
     std::atomic<bool> muted_;
@@ -1055,7 +1062,10 @@ private:
             jclass cls = env->GetObjectClass(g_mainActivity);
             jmethodID mid = env->GetMethodID(cls, "onNativeEvent",
                 "(Ljava/lang/String;Ljava/lang/String;)V");
-            if (mid) {
+            if (!mid) {
+                env->ExceptionClear();
+                LOGE("notifyDart: MainActivity.onNativeEvent not found");
+            } else {
                 jstring jMethod = env->NewStringUTF(method);
                 jstring jData = env->NewStringUTF(data);
                 env->CallVoidMethod(g_mainActivity, mid, jMethod, jData);
@@ -1193,7 +1203,19 @@ private:
                 if (len >= 18) {
                     uint16_t jitterMs;
                     memcpy(&jitterMs, data + 16, 2);
-                    LOGI("[RECV] Settings: jitter=%u ms", jitterMs);
+                    if (len >= 20) {
+                        uint16_t frameMs;
+                        memcpy(&frameMs, data + 18, 2);
+                        if (frameMs == 5 || frameMs == 10 || frameMs == 20) {
+                            g_frameSizeMs.store((int)frameMs);
+                            LOGI("[RECV] Settings: jitter=%u ms, frameSize=%u ms", jitterMs, frameMs);
+                            notifyDart("onFrameSizeUpdate", std::to_string(frameMs).c_str());
+                        } else {
+                            LOGI("[RECV] Settings: jitter=%u ms", jitterMs);
+                        }
+                    } else {
+                        LOGI("[RECV] Settings: jitter=%u ms", jitterMs);
+                    }
                     g_player.setJitterBufferMs(jitterMs);
                     notifyDart("onSettingsUpdate", std::to_string(jitterMs).c_str());
                 }

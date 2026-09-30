@@ -372,10 +372,10 @@ void AudioCapture::captureThread() {
 
 void AudioCapture::resampleAndDeliver(const float* src, uint32_t srcFrames,
                                        uint32_t srcChannels, uint32_t srcRate) {
-    // Target: 48000 Hz, 2 channels, 480-sample frames
+    // Target: 48000 Hz, 2 channels, configurable frame size
     const uint32_t targetRate = 48000;
     const uint32_t targetChannels = 2;
-    const uint32_t targetFrameSize = 480;
+    const uint32_t targetFrameSize = targetFrameSize_.load(std::memory_order_relaxed);
 
     if (srcFrames == 0 || srcChannels == 0) return;
 

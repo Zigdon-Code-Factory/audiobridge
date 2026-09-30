@@ -30,6 +30,11 @@ public:
     bool start(FrameCallback callback);
     void stop();
 
+    void setFrameSize(uint32_t samples) {
+        if (samples == 240 || samples == 480 || samples == 960)
+            targetFrameSize_.store(samples, std::memory_order_relaxed);
+    }
+
     void setOnDeviceInvalidated(std::function<void()> cb) { onDeviceInvalidated_ = cb; }
 
     uint32_t getSampleRate() const { return sampleRate_; }
@@ -56,6 +61,8 @@ private:
     HANDLE captureEvent_ = nullptr; // event-driven WASAPI signaling
 
     std::function<void()> onDeviceInvalidated_;
+
+    std::atomic<uint32_t> targetFrameSize_{480}; // 240=5ms, 480=10ms, 960=20ms
 
     // Resampling accumulation buffer
     std::deque<float> resampleBuf_;

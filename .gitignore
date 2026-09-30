@@ -59,8 +59,6 @@ flutter_app/android/app/release
 flutter_app/android/.gradle/
 flutter_app/android/app/build/
 flutter_app/android/build/
-*.apk
-*.aab
 
 # === Native build intermediates ===
 flutter_app/android/app/src/main/jniLibs/

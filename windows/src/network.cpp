@@ -739,16 +739,18 @@ void Network::sendMediaInfo(const std::string& json) {
     sendPacket(packet, 16 + payloadLen);
 }
 
-void Network::sendSettings(int jitterMs) {
+void Network::sendSettings(int jitterMs, int frameSizeMs) {
     if (!connected_) return;
 
     uint8_t packet[32];
-    uint16_t payloadLen = 2;
+    uint16_t payloadLen = 4;
     writeHeader(packet, PACKET_SETTINGS, payloadLen);
     uint16_t jitter = (uint16_t)jitterMs;
+    uint16_t frameMs = (uint16_t)frameSizeMs;
     memcpy(packet + 16, &jitter, 2);
+    memcpy(packet + 18, &frameMs, 2);
     sendPacket(packet, 16 + payloadLen);
-    printf("[NET] Sent settings to client: jitter=%dms\n", jitterMs);
+    printf("[NET] Sent settings to client: jitter=%dms frameSize=%dms\n", jitterMs, frameSizeMs);
 }
 
 std::string Network::getClientAddress() const {

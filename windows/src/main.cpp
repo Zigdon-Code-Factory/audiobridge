@@ -85,6 +85,7 @@ static LONG WINAPI CrashHandler(EXCEPTION_POINTERS* ex) {
 
 struct AppSettings {
     int jitterBufferMs = 20;
+    int frameSizeMs = 10;          // 5, 10, or 20 ms
     bool loopbackMode = true;
     std::string inputDeviceName;   // empty = default
     std::string outputDeviceName;  // empty = default
@@ -107,6 +108,7 @@ static AppSettings loadSettings() {
         std::string key = line.substr(0, eq);
         std::string val = line.substr(eq + 1);
         if (key == "jitter") { try { s.jitterBufferMs = std::stoi(val); } catch (...) {} }
+        else if (key == "frame") { try { int v = std::stoi(val); if (v==5||v==10||v==20) s.frameSizeMs = v; } catch (...) {} }
         else if (key == "mode") { s.loopbackMode = (val != "recording"); }
         else if (key == "input") { s.inputDeviceName = val; }
         else if (key == "output") { s.outputDeviceName = val; }
@@ -119,6 +121,7 @@ static void saveSettings(const AppSettings& s) {
     if (!file.is_open()) return;
     file << "# AudioBridge settings\n";
     file << "jitter=" << s.jitterBufferMs << "\n";
+    file << "frame=" << s.frameSizeMs << "\n";
     file << "mode=" << (s.loopbackMode ? "loopback" : "recording") << "\n";
     file << "input=" << s.inputDeviceName << "\n";
     file << "output=" << s.outputDeviceName << "\n";
@@ -175,8 +178,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     // Load saved settings
     AppSettings settings = loadSettings();
-    logPrintf("[SETTINGS] Loaded: jitter=%d, mode=%s, input='%s', output='%s'\n",
-             settings.jitterBufferMs, settings.loopbackMode ? "loopback" : "recording",
+    logPrintf("[SETTINGS] Loaded: jitter=%d, frame=%dms, mode=%s, input='%s', output='%s'\n",
+             settings.jitterBufferMs, settings.frameSizeMs,
+             settings.loopbackMode ? "loopback" : "recording",
              settings.inputDeviceName.c_str(), settings.outputDeviceName.c_str());
 
     // Initialize components — use saved capture mode from settings
@@ -206,6 +210,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         // Track which device we initialized with
         // (will be set properly after reinitAudio lambdas are defined)
     }
+    capture.setFrameSize((uint32_t)(settings.frameSizeMs * 48));
     gui.addLogMessage("Audio capture initialized: " + std::to_string(capture.getSampleRate()) + " Hz, " +
                       std::to_string(capture.getChannels()) + " ch");
 
@@ -244,12 +249,23 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     std::condition_variable mediaWakeCv;
 
     // Set up GUI callbacks
+    gui.setJitterBufferMs(settings.jitterBufferMs);
+    gui.setFrameSizeMs(settings.frameSizeMs);
+
     gui.setJitterChangeCallback([&](int bufferMs) {
         gui.addLogMessage("Jitter buffer target: " + std::to_string(bufferMs) + " ms");
         settings.jitterBufferMs = bufferMs;
         saveSettings(settings);
-        // Push updated jitter to connected client
-        network.sendSettings(bufferMs);
+        network.sendSettings(bufferMs, settings.frameSizeMs);
+    });
+
+    gui.setFrameSizeChangeCallback([&](int frameSizeMs) {
+        int samples = frameSizeMs * 48; // ms * 48kHz / 1000 * 1 = ms * 48
+        gui.addLogMessage("Frame size: " + std::to_string(frameSizeMs) + " ms (" + std::to_string(samples) + " samples)");
+        settings.frameSizeMs = frameSizeMs;
+        saveSettings(settings);
+        capture.setFrameSize((uint32_t)samples);
+        network.sendSettings(settings.jitterBufferMs, frameSizeMs);
     });
 
     gui.setPairApproveCallback([&](const std::string& clientId) {
@@ -276,8 +292,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
             bytesSent = 0;
             gui.addLogMessage("Client connected: " + name + " (" + network.getClientAddress() + ")");
             gui.updateApprovedPeers(network.getApprovedPeers());
-            // Send current jitter setting to client
-            network.sendSettings(settings.jitterBufferMs);
+            // Send current settings to client
+            network.sendSettings(settings.jitterBufferMs, settings.frameSizeMs);
         },
         [&]() {
             gui.addLogMessage("Client disconnected: " + clientName);
@@ -433,6 +449,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         gui.addLogMessage("Audio device: " + std::to_string(capture.getSampleRate()) + " Hz, " +
                           std::to_string(capture.getChannels()) + " ch");
 
+        capture.setFrameSize((uint32_t)(settings.frameSizeMs * 48));
         logPrintf("[REINIT] starting capture...\n");
         if (!capture.start(captureCallback)) {
             logPrintf("[REINIT] start FAILED\n");
@@ -633,6 +650,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         stats.micPeakLevel = micPeakLevel.load();
         stats.encrypted = network.isDtlsActive();
         stats.jitterBufferMs = gui.getJitterBufferMs();
+        stats.frameSizeMs = gui.getFrameSizeMs();
         stats.sequenceNum = (uint32_t)packetsSent.load();
         stats.uptimeSeconds = std::chrono::duration_cast<std::chrono::milliseconds>(
             now - startTime).count() / 1000.0;
