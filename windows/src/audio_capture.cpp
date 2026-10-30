@@ -14,7 +14,9 @@
 static const CLSID CLSID_MMDeviceEnumerator = __uuidof(MMDeviceEnumerator);
 static const IID IID_IMMDeviceEnumerator = __uuidof(IMMDeviceEnumerator);
 static const IID IID_IAudioClient = __uuidof(IAudioClient);
+static const IID IID_IAudioClient3 = __uuidof(IAudioClient3);
 static const IID IID_IAudioCaptureClient = __uuidof(IAudioCaptureClient);
+static const IID IID_IAudioRenderClient = __uuidof(IAudioRenderClient);
 
 AudioCapture::AudioCapture() {}
 
@@ -25,11 +27,32 @@ AudioCapture::~AudioCapture() {
 }
 
 void AudioCapture::cleanup() {
+    if (tapDevice_ != INVALID_HANDLE_VALUE) {
+        AudioBridgeTapEventRequest evReq{0};
+        DWORD returned = 0;
+        DeviceIoControl(tapDevice_, IOCTL_AUDIOBRIDGE_REGISTER_EVENT,
+                        &evReq, sizeof(evReq), nullptr, 0, &returned, nullptr);
+        if (tapSharedBuf_) {
+            DeviceIoControl(tapDevice_, IOCTL_AUDIOBRIDGE_UNMAP_BUFFER,
+                            nullptr, 0, nullptr, 0, &returned, nullptr);
+            tapSharedBuf_ = nullptr;
+        }
+        CloseHandle(tapDevice_);
+        tapDevice_ = INVALID_HANDLE_VALUE;
+    }
+    usingKernelTap_ = false;
+    if (lowPeriodRender_) { lowPeriodRender_->Release(); lowPeriodRender_ = nullptr; }
+    if (lowPeriodClient_) { lowPeriodClient_->Release(); lowPeriodClient_ = nullptr; }
+    if (lowPeriodEvent_) { CloseHandle(lowPeriodEvent_); lowPeriodEvent_ = nullptr; }
+    lowPeriodBufFrames_ = 0;
+
     if (captureClient_) { captureClient_->Release(); captureClient_ = nullptr; }
     if (audioClient_) { audioClient_->Release(); audioClient_ = nullptr; }
     if (device_) { device_->Release(); device_ = nullptr; }
     if (captureEvent_) { CloseHandle(captureEvent_); captureEvent_ = nullptr; }
+    deviceFriendlyName_.clear();
     resampleBuf_.clear();
+    chunkBuf_.clear();
     resamplePos_ = 0.0;
     peakLevel_ = 0.0f;
     peakSampleCount_ = 0;
@@ -99,6 +122,96 @@ std::vector<AudioDeviceInfo> AudioCapture::getDevices(bool loopback) {
     return devices;
 }
 
+bool AudioCapture::tryInitializeKernelTap() {
+    if (!loopback_ || !device_) return false;
+    if (deviceFriendlyName_.find(L"AudioBridge Virtual Speakers") == std::wstring::npos) {
+        return false;
+    }
+
+    HANDLE hTap = CreateFileW(AUDIOBRIDGE_TAP_USER_PATH,
+                              GENERIC_READ | GENERIC_WRITE,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE,
+                              nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hTap == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+
+    AudioBridgeTapMapResponse mapResp{};
+    DWORD returned = 0;
+    if (!DeviceIoControl(hTap, IOCTL_AUDIOBRIDGE_MAP_BUFFER,
+                         nullptr, 0, &mapResp, sizeof(mapResp), &returned, nullptr) ||
+        returned < sizeof(mapResp) || mapResp.userAddress == 0) {
+        CloseHandle(hTap);
+        return false;
+    }
+
+    auto* hdr = reinterpret_cast<AudioBridgeTapSharedBuffer*>((uintptr_t)mapResp.userAddress);
+    if (hdr->magic != AUDIOBRIDGE_TAP_MAGIC || hdr->version != AUDIOBRIDGE_TAP_VERSION ||
+        hdr->capacityFrames == 0 || hdr->channels == 0 || hdr->sampleRate == 0) {
+        DeviceIoControl(hTap, IOCTL_AUDIOBRIDGE_UNMAP_BUFFER, nullptr, 0, nullptr, 0, &returned, nullptr);
+        CloseHandle(hTap);
+        return false;
+    }
+
+    captureEvent_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!captureEvent_) {
+        DeviceIoControl(hTap, IOCTL_AUDIOBRIDGE_UNMAP_BUFFER, nullptr, 0, nullptr, 0, &returned, nullptr);
+        CloseHandle(hTap);
+        return false;
+    }
+
+    AudioBridgeTapEventRequest evReq{};
+    evReq.eventHandle = (ULONG64)(uintptr_t)captureEvent_;
+    if (!DeviceIoControl(hTap, IOCTL_AUDIOBRIDGE_REGISTER_EVENT,
+                         &evReq, sizeof(evReq), nullptr, 0, &returned, nullptr)) {
+        CloseHandle(captureEvent_);
+        captureEvent_ = nullptr;
+        DeviceIoControl(hTap, IOCTL_AUDIOBRIDGE_UNMAP_BUFFER, nullptr, 0, nullptr, 0, &returned, nullptr);
+        CloseHandle(hTap);
+        return false;
+    }
+
+    // Lock Windows audiodg.exe to the minimum WaveRT engine period (128 frames = 2.67ms)
+    // via a silent companion IAudioClient3 render stream.
+    if (SUCCEEDED(device_->Activate(IID_IAudioClient3, CLSCTX_ALL, nullptr, (void**)&lowPeriodClient_)) &&
+        lowPeriodClient_) {
+        WAVEFORMATEX* wf = nullptr;
+        if (SUCCEEDED(lowPeriodClient_->GetMixFormat(&wf)) && wf) {
+            UINT32 defP = 0, fundP = 0, minP = 0, maxP = 0;
+            if (SUCCEEDED(lowPeriodClient_->GetSharedModeEnginePeriod(wf, &defP, &fundP, &minP, &maxP)) &&
+                minP > 0 && minP < defP) {
+                lowPeriodEvent_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+                if (lowPeriodEvent_ &&
+                    SUCCEEDED(lowPeriodClient_->InitializeSharedAudioStream(
+                        AUDCLNT_STREAMFLAGS_EVENTCALLBACK, minP, wf, nullptr)) &&
+                    SUCCEEDED(lowPeriodClient_->SetEventHandle(lowPeriodEvent_)) &&
+                    SUCCEEDED(lowPeriodClient_->GetBufferSize(&lowPeriodBufFrames_)) &&
+                    SUCCEEDED(lowPeriodClient_->GetService(IID_IAudioRenderClient, (void**)&lowPeriodRender_))) {
+                    BYTE* pData = nullptr;
+                    if (SUCCEEDED(lowPeriodRender_->GetBuffer(lowPeriodBufFrames_, &pData))) {
+                        lowPeriodRender_->ReleaseBuffer(lowPeriodBufFrames_, AUDCLNT_BUFFERFLAGS_SILENT);
+                    }
+                    printf("[CAPTURE] Locked AudioBridge WaveRT engine period to %u frames (%.2f ms)\n",
+                           minP, minP * 1000.0 / wf->nSamplesPerSec);
+                }
+            }
+            CoTaskMemFree(wf);
+        }
+    }
+
+    tapDevice_ = hTap;
+    tapSharedBuf_ = hdr;
+    usingKernelTap_ = true;
+    sampleRate_ = hdr->sampleRate;
+    channels_ = hdr->channels;
+    bitsPerSample_ = 32;
+    isFloat_ = true;
+
+    printf("[CAPTURE] Attached to Direct Kernel WaveRT Tap (\\\\.\\AudioBridgeTap): %u Hz, %u ch, quantum=%u frames (%.2f ms)\n",
+           sampleRate_, channels_, hdr->quantumFrames, hdr->quantumFrames * 1000.0 / sampleRate_);
+    return true;
+}
+
 bool AudioCapture::initialize(const std::wstring& deviceId, bool loopback) {
     loopback_ = loopback;
     if (!enumerator_) {
@@ -122,17 +235,66 @@ bool AudioCapture::initialize(const std::wstring& deviceId, bool loopback) {
         return false;
     }
 
-    hr = device_->Activate(IID_IAudioClient, CLSCTX_ALL, nullptr, (void**)&audioClient_);
-    if (FAILED(hr)) {
-        printf("Failed to activate audio client: 0x%08lx\n", hr);
-        return false;
+    // Read endpoint friendly name for logging & Tier 2 kernel tap detection
+    IPropertyStore* props = nullptr;
+    if (SUCCEEDED(device_->OpenPropertyStore(STGM_READ, &props)) && props) {
+        PROPVARIANT varName;
+        PropVariantInit(&varName);
+        if (SUCCEEDED(props->GetValue(PKEY_Device_FriendlyName, &varName)) && varName.vt == VT_LPWSTR) {
+            deviceFriendlyName_ = varName.pwszVal;
+        }
+        PropVariantClear(&varName);
+        props->Release();
     }
 
+    // Tier 2 fast path: bypass audiodg.exe's 10ms loopback APO via direct WaveRT shared memory
+    if (tryInitializeKernelTap()) {
+        return true;
+    }
+
+    // For recording endpoints (eCapture), try IAudioClient3 low-period shared capture first
     WAVEFORMATEX* mixFormat = nullptr;
-    hr = audioClient_->GetMixFormat(&mixFormat);
-    if (FAILED(hr)) {
-        printf("Failed to get mix format: 0x%08lx\n", hr);
-        return false;
+    bool initializedViaAc3 = false;
+    if (!loopback_) {
+        IAudioClient3* ac3 = nullptr;
+        if (SUCCEEDED(device_->Activate(IID_IAudioClient3, CLSCTX_ALL, nullptr, (void**)&ac3)) && ac3) {
+            if (SUCCEEDED(ac3->GetMixFormat(&mixFormat)) && mixFormat) {
+                UINT32 defP = 0, fundP = 0, minP = 0, maxP = 0;
+                if (SUCCEEDED(ac3->GetSharedModeEnginePeriod(mixFormat, &defP, &fundP, &minP, &maxP)) &&
+                    minP > 0 && minP < defP) {
+                    if (SUCCEEDED(ac3->InitializeSharedAudioStream(
+                            AUDCLNT_STREAMFLAGS_EVENTCALLBACK, minP, mixFormat, nullptr))) {
+                        captureEvent_ = CreateEventW(nullptr, false, false, nullptr);
+                        if (captureEvent_ && SUCCEEDED(ac3->SetEventHandle(captureEvent_))) {
+                            audioClient_ = ac3;
+                            ac3 = nullptr;
+                            initializedViaAc3 = true;
+                            printf("[CAPTURE] Initialized IAudioClient3 low-period capture: %u frames (%.2f ms)\n",
+                                   minP, minP * 1000.0 / mixFormat->nSamplesPerSec);
+                        } else if (captureEvent_) {
+                            CloseHandle(captureEvent_);
+                            captureEvent_ = nullptr;
+                        }
+                    }
+                }
+            }
+            if (ac3) ac3->Release();
+        }
+    }
+
+    if (!initializedViaAc3) {
+        if (mixFormat) { CoTaskMemFree(mixFormat); mixFormat = nullptr; }
+        hr = device_->Activate(IID_IAudioClient, CLSCTX_ALL, nullptr, (void**)&audioClient_);
+        if (FAILED(hr)) {
+            printf("Failed to activate audio client: 0x%08lx\n", hr);
+            return false;
+        }
+
+        hr = audioClient_->GetMixFormat(&mixFormat);
+        if (FAILED(hr)) {
+            printf("Failed to get mix format: 0x%08lx\n", hr);
+            return false;
+        }
     }
 
     sampleRate_ = mixFormat->nSamplesPerSec;
@@ -149,44 +311,57 @@ bool AudioCapture::initialize(const std::wstring& deviceId, bool loopback) {
         isFloat_ = false;
     }
 
-    fprintf(stderr, "Audio device: %u Hz, %u channels, %u bits, %s\n",
-           sampleRate_, channels_, bitsPerSample_, isFloat_ ? "float" : "int");
+    fprintf(stderr, "Audio device '%ls': %u Hz, %u channels, %u bits, %s\n",
+           deviceFriendlyName_.c_str(), sampleRate_, channels_, bitsPerSample_, isFloat_ ? "float" : "int");
     fflush(stderr);
 
-    // For non-loopback (recording device): use event-driven capture so the thread
-    // wakes exactly when WASAPI has data instead of polling with Sleep().
-    // Loopback mode doesn't support AUDCLNT_STREAMFLAGS_EVENTCALLBACK, so it
-    // keeps the polling approach.
-    DWORD streamFlags = loopback_ ? AUDCLNT_STREAMFLAGS_LOOPBACK
-                                  : AUDCLNT_STREAMFLAGS_EVENTCALLBACK;
+    if (!initializedViaAc3) {
+        // Prefer event-driven WASAPI signaling for both recording AND loopback (supported
+        // since Windows 10 1703) so the capture thread wakes immediately on engine periods
+        // without Sleep(1) polling jitter. Automatically fall back to polling if a driver
+        // rejects event-driven loopback.
+        DWORD eventFlags = (loopback_ ? AUDCLNT_STREAMFLAGS_LOOPBACK : 0) | AUDCLNT_STREAMFLAGS_EVENTCALLBACK;
+        hr = audioClient_->Initialize(AUDCLNT_SHAREMODE_SHARED,
+                                       eventFlags,
+                                       0, 0, mixFormat, nullptr);
+        if (SUCCEEDED(hr)) {
+            captureEvent_ = CreateEventW(nullptr, false, false, nullptr);
+            if (!captureEvent_) {
+                printf("Failed to create capture event\n");
+                CoTaskMemFree(mixFormat);
+                return false;
+            }
+            hr = audioClient_->SetEventHandle(captureEvent_);
+            if (FAILED(hr)) {
+                printf("[CAPTURE] SetEventHandle failed (0x%08lx)\n", hr);
+                CloseHandle(captureEvent_);
+                captureEvent_ = nullptr;
+            }
+        }
 
-    REFERENCE_TIME bufferDuration = loopback_ ? 100000 : 0; // 0 = use engine default for event mode
-    hr = audioClient_->Initialize(AUDCLNT_SHAREMODE_SHARED,
-                                   streamFlags,
-                                   bufferDuration, 0, mixFormat, nullptr);
-    if (FAILED(hr)) {
-        printf("Failed to initialize audio client: 0x%08lx\n", hr);
-        CoTaskMemFree(mixFormat);
-        return false;
+        if (FAILED(hr) && loopback_) {
+            printf("[CAPTURE] Event-driven loopback unsupported (0x%08lx), falling back to polling\n", hr);
+            audioClient_->Release();
+            audioClient_ = nullptr;
+            hr = device_->Activate(IID_IAudioClient, CLSCTX_ALL, nullptr, (void**)&audioClient_);
+            if (FAILED(hr)) {
+                printf("Failed to re-activate audio client: 0x%08lx\n", hr);
+                CoTaskMemFree(mixFormat);
+                return false;
+            }
+            hr = audioClient_->Initialize(AUDCLNT_SHAREMODE_SHARED,
+                                           AUDCLNT_STREAMFLAGS_LOOPBACK,
+                                           100000, 0, mixFormat, nullptr);
+        }
+
+        if (FAILED(hr)) {
+            printf("Failed to initialize audio client: 0x%08lx\n", hr);
+            CoTaskMemFree(mixFormat);
+            return false;
+        }
     }
 
     CoTaskMemFree(mixFormat);
-
-    // Set up event handle for non-loopback event-driven capture
-    if (!loopback_) {
-        captureEvent_ = CreateEventW(nullptr, false, false, nullptr);
-        if (!captureEvent_) {
-            printf("Failed to create capture event\n");
-            return false;
-        }
-        hr = audioClient_->SetEventHandle(captureEvent_);
-        if (FAILED(hr)) {
-            printf("Failed to set event handle: 0x%08lx\n", hr);
-            CloseHandle(captureEvent_);
-            captureEvent_ = nullptr;
-            return false;
-        }
-    }
 
     hr = audioClient_->GetService(IID_IAudioCaptureClient, (void**)&captureClient_);
     if (FAILED(hr)) {
@@ -202,6 +377,15 @@ bool AudioCapture::start(FrameCallback callback) {
     resampleBuf_.clear();
     resamplePos_ = 0.0;
 
+    if (usingKernelTap_) {
+        if (lowPeriodClient_ && lowPeriodRender_) {
+            lowPeriodClient_->Start();
+        }
+        running_ = true;
+        thread_ = std::thread(&AudioCapture::tapCaptureThread, this);
+        return true;
+    }
+
     HRESULT hr = audioClient_->Start();
     if (FAILED(hr)) {
         printf("Failed to start capture: 0x%08lx\n", hr);
@@ -215,13 +399,94 @@ bool AudioCapture::start(FrameCallback callback) {
 
 void AudioCapture::stop() {
     running_ = false;
+    if (captureEvent_) SetEvent(captureEvent_);
+    if (lowPeriodEvent_) SetEvent(lowPeriodEvent_);
     if (thread_.joinable()) thread_.join();
+    if (lowPeriodClient_) lowPeriodClient_->Stop();
     if (audioClient_) audioClient_->Stop();
 }
 
+void AudioCapture::tapCaptureThread() {
+    printf("[CAPTURE] Direct Kernel WaveRT Tap thread started (tid=%lu, rate=%u, ch=%u)\n",
+           GetCurrentThreadId(), sampleRate_, channels_);
+
+    DWORD taskIndex = 0;
+    HANDLE task = AvSetMmThreadCharacteristicsW(L"Pro Audio", &taskIndex);
+
+    const float* ringSamples = AudioBridgeTapGetSamplesConst(tapSharedBuf_);
+    const uint32_t capFrames = tapSharedBuf_->capacityFrames;
+    LONG64 readCursor = InterlockedCompareExchange64(&tapSharedBuf_->writeFrameCursor, 0, 0);
+    std::vector<float> tempBuf(1024 * channels_);
+
+    while (running_) {
+        HANDLE handles[2];
+        DWORD handleCount = 0;
+        if (captureEvent_) handles[handleCount++] = captureEvent_;
+        if (lowPeriodEvent_) handles[handleCount++] = lowPeriodEvent_;
+
+        DWORD waitRes = (handleCount > 0)
+            ? WaitForMultipleObjects(handleCount, handles, FALSE, 10)
+            : WAIT_TIMEOUT;
+
+        if (!running_) break;
+
+        // Keep silent companion IAudioClient3 pacemaker fed so audiodg.exe stays at 128 frames
+        if (lowPeriodClient_ && lowPeriodRender_ && lowPeriodBufFrames_ > 0 &&
+            (waitRes == WAIT_OBJECT_0 + 1 || waitRes == WAIT_TIMEOUT)) {
+            UINT32 pad = 0;
+            if (SUCCEEDED(lowPeriodClient_->GetCurrentPadding(&pad)) && lowPeriodBufFrames_ > pad) {
+                BYTE* pData = nullptr;
+                UINT32 toWrite = lowPeriodBufFrames_ - pad;
+                if (SUCCEEDED(lowPeriodRender_->GetBuffer(toWrite, &pData))) {
+                    lowPeriodRender_->ReleaseBuffer(toWrite, AUDCLNT_BUFFERFLAGS_SILENT);
+                }
+            }
+        }
+
+        LONG64 writeCursor = InterlockedCompareExchange64(&tapSharedBuf_->writeFrameCursor, 0, 0);
+        if (writeCursor < readCursor) {
+            // Driver stream restarted and reset its cursor; resync instead of stalling forever
+            readCursor = writeCursor;
+        }
+        if (writeCursor > readCursor) {
+            LONG64 avail = writeCursor - readCursor;
+            if (avail > (LONG64)capFrames) {
+                // Reader fell behind cyclic ring capacity; jump to latest quantum
+                const uint32_t q = tapSharedBuf_->quantumFrames;
+                readCursor = writeCursor - ((q > 0 && q <= capFrames) ? q : AUDIOBRIDGE_TAP_DEFAULT_QUANTUM);
+                avail = writeCursor - readCursor;
+            }
+            while (avail > 0 && running_) {
+                uint32_t chunkFrames = (avail > 512) ? 512u : (uint32_t)avail;
+                if (tempBuf.size() < chunkFrames * channels_) {
+                    tempBuf.resize(chunkFrames * channels_);
+                }
+                for (uint32_t f = 0; f < chunkFrames; ++f) {
+                    uint32_t ringIdx = (uint32_t)((readCursor + f) % capFrames) * channels_;
+                    for (uint32_t c = 0; c < channels_; ++c) {
+                        tempBuf[f * channels_ + c] = ringSamples[ringIdx + c];
+                    }
+                }
+                readCursor += chunkFrames;
+                avail -= chunkFrames;
+                resampleAndDeliver(tempBuf.data(), chunkFrames, channels_, sampleRate_);
+            }
+        } else if (tapSharedBuf_->activeStreams == 0 && waitRes == WAIT_TIMEOUT) {
+            // Deliver idle silence quantum when no audio stream is active on the endpoint
+            uint32_t qFrames = tapSharedBuf_->quantumFrames ? tapSharedBuf_->quantumFrames : 128u;
+            std::vector<float> silence(qFrames * channels_, 0.0f);
+            resampleAndDeliver(silence.data(), qFrames, channels_, sampleRate_);
+        }
+    }
+
+    if (task) AvRevertMmThreadCharacteristics(task);
+    printf("[CAPTURE] Direct Kernel WaveRT Tap thread exiting\n");
+}
+
 void AudioCapture::captureThread() {
-    printf("[CAPTURE] Thread started (tid=%lu, rate=%u, ch=%u, %s)\n",
-           GetCurrentThreadId(), sampleRate_, channels_, isFloat_ ? "float" : "int");
+    printf("[CAPTURE] Thread started (tid=%lu, rate=%u, ch=%u, %s, wait=%s, dev='%ls')\n",
+           GetCurrentThreadId(), sampleRate_, channels_, isFloat_ ? "float" : "int",
+           captureEvent_ ? "event" : "poll", deviceFriendlyName_.c_str());
 
     // Boost thread priority for low latency
     DWORD taskIndex = 0;
@@ -236,7 +501,6 @@ void AudioCapture::captureThread() {
     uint64_t deliveryCount = 0;
     uint64_t getBufferFailCount = 0;
     uint64_t emptyPollCount = 0;        // times we polled and got nothing
-    uint64_t callbackDeliveryCount = 0; // 480-sample callback deliveries
     auto lastStatsTime = std::chrono::steady_clock::now();
     auto lastDeliveryTime = std::chrono::steady_clock::now();
     double maxGapMs = 0.0;
@@ -302,9 +566,6 @@ void AudioCapture::captureThread() {
 
             totalFrames += numFrames;
 
-            // Track resample buffer size
-            size_t resBufBefore = resampleBuf_.size();
-
             if (flags & AUDCLNT_BUFFERFLAGS_SILENT) {
                 silenceFrames += numFrames;
                 std::vector<float> silence(numFrames * channels_, 0.0f);
@@ -357,9 +618,11 @@ void AudioCapture::captureThread() {
             lastStatsTime = now;
         }
 
-        // Wait for next buffer: event-driven (recording) or short sleep (loopback)
+        if (!running_) break;
+
+        // Wait for next buffer: event-driven (wakes immediately on WASAPI quantum) or 1ms poll fallback
         if (captureEvent_) {
-            WaitForSingleObject(captureEvent_, 25); // up to 25ms — wakes as soon as WASAPI has data
+            WaitForSingleObject(captureEvent_, 25);
         } else {
             Sleep(1);
         }
@@ -380,7 +643,7 @@ void AudioCapture::resampleAndDeliver(const float* src, uint32_t srcFrames,
     if (srcFrames == 0 || srcChannels == 0) return;
 
     if (srcRate == targetRate && srcChannels == targetChannels) {
-        // No conversion needed — just accumulate and deliver in 480-sample chunks
+        // No conversion needed — accumulate and deliver in targetFrameSize chunks
         for (uint32_t i = 0; i < srcFrames * targetChannels; i++) {
             resampleBuf_.push_back(src[i]);
         }
@@ -432,23 +695,24 @@ void AudioCapture::resampleAndDeliver(const float* src, uint32_t srcFrames,
         }
     }
 
-    // Deliver complete 480-sample frames
+    // Deliver complete frames reusing chunkBuf_
     const size_t chunkSize = targetFrameSize * targetChannels;
+    if (chunkBuf_.size() != chunkSize) {
+        chunkBuf_.resize(chunkSize);
+    }
     while (resampleBuf_.size() >= chunkSize) {
         // Copy to contiguous buffer for callback, clamping to [-1.0, 1.0]
         // WASAPI loopback can deliver values outside this range when apps output
         // hot signals or system mixing occurs. Opus expects normalized float input
         // and distorts badly on out-of-range values (causes harsh "expanded" sound).
-        std::vector<float> chunk(chunkSize);
-        bool clipped = false;
         for (size_t i = 0; i < chunkSize; i++) {
             float sample = resampleBuf_.front();
             resampleBuf_.pop_front();
             float absSample = sample < 0 ? -sample : sample;
             if (absSample > peakLevel_) peakLevel_ = absSample;
-            if (sample > 1.0f) { sample = 1.0f; clipped = true; }
-            else if (sample < -1.0f) { sample = -1.0f; clipped = true; }
-            chunk[i] = sample;
+            if (sample > 1.0f) { sample = 1.0f; }
+            else if (sample < -1.0f) { sample = -1.0f; }
+            chunkBuf_[i] = sample;
         }
         peakSampleCount_ += targetFrameSize;
         if (peakSampleCount_ >= PEAK_REPORT_INTERVAL) {
@@ -457,6 +721,6 @@ void AudioCapture::resampleAndDeliver(const float* src, uint32_t srcFrames,
             peakLevel_ = 0.0f;
             peakSampleCount_ = 0;
         }
-        callback_(chunk.data(), targetFrameSize);
+        callback_(chunkBuf_.data(), targetFrameSize);
     }
 }

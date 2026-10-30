@@ -180,21 +180,25 @@ class AudioForegroundService : Service() {
     }
 
     private fun acquireWakeLock() {
-        val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
-        wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "AudioBridge::AudioWaitLock").apply {
-            acquire(24 * 60 * 60 * 1000L)
+        if (wakeLock?.isHeld != true) {
+            val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+            wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "AudioBridge::AudioWaitLock").apply {
+                acquire(24 * 60 * 60 * 1000L)
+            }
         }
 
         // Prevent Wi-Fi from entering power save mode — without this, the Wi-Fi chip
         // sleeps between packets and causes 50-200ms blackouts in UDP reception (audible pops).
         // WIFI_MODE_FULL_LOW_LATENCY disables PSM and DTIM coalescing entirely.
-        val wifiManager = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
-        val lockMode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q)
-            WifiManager.WIFI_MODE_FULL_LOW_LATENCY
-        else
-            WifiManager.WIFI_MODE_FULL_HIGH_PERF
-        wifiLock = wifiManager.createWifiLock(lockMode, "AudioBridge::WifiLock").apply {
-            acquire()
+        if (wifiLock?.isHeld != true) {
+            val wifiManager = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+            val lockMode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q)
+                WifiManager.WIFI_MODE_FULL_LOW_LATENCY
+            else
+                WifiManager.WIFI_MODE_FULL_HIGH_PERF
+            wifiLock = wifiManager.createWifiLock(lockMode, "AudioBridge::WifiLock").apply {
+                acquire()
+            }
         }
     }
 

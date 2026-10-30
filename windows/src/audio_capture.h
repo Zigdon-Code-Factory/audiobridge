@@ -9,6 +9,7 @@
 #include <deque>
 #include <vector>
 #include <string>
+#include "audiobridge_tap.h"
 
 struct AudioDeviceInfo {
     std::wstring id;
@@ -17,7 +18,7 @@ struct AudioDeviceInfo {
 
 class AudioCapture {
 public:
-    // Callback receives interleaved float stereo samples at 48kHz, 480 samples (10ms)
+    // Callback receives interleaved float stereo samples at 48kHz (120, 240, 480, or 960 frames)
     using FrameCallback = std::function<void(const float* data, uint32_t frameCount)>;
 
     AudioCapture();
@@ -31,7 +32,8 @@ public:
     void stop();
 
     void setFrameSize(uint32_t samples) {
-        if (samples == 240 || samples == 480 || samples == 960)
+        // Opus-valid frame sizes only (Opus mode can't encode e.g. 128-frame chunks)
+        if (samples == 120 || samples == 240 || samples == 480 || samples == 960)
             targetFrameSize_.store(samples, std::memory_order_relaxed);
     }
 
@@ -39,15 +41,29 @@ public:
 
     uint32_t getSampleRate() const { return sampleRate_; }
     uint32_t getChannels() const { return channels_; }
+    bool isUsingKernelTap() const { return usingKernelTap_; }
+    const std::wstring& getDeviceFriendlyName() const { return deviceFriendlyName_; }
 
 private:
+    bool tryInitializeKernelTap();
     void captureThread();
+    void tapCaptureThread();
     void resampleAndDeliver(const float* src, uint32_t srcFrames, uint32_t srcChannels, uint32_t srcRate);
 
     IMMDeviceEnumerator* enumerator_ = nullptr;
     IMMDevice* device_ = nullptr;
     IAudioClient* audioClient_ = nullptr;
     IAudioCaptureClient* captureClient_ = nullptr;
+    std::wstring deviceFriendlyName_;
+
+    // Tier 2 Direct Kernel WaveRT Tap (\\.\AudioBridgeTap) + IAudioClient3 128-frame pacemaker
+    bool usingKernelTap_ = false;
+    HANDLE tapDevice_ = INVALID_HANDLE_VALUE;
+    AudioBridgeTapSharedBuffer* tapSharedBuf_ = nullptr;
+    IAudioClient3* lowPeriodClient_ = nullptr;
+    IAudioRenderClient* lowPeriodRender_ = nullptr;
+    HANDLE lowPeriodEvent_ = nullptr;
+    UINT32 lowPeriodBufFrames_ = 0;
 
     uint32_t sampleRate_ = 0;
     uint32_t channels_ = 0;
@@ -58,14 +74,15 @@ private:
     FrameCallback callback_;
     std::atomic<bool> running_{false};
     std::thread thread_;
-    HANDLE captureEvent_ = nullptr; // event-driven WASAPI signaling
+    HANDLE captureEvent_ = nullptr; // event-driven WASAPI or kernel tap signaling
 
     std::function<void()> onDeviceInvalidated_;
 
-    std::atomic<uint32_t> targetFrameSize_{480}; // 240=5ms, 480=10ms, 960=20ms
+    std::atomic<uint32_t> targetFrameSize_{120}; // 120=2.5ms, 240=5ms, 480=10ms, 960=20ms
 
     // Resampling accumulation buffer
     std::deque<float> resampleBuf_;
+    std::vector<float> chunkBuf_;
     double resamplePos_ = 0.0;
 
     // Peak level monitoring

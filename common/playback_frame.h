@@ -18,6 +18,7 @@ public:
     AudioFrame frame;
     void reset() { frame.frameCount = 0; offset_ = 0; }
     bool empty() const { return offset_ >= frame.frameCount; }
+    int remaining() const { return frame.frameCount > offset_ ? (frame.frameCount - offset_) : 0; }
     int copyTo(int16_t* output, int requestedFrames) {
         const int count = std::min(requestedFrames, frame.frameCount - offset_);
         if (count <= 0) return 0;

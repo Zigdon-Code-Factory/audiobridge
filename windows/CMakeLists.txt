@@ -61,6 +61,7 @@ target_link_libraries(audiobridge PRIVATE
     opus
     webview::core
     ws2_32
+    qwave
     ole32
     avrt
     iphlpapi

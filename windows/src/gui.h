@@ -23,8 +23,11 @@ struct ServerStats {
     float peakLevel = 0.0f;
     float micPeakLevel = 0.0f;
     bool encrypted = false;
-    int jitterBufferMs = 20;
-    int frameSizeMs = 10;
+    bool rawPcm = true;
+    bool voiceQos = false;
+    bool kernelTap = false;
+    int jitterBufferMs = 10;
+    int frameSizeMs = 2; // 2 => 2.5ms (120 samples), 5, 10, 20
     uint32_t sequenceNum = 0;
     double uptimeSeconds = 0.0;
     std::string serverName;
@@ -42,6 +45,7 @@ class ServerGui {
 public:
     using JitterChangeCallback = std::function<void(int bufferMs)>;
     using FrameSizeChangeCallback = std::function<void(int frameSizeMs)>;
+    using CodecChangeCallback = std::function<void(bool rawPcm)>;
     using PairApproveCallback = std::function<void(const std::string& clientId)>;
     using PairDenyCallback = std::function<void(const std::string& clientId)>;
     using RevokeCallback = std::function<void(const std::string& clientId)>;
@@ -71,6 +75,7 @@ public:
     // Set callbacks
     void setJitterChangeCallback(JitterChangeCallback cb) { onJitterChange_ = cb; }
     void setFrameSizeChangeCallback(FrameSizeChangeCallback cb) { onFrameSizeChange_ = cb; }
+    void setCodecChangeCallback(CodecChangeCallback cb) { onCodecChange_ = cb; }
     void setPairApproveCallback(PairApproveCallback cb) { onPairApprove_ = cb; }
     void setPairDenyCallback(PairDenyCallback cb) { onPairDeny_ = cb; }
     void setRevokeCallback(RevokeCallback cb) { onRevoke_ = cb; }
@@ -82,6 +87,8 @@ public:
     void setJitterBufferMs(int ms) { jitterBufferMs_ = ms; }
     int getFrameSizeMs() const { return frameSizeMs_; }
     void setFrameSizeMs(int ms) { frameSizeMs_ = ms; }
+    bool getRawPcm() const { return rawPcm_; }
+    void setRawPcm(bool raw) { rawPcm_ = raw; }
 
 private:
     void setupBindings();
@@ -94,7 +101,8 @@ private:
 
     std::unique_ptr<webview::webview> webview_;
     int jitterBufferMs_ = 10;
-    int frameSizeMs_ = 10;
+    int frameSizeMs_ = 2;
+    bool rawPcm_ = true;
 
     // Thread-safe data
     mutable std::mutex dataMutex_;
@@ -117,6 +125,7 @@ private:
     // Callbacks
     JitterChangeCallback onJitterChange_;
     FrameSizeChangeCallback onFrameSizeChange_;
+    CodecChangeCallback onCodecChange_;
     PairApproveCallback onPairApprove_;
     PairDenyCallback onPairDeny_;
     RevokeCallback onRevoke_;

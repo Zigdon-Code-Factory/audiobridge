@@ -153,12 +153,21 @@ void ServerGui::setupBindings() {
         return "{}";
     });
 
-    // _setFrameSize: user changed frame size select
+    // _setFrameSize: user changed frame size select (2 => 2.5ms = 120 samples, 5, 10, 20)
     webview_->bind("_setFrameSize", [this](const std::string& args) -> std::string {
         int ms = parseFirstInt(args);
-        if (ms != 5 && ms != 10 && ms != 20) ms = 10;
+        if (ms != 2 && ms != 5 && ms != 10 && ms != 20) ms = 2;
         frameSizeMs_ = ms;
         if (onFrameSizeChange_) onFrameSizeChange_(ms);
+        return "{}";
+    });
+
+    // _setCodec: user changed streaming codec ("pcm" or "opus")
+    webview_->bind("_setCodec", [this](const std::string& args) -> std::string {
+        std::string mode = parseFirstString(args);
+        bool raw = (mode != "opus");
+        rawPcm_ = raw;
+        if (onCodecChange_) onCodecChange_(raw);
         return "{}";
     });
 
@@ -276,6 +285,9 @@ std::string ServerGui::buildStateJson() {
     s += "\"peakLevel\":" + jsonFloat(stats_.peakLevel) + ",";
     s += "\"micPeakLevel\":" + jsonFloat(stats_.micPeakLevel) + ",";
     s += "\"encrypted\":" + std::string(stats_.encrypted ? "true" : "false") + ",";
+    s += "\"rawPcm\":" + std::string(stats_.rawPcm ? "true" : "false") + ",";
+    s += "\"voiceQos\":" + std::string(stats_.voiceQos ? "true" : "false") + ",";
+    s += "\"kernelTap\":" + std::string(stats_.kernelTap ? "true" : "false") + ",";
     s += "\"jitterBufferMs\":" + std::to_string(stats_.jitterBufferMs) + ",";
     s += "\"frameSizeMs\":" + std::to_string(stats_.frameSizeMs) + ",";
     s += "\"sequenceNum\":" + std::to_string(stats_.sequenceNum) + ",";

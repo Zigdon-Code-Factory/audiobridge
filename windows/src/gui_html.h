@@ -109,7 +109,7 @@ body {
     font-weight: 600;
     padding: 2px 8px;
     border-radius: 6px;
-    margin-left: 8px;
+    margin-left: 6px;
     vertical-align: middle;
 }
 .encryption-badge.encrypted {
@@ -121,6 +121,11 @@ body {
     background: rgba(255, 152, 0, 0.15);
     color: #ff9800;
     border: 1px solid rgba(255, 152, 0, 0.3);
+}
+.encryption-badge.fast {
+    background: rgba(99, 102, 241, 0.18);
+    color: #a5b4fc;
+    border: 1px solid rgba(99, 102, 241, 0.4);
 }
 .level-fill {
     height: 100%;
@@ -207,9 +212,9 @@ input[type=range]::-webkit-slider-thumb {
 .btn.approve:hover { filter: brightness(1.1); }
 .btn.deny { background: var(--red); color: #0f0f14; }
 .btn.deny:hover { filter: brightness(1.1); }
-.btn.frame-btn { background: #2a2a3a; color: var(--text); border: 1px solid #3a3a4a; padding: 6px 16px; }
-.btn.frame-btn:hover { background: #3a3a4a; }
-.btn.frame-btn.active { background: var(--accent); color: #0f0f14; border-color: var(--accent); }
+.btn.frame-btn, .btn.codec-btn { background: #2a2a3a; color: var(--text); border: 1px solid #3a3a4a; padding: 6px 14px; }
+.btn.frame-btn:hover, .btn.codec-btn:hover { background: #3a3a4a; }
+.btn.frame-btn.active, .btn.codec-btn.active { background: var(--accent); color: #0f0f14; border-color: var(--accent); }
 .peer-item {
     display: flex;
     align-items: center;
@@ -249,7 +254,7 @@ input[type=range]::-webkit-slider-thumb {
 
 <div class="header">
     <span class="title">AudioBridge</span>
-    <span class="version">v1.0</span>
+    <span class="version">v1.1 Low-Latency</span>
 </div>
 <div class="sep"></div>
 
@@ -299,27 +304,41 @@ input[type=range]::-webkit-slider-thumb {
     </div>
 </div>
 
+<!-- Streaming Codec Card -->
+<div class="card">
+    <div class="card-header">
+        <span>STREAMING CODEC</span>
+        <span class="accent" id="codecValue">Raw PCM (0ms)</span>
+    </div>
+    <div class="btn-row" style="justify-content:center;gap:8px;margin-top:4px">
+        <button class="btn codec-btn active" id="codecBtnPcm" data-codec="pcm">Raw PCM (0ms delay)</button>
+        <button class="btn codec-btn" id="codecBtnOpus" data-codec="opus">Opus (128 kbps)</button>
+    </div>
+    <div class="dim small" style="margin-top:6px;text-align:center">Raw PCM bypasses Opus's 2.5ms lookahead (~1.5 Mbps over LAN Wi-Fi)</div>
+</div>
+
 <!-- Jitter Buffer Card -->
 <div class="card">
     <div class="card-header">
         <span>JITTER BUFFER</span>
         <span class="accent" id="jitterValue">10 ms</span>
     </div>
-    <input type="range" id="jitterSlider" min="0" max="150" step="5" value="10">
+    <input type="range" id="jitterSlider" min="0" max="100" step="1" value="10">
 </div>
 
 <!-- Frame Size Card -->
 <div class="card">
     <div class="card-header">
         <span>FRAME SIZE</span>
-        <span class="accent" id="frameSizeValue">10 ms</span>
+        <span class="accent" id="frameSizeValue">2.5 ms</span>
     </div>
     <div class="btn-row" style="justify-content:center;gap:8px;margin-top:4px">
+        <button class="btn frame-btn active" id="frameBtn2" data-ms="2">2.5 ms</button>
         <button class="btn frame-btn" id="frameBtn5" data-ms="5">5 ms</button>
-        <button class="btn frame-btn active" id="frameBtn10" data-ms="10">10 ms</button>
+        <button class="btn frame-btn" id="frameBtn10" data-ms="10">10 ms</button>
         <button class="btn frame-btn" id="frameBtn20" data-ms="20">20 ms</button>
     </div>
-    <div class="dim small" style="margin-top:6px;text-align:center">Lower = less latency &nbsp;|&nbsp; Higher = better compression</div>
+    <div class="dim small" style="margin-top:6px;text-align:center">2.5 ms (120 samples) = fastest streaming response</div>
 </div>
 
 <!-- Pair Request Card -->
@@ -354,6 +373,10 @@ let currentPairId = '';
 let currentDeviceIndex = -1;
 let currentOutDeviceIndex = -1;
 
+function frameLabel(ms) {
+    return (ms === 2) ? '2.5 ms' : (ms + ' ms');
+}
+
 // Event listeners
 document.getElementById('jitterSlider').addEventListener('input', function() {
     document.getElementById('jitterValue').textContent = this.value + ' ms';
@@ -365,8 +388,18 @@ document.querySelectorAll('.frame-btn').forEach(function(btn) {
         var ms = parseInt(this.getAttribute('data-ms'));
         document.querySelectorAll('.frame-btn').forEach(function(b) { b.classList.remove('active'); });
         this.classList.add('active');
-        document.getElementById('frameSizeValue').textContent = ms + ' ms';
+        document.getElementById('frameSizeValue').textContent = frameLabel(ms);
         window._setFrameSize(String(ms));
+    });
+});
+
+document.querySelectorAll('.codec-btn').forEach(function(btn) {
+    btn.addEventListener('click', function() {
+        var codec = this.getAttribute('data-codec');
+        document.querySelectorAll('.codec-btn').forEach(function(b) { b.classList.remove('active'); });
+        this.classList.add('active');
+        document.getElementById('codecValue').textContent = (codec === 'pcm') ? 'Raw PCM (0ms)' : 'Opus';
+        window._setCodec(codec);
     });
 });
 
@@ -427,10 +460,18 @@ function updateStatusCard(s) {
         conn.style.display = '';
         disc.style.display = 'none';
 
+        var badges = '<span class="encryption-badge ' + (s.encrypted ? 'encrypted' : 'unencrypted') + '">' +
+            (s.encrypted ? '\u{1F512} DTLS' : '\u{1F513} Open') + '</span>' +
+            '<span class="encryption-badge fast">' + (s.rawPcm ? 'PCM 0ms' : 'Opus') + '</span>';
+        if (s.voiceQos) {
+            badges += '<span class="encryption-badge encrypted">Wi-Fi AC_VO</span>';
+        }
+        if (s.kernelTap) {
+            badges += '<span class="encryption-badge encrypted">Kernel Tap</span>';
+        }
+
         var clientInfoEl = document.getElementById('clientInfo');
-        clientInfoEl.innerHTML = s.clientName + '  \u2022  ' + s.clientAddress +
-            '<span class="encryption-badge ' + (s.encrypted ? 'encrypted' : 'unencrypted') + '">' +
-            (s.encrypted ? '\u{1F512} DTLS' : '\u{1F513} Open') + '</span>';
+        clientInfoEl.innerHTML = escapeHtml(s.clientName) + '  \u2022  ' + escapeHtml(s.clientAddress) + badges;
 
         var sendLevel = Math.min(s.peakLevel, 1.0);
         var sendFill = document.getElementById('sendLevelFill');
@@ -460,7 +501,7 @@ function updateStatusCard(s) {
         conn.style.display = 'none';
         disc.style.display = '';
         document.getElementById('serverInfo').textContent =
-            s.serverName + '  \u2022  ' + s.serverMac;
+            s.serverName + '  \u2022  ' + s.serverMac + (s.kernelTap ? '  \u2022  Kernel Tap Active' : '');
     }
 }
 
@@ -578,6 +619,7 @@ function escapeHtml(s) {
 // Periodic tick
 var lastJitterMs = -1;
 var lastFrameSizeMs = -1;
+var lastRawPcm = null;
 
 async function tick() {
     try {
@@ -602,7 +644,15 @@ async function tick() {
             document.querySelectorAll('.frame-btn').forEach(function(b) {
                 b.classList.toggle('active', parseInt(b.getAttribute('data-ms')) === s.frameSizeMs);
             });
-            document.getElementById('frameSizeValue').textContent = s.frameSizeMs + ' ms';
+            document.getElementById('frameSizeValue').textContent = frameLabel(s.frameSizeMs);
+        }
+        if (s.rawPcm !== undefined && s.rawPcm !== lastRawPcm) {
+            lastRawPcm = s.rawPcm;
+            document.querySelectorAll('.codec-btn').forEach(function(b) {
+                var isPcmBtn = b.getAttribute('data-codec') === 'pcm';
+                b.classList.toggle('active', isPcmBtn === s.rawPcm);
+            });
+            document.getElementById('codecValue').textContent = s.rawPcm ? 'Raw PCM (0ms)' : 'Opus';
         }
     } catch(e) {
         console.error('tick error:', e);

@@ -1,5 +1,6 @@
 # === Build outputs ===
 windows/build/
+windows/driver/build/
 flutter_app/build/
 
 # === CMake ===
@@ -17,6 +18,9 @@ _deps/
 # === Compiled binaries ===
 *.exe
 *.dll
+*.sys
+*.cat
+*.cer
 *.lib
 *.obj
 *.o

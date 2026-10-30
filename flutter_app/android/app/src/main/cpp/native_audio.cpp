@@ -2,7 +2,9 @@
 #include <android/log.h>
 #include <oboe/Oboe.h>
 #include <opus.h>
+#include <algorithm>
 #include <cstring>
+#include <cmath>
 #include <mutex>
 #include <atomic>
 #include <vector>
@@ -12,7 +14,10 @@
 #include <sys/socket.h>
 #include <sys/resource.h>
 #include <netinet/in.h>
+#include <netinet/ip.h>
 #include <arpa/inet.h>
+#include <limits>
+#include <fcntl.h>
 #include <unistd.h>
 #include "playback_frame.h"
 
@@ -23,27 +28,30 @@
 // Audio constants matching spec
 static constexpr int SAMPLE_RATE = 48000;
 static constexpr int CHANNELS = 2;
-static constexpr int FRAME_SIZE = 480; // 10ms at 48kHz
+static constexpr int FRAME_SIZE = 480; // 10ms default reference at 48kHz
 static constexpr int SAMPLES_PER_FRAME = FRAME_SIZE * CHANNELS;
-static std::atomic<int> g_frameSizeMs{10}; // server-synced frame duration
+static std::atomic<int> g_frameSizeMs{2};     // 2 => 2.5ms (120 samples), 5, 10, or 20 ms
+static std::atomic<int> g_frameSamples{120};  // exact stereo sample frames per server packet
+static std::atomic<bool> g_isRawPcm{true};    // server streaming codec mode (true = Raw PCM)
 static constexpr int HEADER_SIZE = 16;
 static constexpr uint8_t PACKET_AUDIO = 0x01;
 static constexpr uint8_t PACKET_MIC_AUDIO = 0x04;
+static constexpr uint8_t PACKET_AUDIO_PCM = 0x09;
 
-// Jitter buffer constants — aggressive low-latency mode
-static constexpr int MIN_BUFFER_FRAMES = 0;  // 0 = pass-through, play immediately
-static constexpr int MAX_BUFFER_FRAMES = 3;  // 30ms max — accept some glitches over huge latency
-static constexpr int INITIAL_BUFFER_FRAMES = 1; // 10ms — single-frame startup
+// Sample-exact jitter buffer defaults (at 48 kHz stereo)
+static constexpr int INITIAL_TARGET_SAMPLE_FRAMES = 480; // 10.0 ms default startup target
+static constexpr int MAX_TARGET_SAMPLE_FRAMES = 7200;    // 150.0 ms ceiling
 
 
 class JitterBuffer {
 public:
-    JitterBuffer() : targetFrames_(INITIAL_BUFFER_FRAMES), underruns_(0), earlyCount_(0) {}
+    JitterBuffer() : targetSampleFrames_(INITIAL_TARGET_SAMPLE_FRAMES), underruns_(0), earlyCount_(0) {}
 
     void push(const AudioFrame& frame) {
+        if (frame.frameCount <= 0) return;
         std::lock_guard<std::mutex> lock(mutex_);
 
-        // Track sequence gaps (missing packets)
+        // Track sequence gaps (server increments sequence only for audio packets)
         if (lastPushSeq_ > 0 && frame.sequence > lastPushSeq_ + 1) {
             uint32_t missed = frame.sequence - lastPushSeq_ - 1;
             totalMissedPackets_ += missed;
@@ -65,22 +73,86 @@ public:
                 if (it->sequence == frame.sequence) { totalDuplicates_++; return; }
                 if (it->sequence > frame.sequence) {
                     frames_.insert(it, frame);
+                    queuedSamples_ += frame.frameCount;
+                    queuedSamplesAtomic_.store(queuedSamples_, std::memory_order_relaxed);
                     totalReordered_++;
                     return;
                 }
             }
             return;
         }
-        frames_.push_back(frame);
 
-        // Hard cap at 80 frames (800ms) regardless of target — prevents unbounded growth
-        // from clock drift while absorbing large Wi-Fi bursts without dropping packets.
-        // targetFrames_ only controls priming (fast startup after a gap), not this cap.
-        static constexpr size_t MAX_ABSOLUTE_FRAMES = 80;
-        while (frames_.size() > MAX_ABSOLUTE_FRAMES) {
+        if (primed_ && queuedSamples_ < windowMinSamples_) {
+            windowMinSamples_ = queuedSamples_;
+        }
+        frames_.push_back(frame);
+        queuedSamples_ += frame.frameCount;
+
+        const int target = std::max(targetSampleFrames_, 96); // >= 2.0ms floor for windowing
+
+        // Dynamic hard cap (at least 25ms = 1200 frames, or 5x target) — bounds extreme Wi-Fi
+        // stall bursts immediately rather than letting hundreds of milliseconds queue up.
+        const int maxAbsoluteSamples = std::max(1200, target * 5);
+        while (queuedSamples_ > maxAbsoluteSamples && !frames_.empty()) {
+            queuedSamples_ -= frames_.front().frameCount;
             frames_.pop_front();
             totalOverflows_++;
         }
+        if (queuedSamples_ < 0) queuedSamples_ = 0;
+
+        // Sample-exact 1.0-second (48,000 stereo frames) windowed minimum-depth latency catch-up:
+        // Observes the true trough queue depth across a full 1.0s window (after pops and before pushes).
+        // Because Windows WASAPI loopback delivers 480-frame (10ms) batches at once, keeping a 2.5ms
+        // (120-frame) trough floor when target <= 12.5ms lets the average queue depth track target 1:1
+        // instead of stacking +10ms of WASAPI burst depth on top of target.
+        if (primed_) {
+            windowPushedSamples_ += frame.frameCount;
+            if (windowPushedSamples_ >= SAMPLE_RATE) {
+                const int troughFloor = std::max(120, target - 480);
+                if (windowMinSamples_ > troughFloor && queuedSamples_ > troughFloor) {
+                    int excessSamples = windowMinSamples_ - troughFloor;
+                    size_t droppedPkts = 0;
+                    int droppedSamples = 0;
+                    while (!frames_.empty() &&
+                           frames_.front().frameCount <= excessSamples &&
+                           (queuedSamples_ - frames_.front().frameCount) >= troughFloor) {
+                        int fc = frames_.front().frameCount;
+                        frames_.pop_front();
+                        queuedSamples_ -= fc;
+                        excessSamples -= fc;
+                        droppedSamples += fc;
+                        droppedPkts++;
+                    }
+                    if (droppedPkts > 0) {
+                        totalTrimmed_ += droppedPkts;
+                        if (totalTrimmed_ <= 200 || (totalTrimmed_ % 100) == 0) {
+                            LOGI("[JITTER] Window catch-up trimmed %zu pkts / %.1fms (winMin=%.1fms, floor=%.1fms, target=%.1fms, total trimmed=%llu)",
+                                 droppedPkts, droppedSamples * 1000.0 / SAMPLE_RATE,
+                                 windowMinSamples_ * 1000.0 / SAMPLE_RATE,
+                                 troughFloor * 1000.0 / SAMPLE_RATE,
+                                 target * 1000.0 / SAMPLE_RATE,
+                                 (unsigned long long)totalTrimmed_);
+                        }
+                    }
+                }
+                resetWindowLocked();
+            }
+        }
+
+        queuedSamplesAtomic_.store(queuedSamples_, std::memory_order_relaxed);
+    }
+
+    // Discard stale packets accumulated while AAudioStreamBuilder_openStream() was opening
+    void trimPreStartBacklog() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const int keep = std::max(targetSampleFrames_, 240);
+        while (!frames_.empty() && (queuedSamples_ - frames_.front().frameCount) >= keep) {
+            queuedSamples_ -= frames_.front().frameCount;
+            frames_.pop_front();
+        }
+        if (queuedSamples_ < 0) queuedSamples_ = 0;
+        queuedSamplesAtomic_.store(queuedSamples_, std::memory_order_relaxed);
+        resetWindowLocked();
     }
 
     bool pop(AudioFrame& out) {
@@ -88,18 +160,28 @@ public:
         if (frames_.empty()) {
             underruns_++;
             totalUnderruns_++;
-            primed_ = false; // Re-prime the buffer up to targetFrames_ to survive subsequent jitter
+            primed_ = false; // Re-prime up to targetSampleFrames_ to survive subsequent jitter
+            resetWindowLocked();
+            queuedSamples_ = 0;
+            queuedSamplesAtomic_.store(0, std::memory_order_relaxed);
             return false;
         }
 
-        if (!primed_ && targetFrames_ > 0 && frames_.size() < static_cast<size_t>(targetFrames_)) {
+        if (!primed_ && targetSampleFrames_ > 0 && queuedSamples_ < targetSampleFrames_) {
             return false;
         }
         primed_ = true;
 
         out = frames_.front();
         frames_.pop_front();
+        queuedSamples_ -= out.frameCount;
+        if (queuedSamples_ < 0) queuedSamples_ = 0;
+        queuedSamplesAtomic_.store(queuedSamples_, std::memory_order_relaxed);
         totalPops_++;
+
+        if (queuedSamples_ < windowMinSamples_) {
+            windowMinSamples_ = queuedSamples_;
+        }
 
         underruns_ = 0;
         return true;
@@ -108,10 +190,13 @@ public:
     void reset() {
         std::lock_guard<std::mutex> lock(mutex_);
         frames_.clear();
-        // Do NOT reset targetFrames_ here; the server controls it explicitly
+        queuedSamples_ = 0;
+        queuedSamplesAtomic_.store(0, std::memory_order_relaxed);
+        // Do NOT reset targetSampleFrames_ here; the server controls it explicitly
         underruns_ = 0;
         earlyCount_ = 0;
         primed_ = false;
+        resetWindowLocked();
         lastPushSeq_ = 0;
         totalPushes_ = 0;
         totalPops_ = 0;
@@ -121,44 +206,59 @@ public:
         totalReordered_ = 0;
         totalDroppedOld_ = 0;
         totalOverflows_ = 0;
+        totalTrimmed_ = 0;
     }
 
-    int size() {
+    int size() const {
         std::lock_guard<std::mutex> lock(mutex_);
         return static_cast<int>(frames_.size());
     }
 
-    int getTargetFrames() const { return targetFrames_; }
+    // Lock-free sample frame depth for UI latency polling and audio callback diagnostics
+    int queuedSampleFrames() const {
+        return queuedSamplesAtomic_.load(std::memory_order_relaxed);
+    }
 
-    void setTargetFrames(int frames) {
+    void setTargetMs(int jitterMs) {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (frames < MIN_BUFFER_FRAMES) frames = MIN_BUFFER_FRAMES;
-        const int frameMs = std::max(5, g_frameSizeMs.load());
-        const int maxFrames = (150 + frameMs - 1) / frameMs;
-        if (frames > maxFrames) frames = maxFrames;
-        targetFrames_ = frames;
-        LOGI("[JITTER] Server set explicit target to %d frames (%d ms)", frames, frames * frameMs);
+        if (jitterMs < 0) jitterMs = 0;
+        int samples = (jitterMs * SAMPLE_RATE) / 1000;
+        if (samples > MAX_TARGET_SAMPLE_FRAMES) samples = MAX_TARGET_SAMPLE_FRAMES;
+        targetSampleFrames_ = samples;
+        resetWindowLocked();
+        LOGI("[JITTER] Server set explicit target to %d ms (%d sample frames)", jitterMs, samples);
     }
 
     void logStats() {
         std::lock_guard<std::mutex> lock(mutex_);
-        LOGI("[JITTER] Stats: size=%zu, target=%d, pushes=%llu, pops=%llu, "
-             "underruns=%llu, missed=%llu, dupes=%llu, reorder=%llu, "
+        LOGI("[JITTER] Stats: pkts=%zu (%.1fms), target=%.1fms, pushes=%llu, pops=%llu, "
+             "underruns=%llu, trimmed=%llu, missed=%llu, dupes=%llu, reorder=%llu, "
              "dropped_old=%llu, overflows=%llu",
-             frames_.size(), targetFrames_,
+             frames_.size(), queuedSamples_ * 1000.0 / SAMPLE_RATE,
+             targetSampleFrames_ * 1000.0 / SAMPLE_RATE,
              (unsigned long long)totalPushes_, (unsigned long long)totalPops_,
-             (unsigned long long)totalUnderruns_, (unsigned long long)totalMissedPackets_,
+             (unsigned long long)totalUnderruns_, (unsigned long long)totalTrimmed_,
+             (unsigned long long)totalMissedPackets_,
              (unsigned long long)totalDuplicates_, (unsigned long long)totalReordered_,
              (unsigned long long)totalDroppedOld_, (unsigned long long)totalOverflows_);
     }
 
 private:
+    void resetWindowLocked() {
+        windowMinSamples_ = std::numeric_limits<int>::max();
+        windowPushedSamples_ = 0;
+    }
+
     std::deque<AudioFrame> frames_;
-    std::mutex mutex_;
-    int targetFrames_;
+    mutable std::mutex mutex_;
+    int queuedSamples_ = 0;
+    std::atomic<int> queuedSamplesAtomic_{0};
+    int targetSampleFrames_;
     int underruns_;
     int earlyCount_;
     bool primed_ = false;
+    int windowMinSamples_ = std::numeric_limits<int>::max();
+    int windowPushedSamples_ = 0;
     uint32_t lastPushSeq_ = 0;
 
     // Cumulative diagnostic counters
@@ -170,20 +270,19 @@ private:
     uint64_t totalReordered_ = 0;
     uint64_t totalDroppedOld_ = 0;
     uint64_t totalOverflows_ = 0;
+    uint64_t totalTrimmed_ = 0;
 };
 
 class AudioPlayer : public oboe::AudioStreamDataCallback, public oboe::AudioStreamErrorCallback {
 public:
-    AudioPlayer() : decoder_(nullptr), running_(false), latencyMs_(0.0), muted_(false), volume_(1.0f) {}
+    AudioPlayer() : decoder_(nullptr), running_(false), muted_(false), volume_(1.0f), systemVolume_(1.0f) {}
 
     void setMuted(bool muted) { muted_.store(muted); }
     void setVolume(float vol) { volume_.store(vol < 0.0f ? 0.0f : (vol > 1.0f ? 1.0f : vol)); }
+    void setSystemVolume(float vol) { systemVolume_.store(vol < 0.0f ? 0.0f : (vol > 1.0f ? 1.0f : vol)); }
 
     void setJitterBufferMs(int jitterMs) {
-        int fms = g_frameSizeMs.load();
-        if (fms <= 0) fms = 10;
-        int frames = (jitterMs + fms - 1) / fms;
-        jitterBuffer_.setTargetFrames(frames);
+        jitterBuffer_.setTargetMs(jitterMs);
     }
 
     bool start() {
@@ -196,65 +295,117 @@ public:
 
         jitterBuffer_.reset();
         playbackFrame_.reset();
+        remainingPlaybackFrames_.store(0, std::memory_order_relaxed);
+        lastSampleL_ = 0;
+        lastSampleR_ = 0;
+        framesSinceLog_ = 0;
+        callbackCount_ = 0;
 
+        // Request SharingMode::Exclusive for direct 1.0ms (48-frame) hardware MMAP access,
+        // bypassing AAudioService's 6.0ms shared mixer ring buffer! Oboe automatically falls
+        // back to SharingMode::Shared if Exclusive MMAP is unavailable; when Exclusive is
+        // granted, we apply Android's STREAM_MUSIC volume curve in software so hardware
+        // volume keys work identically.
         oboe::AudioStreamBuilder builder;
         builder.setDirection(oboe::Direction::Output)
                ->setPerformanceMode(oboe::PerformanceMode::LowLatency)
-               ->setSharingMode(oboe::SharingMode::Shared)
+               ->setSharingMode(oboe::SharingMode::Exclusive)
                ->setFormat(oboe::AudioFormat::I16)
                ->setChannelCount(CHANNELS)
                ->setSampleRate(SAMPLE_RATE)
-               ->setFramesPerCallback(FRAME_SIZE)
                ->setDataCallback(this)
                ->setErrorCallback(this)
                ->setUsage(oboe::Usage::Media)
-               ->setContentType(oboe::ContentType::Speech)
-               ->setBufferCapacityInFrames(FRAME_SIZE * 2);
+               ->setContentType(oboe::ContentType::Music);
 
-        oboe::Result result = builder.openStream(stream_);
-        if (result != oboe::Result::OK) {
+        std::shared_ptr<oboe::AudioStream> newStream;
+        oboe::Result result = builder.openStream(newStream);
+        if (result != oboe::Result::OK || !newStream) {
             LOGE("Failed to open stream: %s", oboe::convertToText(result));
             opus_decoder_destroy(decoder_);
             decoder_ = nullptr;
             return false;
         }
 
-        result = stream_->requestStart();
+        const bool exclusiveGranted = (newStream->getSharingMode() == oboe::SharingMode::Exclusive);
+        isExclusiveMmap_.store(exclusiveGranted, std::memory_order_relaxed);
+
+        // Pin active AAudio ring buffer threshold:
+        // - Exclusive MMAP (48-frame 1.0ms burst): 3x burst = 144 frames (3.0ms) gives 2.0ms of
+        //   SCHED_FIFO scheduling slack for zero XRuns while halving output latency vs Shared!
+        // - Shared MMAP (96-frame 2.0ms burst): 2x burst = 192 frames (4.0ms).
+        int32_t burst = newStream->getFramesPerBurst();
+        if (burst > 0) {
+            int32_t targetBuf = (burst <= 48)
+                ? std::max<int32_t>(burst * 3, 144)
+                : std::max<int32_t>(burst * 2, 144);
+            int32_t cap = newStream->getBufferCapacityInFrames();
+            if (cap > 0 && targetBuf > cap) targetBuf = cap;
+            newStream->setBufferSizeInFrames(targetBuf);
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(streamMutex_);
+            stream_ = newStream;
+        }
+
+        // Trim any packets accumulated while AAudioStreamBuilder_openStream() was opening
+        jitterBuffer_.trimPreStartBacklog();
+
+        running_ = true;
+        result = newStream->requestStart();
         if (result != oboe::Result::OK) {
+            running_ = false;
             LOGE("Failed to start stream: %s", oboe::convertToText(result));
-            stream_->close();
-            stream_.reset();
+            {
+                std::lock_guard<std::mutex> lock(streamMutex_);
+                stream_.reset();
+            }
+            newStream->close();
             opus_decoder_destroy(decoder_);
             decoder_ = nullptr;
             return false;
         }
 
-        running_ = true;
-        LOGI("Audio player started, buffer size: %d", stream_->getBufferSizeInFrames());
+        LOGI("Audio player started: api=%s, perf=%d, sharing=%s, rate=%d, burst=%d, bufSize=%d, cap=%d",
+             newStream->getAudioApi() == oboe::AudioApi::AAudio ? "AAudio" : "OpenSLES",
+             (int)newStream->getPerformanceMode(),
+             exclusiveGranted ? "EXCLUSIVE" : "SHARED",
+             newStream->getSampleRate(),
+             newStream->getFramesPerBurst(),
+             newStream->getBufferSizeInFrames(),
+             newStream->getBufferCapacityInFrames());
         return true;
     }
 
     void stop() {
         running_ = false;
-        if (stream_) {
-            stream_->requestStop();
-            stream_->close();
-            stream_.reset();
+        isExclusiveMmap_.store(false, std::memory_order_relaxed);
+        std::shared_ptr<oboe::AudioStream> oldStream;
+        {
+            std::lock_guard<std::mutex> lock(streamMutex_);
+            oldStream = std::move(stream_);
+        }
+        if (oldStream) {
+            oldStream->requestStop();
+            oldStream->close();
+            oldStream.reset();
         }
         if (decoder_) {
             opus_decoder_destroy(decoder_);
             decoder_ = nullptr;
         }
         jitterBuffer_.reset();
+        remainingPlaybackFrames_.store(0, std::memory_order_relaxed);
     }
 
     void feedPacket(const uint8_t* data, int length) {
-        if (!running_ || !decoder_ || length < HEADER_SIZE) return;
+        if (!running_ || length < HEADER_SIZE) return;
 
         uint8_t version = data[0];
         uint8_t type = data[1];
 
-        if (version != 0x01 || type != 0x01) return; // Only process audio packets
+        if (version != 0x01 || (type != PACKET_AUDIO && type != PACKET_AUDIO_PCM)) return;
 
         uint32_t seq;
         uint64_t timestamp;
@@ -264,9 +415,9 @@ public:
         memcpy(&timestamp, data + 6, 8);
         memcpy(&payloadLen, data + 14, 2);
 
-        if (length < HEADER_SIZE + payloadLen) return;
+        if (payloadLen == 0 || length < HEADER_SIZE + payloadLen) return;
 
-        const uint8_t* opusData = data + HEADER_SIZE;
+        const uint8_t* payload = data + HEADER_SIZE;
 
         // Track feed timing
         auto now = std::chrono::steady_clock::now();
@@ -274,51 +425,66 @@ public:
         lastFeedTime_ = now;
         feedCount_++;
 
-        if (feedGapMs > 15.0 && feedCount_ > 1) {
+        const int cfgSamples = std::max(48, g_frameSamples.load(std::memory_order_relaxed));
+        const double expectedFeedMs = (cfgSamples * 1000.0) / SAMPLE_RATE;
+        if (feedGapMs > std::max(15.0, expectedFeedMs * 2.5) && feedCount_ > 1) {
             largeFeedGapCount_++;
             if (largeFeedGapCount_ <= 20 || (largeFeedGapCount_ % 50) == 0) {
-                LOGI("[FEED] LARGE GAP #%llu: %.1fms between feeds (seq=%u, jbuf=%d)",
-                     (unsigned long long)largeFeedGapCount_, feedGapMs, seq, jitterBuffer_.size());
+                LOGI("[FEED] LARGE GAP #%llu: %.1fms between feeds (seq=%u, jbufMs=%.1f)",
+                     (unsigned long long)largeFeedGapCount_, feedGapMs, seq,
+                     jitterBuffer_.queuedSampleFrames() * 1000.0 / SAMPLE_RATE);
             }
         }
 
-        // Decode Opus  
         AudioFrame frame;
         frame.sequence = seq;
         frame.timestamp = timestamp;
+        double decodeMs = 0.0;
 
-        auto beforeDecode = std::chrono::steady_clock::now();
-        int decoded = opus_decode(decoder_, opusData, payloadLen,
-                                  frame.samples, AudioFrame::maxFrames, 0);
-        auto afterDecode = std::chrono::steady_clock::now();
-        double decodeMs = std::chrono::duration<double, std::milli>(afterDecode - beforeDecode).count();
+        if (type == PACKET_AUDIO_PCM) {
+            // Zero-lookahead Raw 16-bit Stereo PCM fast path (4 bytes per stereo frame)
+            if ((payloadLen % 4) != 0) return;
+            int pcmFrames = payloadLen / 4;
+            if (pcmFrames <= 0 || pcmFrames > AudioFrame::maxFrames) return;
+            memcpy(frame.samples, payload, static_cast<size_t>(pcmFrames) * 4);
+            frame.frameCount = pcmFrames;
+        } else {
+            // Opus decode path (exclusively on recvThread_ — never touched from onAudioReady)
+            if (!decoder_) return;
+            auto beforeDecode = std::chrono::steady_clock::now();
+            int decoded = opus_decode(decoder_, payload, payloadLen,
+                                      frame.samples, AudioFrame::maxFrames, 0);
+            auto afterDecode = std::chrono::steady_clock::now();
+            decodeMs = std::chrono::duration<double, std::milli>(afterDecode - beforeDecode).count();
 
-        if (decoded <= 0) {
-            LOGE("Opus decode error: %s (payloadLen=%u)", opus_strerror(decoded), payloadLen);
-            decodeErrors_++;
-            return;
-        }
-        frame.frameCount = decoded;
+            if (decoded <= 0) {
+                LOGE("Opus decode error: %s (payloadLen=%u)", opus_strerror(decoded), payloadLen);
+                decodeErrors_++;
+                return;
+            }
+            frame.frameCount = decoded;
 
-        if (decodeMs > 2.0) {
-            slowDecodes_++;
-            if (slowDecodes_ <= 10 || (slowDecodes_ % 50) == 0) {
-                LOGI("[FEED] SLOW decode #%llu: %.2fms", (unsigned long long)slowDecodes_, decodeMs);
+            if (decodeMs > 2.0) {
+                slowDecodes_++;
+                if (slowDecodes_ <= 10 || (slowDecodes_ % 50) == 0) {
+                    LOGI("[FEED] SLOW decode #%llu: %.2fms", (unsigned long long)slowDecodes_, decodeMs);
+                }
             }
         }
 
-        double bufferLatency = jitterBuffer_.size() * (double)g_frameSizeMs.load();
-        latencyMs_.store(bufferLatency);
-
         jitterBuffer_.push(frame);
 
-        // Periodic feed stats (every 500 packets = ~5 seconds)
-        if (feedCount_ <= 5 || (feedCount_ % 500) == 0) {
-            LOGI("[FEED] #%llu: seq=%u, opusLen=%u, decoded=%d, "
-                 "decodeMs=%.2f, gap=%.1fms, jbuf=%d, "
+        // Periodic feed stats (every ~5 seconds)
+        const uint64_t logInterval = static_cast<uint64_t>(std::max(100.0, 5000.0 / expectedFeedMs));
+        if (feedCount_ <= 5 || (logInterval > 0 && (feedCount_ % logInterval) == 0)) {
+            LOGI("[FEED] #%llu (%s): seq=%u, len=%u, frames=%d, "
+                 "decodeMs=%.2f, gap=%.1fms, jbufMs=%.1f, "
                  "largeGaps=%llu, slowDec=%llu, decErr=%llu",
-                 (unsigned long long)feedCount_, seq, payloadLen, decoded,
-                 decodeMs, feedGapMs, jitterBuffer_.size(),
+                 (unsigned long long)feedCount_,
+                 type == PACKET_AUDIO_PCM ? "PCM" : "OPUS",
+                 seq, payloadLen, frame.frameCount,
+                 decodeMs, feedGapMs,
+                 jitterBuffer_.queuedSampleFrames() * 1000.0 / SAMPLE_RATE,
                  (unsigned long long)largeFeedGapCount_,
                  (unsigned long long)slowDecodes_,
                  (unsigned long long)decodeErrors_);
@@ -327,12 +493,29 @@ public:
     }
 
     double getLatency() const {
-        return latencyMs_.load();
+        const int totalFrames = jitterBuffer_.queuedSampleFrames() +
+                                remainingPlaybackFrames_.load(std::memory_order_relaxed);
+        return (totalFrames * 1000.0) / SAMPLE_RATE;
     }
 
     double getOutputBufferMs() const {
-        if (!stream_) return 0.0;
-        return stream_->getBufferSizeInFrames() * 1000.0 / SAMPLE_RATE;
+        if (!running_.load(std::memory_order_relaxed)) return 0.0;
+        std::shared_ptr<oboe::AudioStream> s;
+        {
+            std::lock_guard<std::mutex> lock(streamMutex_);
+            s = stream_;
+        }
+        if (!s) return 0.0;
+        auto latResult = s->calculateLatencyMillis();
+        if (latResult) {
+            double ms = latResult.value();
+            if (ms > 0.0 && ms < 500.0) {
+                return ms;
+            }
+        }
+        int32_t rate = s->getSampleRate();
+        if (rate <= 0) rate = SAMPLE_RATE;
+        return s->getBufferSizeInFrames() * 1000.0 / rate;
     }
 
     float getOutputPeakLevel() {
@@ -346,124 +529,130 @@ public:
             void* audioData,
             int32_t numFrames) override {
 
-        auto* output = static_cast<int16_t*>(audioData);
         auto callbackStart = std::chrono::steady_clock::now();
-
-        // Track callback timing
         double callbackGapMs = std::chrono::duration<double, std::milli>(
             callbackStart - lastCallbackTime_).count();
         lastCallbackTime_ = callbackStart;
         callbackCount_++;
 
-        if (callbackGapMs > 15.0 && callbackCount_ > 1) {
+        const double expectedCallbackMs = (numFrames * 1000.0) / SAMPLE_RATE;
+        if (callbackGapMs > std::max(10.0, expectedCallbackMs * 2.5) && callbackCount_ > 1) {
             largeCallbackGapCount_++;
             if (largeCallbackGapCount_ <= 20 || (largeCallbackGapCount_ % 50) == 0) {
-                LOGI("[OBOE] LARGE callback gap #%llu: %.1fms (expected ~10ms, numFrames=%d, jbuf=%d)",
-                     (unsigned long long)largeCallbackGapCount_, callbackGapMs,
-                     numFrames, jitterBuffer_.size());
+                LOGI("[OBOE] LARGE CALLBACK GAP #%llu: %.1fms (numFrames=%d, jbufFrames=%d)",
+                     (unsigned long long)largeCallbackGapCount_, callbackGapMs, numFrames,
+                     jitterBuffer_.queuedSampleFrames());
             }
         }
 
-        if (!running_) {
-            memset(output, 0, numFrames * CHANNELS * sizeof(int16_t));
-            return oboe::DataCallbackResult::Stop;
-        }
+        auto* output = static_cast<int16_t*>(audioData);
 
-        // If muted, output silence but still consume jitter buffer
-        if (muted_.load()) {
+        if (muted_.load(std::memory_order_relaxed)) {
+            // Still drain jitter buffer so it doesn't overflow while muted
+            int drained = 0;
+            while (drained < numFrames) {
+                if (playbackFrame_.empty()) {
+                    playbackFrame_.reset();
+                    if (!jitterBuffer_.pop(playbackFrame_.frame)) break;
+                }
+                drained += playbackFrame_.copyTo(output + drained * CHANNELS, numFrames - drained);
+            }
+            remainingPlaybackFrames_.store(playbackFrame_.remaining(), std::memory_order_relaxed);
             memset(output, 0, numFrames * CHANNELS * sizeof(int16_t));
-            playbackFrame_.reset();
-            AudioFrame discard;
-            while (jitterBuffer_.pop(discard)) {}
+            lastSampleL_ = 0;
+            lastSampleR_ = 0;
             return oboe::DataCallbackResult::Continue;
         }
 
         int framesWritten = 0;
         int underrunsThisCallback = 0;
-        int plcFramesThisCallback = 0;
 
         while (framesWritten < numFrames) {
-            int framesToWrite = std::min(FRAME_SIZE, numFrames - framesWritten);
-
             if (playbackFrame_.empty()) {
                 playbackFrame_.reset();
                 jitterBuffer_.pop(playbackFrame_.frame);
             }
             if (!playbackFrame_.empty()) {
-                framesToWrite = playbackFrame_.copyTo(
+                int copied = playbackFrame_.copyTo(
                     output + framesWritten * CHANNELS, numFrames - framesWritten);
 
-                // Track peak output level for diagnostics
-                for (int i = 0; i < framesToWrite * CHANNELS; i++) {
+                // Track peak output level and last stereo sample for click-free underrun decay
+                for (int i = 0; i < copied * CHANNELS; i++) {
                     int16_t s = output[framesWritten * CHANNELS + i];
                     int16_t abs_s = s < 0 ? -s : s;
                     if (abs_s > outputPeak_) outputPeak_ = abs_s;
                 }
+                if (copied > 0) {
+                    int lastIdx = (framesWritten + copied - 1) * CHANNELS;
+                    lastSampleL_ = output[lastIdx];
+                    lastSampleR_ = output[lastIdx + 1];
+                }
+                framesWritten += copied;
             } else {
+                // Jitter buffer empty/re-priming: smoothly decay last stereo sample to zero.
+                // Avoids calling opus_decode(decoder_, nullptr, ...) concurrently with feedPacket().
+                int missingFrames = numFrames - framesWritten;
                 underrunsThisCallback++;
                 totalPlaybackUnderruns_++;
+                totalSilenceFrames_ += missingFrames;
 
-                // Use Opus PLC if decoder available
-                if (decoder_) {
-                    int16_t plcSamples[SAMPLES_PER_FRAME];
-                    int decoded = opus_decode(decoder_, nullptr, 0, plcSamples, FRAME_SIZE, 0);
-                    if (decoded > 0) {
-                        int copyFrames = std::min(decoded, framesToWrite);
-                        memcpy(output + framesWritten * CHANNELS,
-                               plcSamples,
-                               copyFrames * CHANNELS * sizeof(int16_t));
-                        plcFramesThisCallback++;
-                        totalPlcFrames_++;
-                    } else {
-                        memset(output + framesWritten * CHANNELS, 0,
-                               framesToWrite * CHANNELS * sizeof(int16_t));
-                        totalSilenceFrames_++;
-                    }
-                } else {
-                    memset(output + framesWritten * CHANNELS, 0,
-                           framesToWrite * CHANNELS * sizeof(int16_t));
-                    totalSilenceFrames_++;
+                int16_t* dst = output + framesWritten * CHANNELS;
+                for (int i = 0; i < missingFrames; i++) {
+                    lastSampleL_ = static_cast<int16_t>((static_cast<int32_t>(lastSampleL_) * 248) / 256);
+                    lastSampleR_ = static_cast<int16_t>((static_cast<int32_t>(lastSampleR_) * 248) / 256);
+                    dst[i * 2]     = lastSampleL_;
+                    dst[i * 2 + 1] = lastSampleR_;
                 }
+                framesWritten += missingFrames;
             }
-            framesWritten += framesToWrite;
         }
 
-        // Log underruns (these are the pops!)
+        remainingPlaybackFrames_.store(playbackFrame_.remaining(), std::memory_order_relaxed);
+
+        // Log underruns
         if (underrunsThisCallback > 0) {
             if (totalPlaybackUnderruns_ <= 30 || (totalPlaybackUnderruns_ % 50) == 0) {
-                LOGI("[OBOE] *** UNDERRUN #%llu in callback #%llu: %d sub-frames empty, "
-                     "plc=%d, jbuf=%d, gap=%.1fms — THIS CAUSES A POP",
+                LOGI("[OBOE] *** UNDERRUN #%llu in callback #%llu: %d empty, "
+                     "jbufFrames=%d, gap=%.1fms",
                      (unsigned long long)totalPlaybackUnderruns_,
                      (unsigned long long)callbackCount_,
-                     underrunsThisCallback, plcFramesThisCallback,
-                     jitterBuffer_.size(), callbackGapMs);
+                     underrunsThisCallback,
+                     jitterBuffer_.queuedSampleFrames(), callbackGapMs);
             }
         }
 
-        // Apply volume scaling
-        float vol = volume_.load();
-        if (vol < 1.0f) {
+        // Apply app volume * Android STREAM_MUSIC volume (in Exclusive MMAP mode where HAL bypasses AudioFlinger volume)
+        const float appVol = volume_.load(std::memory_order_relaxed);
+        const float sysVol = isExclusiveMmap_.load(std::memory_order_relaxed)
+            ? systemVolume_.load(std::memory_order_relaxed)
+            : 1.0f;
+        const float vol = appVol * sysVol;
+        if (vol <= 0.0001f) {
+            memset(output, 0, numFrames * CHANNELS * sizeof(int16_t));
+        } else if (vol < 0.999f) {
             int totalSamples = numFrames * CHANNELS;
             for (int i = 0; i < totalSamples; i++) {
                 output[i] = static_cast<int16_t>(output[i] * vol);
             }
         }
 
-        // Periodic Oboe callback stats (every ~3 seconds)
-        if (callbackCount_ <= 3 || (callbackCount_ % 300) == 0) {
+        // Periodic Oboe callback stats (every ~3 seconds regardless of callback size)
+        framesSinceLog_ += numFrames;
+        if (callbackCount_ <= 3 || framesSinceLog_ >= SAMPLE_RATE * 3) {
+            framesSinceLog_ = 0;
             auto callbackEnd = std::chrono::steady_clock::now();
             double callbackDurationMs = std::chrono::duration<double, std::milli>(
                 callbackEnd - callbackStart).count();
-            LOGI("[OBOE] Callback #%llu: numFrames=%d, gap=%.1fms, duration=%.2fms, "
-                 "jbuf=%d, peak=%d, underruns=%llu, plc=%llu, silence=%llu, "
-                 "largeGaps=%llu",
-                 (unsigned long long)callbackCount_, numFrames,
-                 callbackGapMs, callbackDurationMs,
-                 jitterBuffer_.size(), (int)outputPeak_,
+            int32_t xruns = stream ? stream->getXRunCount().value() : 0;
+            LOGI("[OBOE] Callback #%llu (%s): numFrames=%d, gap=%.1fms, dur=%.2fms, "
+                 "jbufMs=%.1f, rem=%d, peak=%d, xruns=%d, underruns=%llu, fadeFrames=%llu",
+                 (unsigned long long)callbackCount_,
+                 isExclusiveMmap_.load(std::memory_order_relaxed) ? "EXCL" : "SHRD",
+                 numFrames, callbackGapMs, callbackDurationMs,
+                 jitterBuffer_.queuedSampleFrames() * 1000.0 / SAMPLE_RATE,
+                 playbackFrame_.remaining(), (int)outputPeak_, xruns,
                  (unsigned long long)totalPlaybackUnderruns_,
-                 (unsigned long long)totalPlcFrames_,
-                 (unsigned long long)totalSilenceFrames_,
-                 (unsigned long long)largeCallbackGapCount_);
+                 (unsigned long long)totalSilenceFrames_);
             outputPeak_ = 0;
         }
 
@@ -486,13 +675,18 @@ public:
 
 private:
     OpusDecoder* decoder_;
+    mutable std::mutex streamMutex_;
     std::shared_ptr<oboe::AudioStream> stream_;
     JitterBuffer jitterBuffer_;
     PlaybackFrame playbackFrame_;
+    std::atomic<int> remainingPlaybackFrames_{0};
     std::atomic<bool> running_;
-    std::atomic<double> latencyMs_;
     std::atomic<bool> muted_;
+    std::atomic<bool> isExclusiveMmap_{false};
     std::atomic<float> volume_;
+    std::atomic<float> systemVolume_;
+    int16_t lastSampleL_ = 0;
+    int16_t lastSampleR_ = 0;
 
     // Feed path diagnostics
     std::chrono::steady_clock::time_point lastFeedTime_ = std::chrono::steady_clock::now();
@@ -504,9 +698,9 @@ private:
     // Oboe callback diagnostics
     std::chrono::steady_clock::time_point lastCallbackTime_ = std::chrono::steady_clock::now();
     uint64_t callbackCount_ = 0;
+    int32_t framesSinceLog_ = 0;
     uint64_t largeCallbackGapCount_ = 0;
     uint64_t totalPlaybackUnderruns_ = 0;
-    uint64_t totalPlcFrames_ = 0;
     uint64_t totalSilenceFrames_ = 0;
     int16_t outputPeak_ = 0;
 };
@@ -534,7 +728,7 @@ public:
             return false;
         }
 
-        // Configure UDP Socket
+        // Configure non-blocking UDP Socket so sendto never stalls Oboe's input callback
         socket_ = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
         if (socket_ < 0) {
             LOGE("Failed to create socket for recording");
@@ -542,6 +736,12 @@ public:
             encoder_ = nullptr;
             return false;
         }
+        int flags = fcntl(socket_, F_GETFL, 0);
+        if (flags >= 0) {
+            fcntl(socket_, F_SETFL, flags | O_NONBLOCK);
+        }
+        int tos = 0xB8; // DSCP 46 EF (WMM Voice)
+        setsockopt(socket_, IPPROTO_IP, IP_TOS, &tos, sizeof(tos));
 
         memset(&serverAddr_, 0, sizeof(serverAddr_));
         serverAddr_.sin_family = AF_INET;
@@ -557,6 +757,7 @@ public:
 
         streamStart_ = std::chrono::steady_clock::now();
         sequence_ = 0;
+        accumFrames_ = 0;
 
         oboe::AudioStreamBuilder builder;
         builder.setDirection(oboe::Direction::Input)
@@ -566,7 +767,6 @@ public:
                ->setChannelCount(MIC_CHANNELS)
                ->setSampleRate(SAMPLE_RATE)
                ->setInputPreset(oboe::InputPreset::Unprocessed)
-               ->setFramesPerCallback(FRAME_SIZE)
                ->setDataCallback(this)
                ->setErrorCallback(this);
 
@@ -577,21 +777,34 @@ public:
             return false;
         }
 
+        int32_t burst = stream_->getFramesPerBurst();
+        if (burst > 0) {
+            int32_t targetBuf = std::max<int32_t>(burst * 2, 96);
+            int32_t cap = stream_->getBufferCapacityInFrames();
+            if (cap > 0 && targetBuf > cap) targetBuf = cap;
+            stream_->setBufferSizeInFrames(targetBuf);
+        }
+
         // Verify actual channel count matches what we requested
         actualChannels_ = stream_->getChannelCount();
         if (actualChannels_ != MIC_CHANNELS) {
             LOGI("Requested %d channels, got %d — will adapt", MIC_CHANNELS, actualChannels_);
         }
 
+        running_ = true;
         result = stream_->requestStart();
         if (result != oboe::Result::OK) {
+            running_ = false;
             LOGE("Failed to start recording stream: %s", oboe::convertToText(result));
+            stream_->close();
+            stream_.reset();
             cleanup();
             return false;
         }
 
-        running_ = true;
-        LOGI("Audio recording started to %s:%d (channels: %d)", serverIp, serverPort, actualChannels_);
+        LOGI("Audio recording started to %s:%d (channels=%d, burst=%d, bufSize=%d)",
+             serverIp, serverPort, actualChannels_,
+             stream_->getFramesPerBurst(), stream_->getBufferSizeInFrames());
         return true;
     }
 
@@ -603,6 +816,7 @@ public:
             stream_.reset();
         }
         cleanup();
+        accumFrames_ = 0;
         LOGI("Audio recording stopped");
     }
 
@@ -616,57 +830,66 @@ public:
         }
 
         auto* input = static_cast<int16_t*>(audioData);
+        int fms = g_frameSizeMs.load(std::memory_order_relaxed);
+        if (fms != 5 && fms != 10 && fms != 20) fms = 10;
+        const int encodeFrames = fms * (SAMPLE_RATE / 1000); // 240 (5ms), 480 (10ms), or 960 (20ms)
+
         int framesRead = 0;
+        static constexpr int ACCUM_CAPACITY = AudioFrame::maxFrames * 2;
 
         while (framesRead < numFrames) {
-            int framesToRead = std::min(FRAME_SIZE, numFrames - framesRead);
-            if (framesToRead < FRAME_SIZE) {
-                break;
+            int space = ACCUM_CAPACITY - accumFrames_;
+            if (space <= 0) {
+                accumFrames_ = 0;
+                space = ACCUM_CAPACITY;
             }
-
-            // If Oboe gave us more channels than we need, downmix to mono
-            int16_t monoBuffer[FRAME_SIZE];
-            const int16_t* encodeInput;
+            int toCopy = std::min<int>(numFrames - framesRead, space);
 
             if (actualChannels_ > MIC_CHANNELS) {
-                // Downmix to mono by averaging channels
-                for (int i = 0; i < FRAME_SIZE; i++) {
+                for (int i = 0; i < toCopy; i++) {
                     int32_t sum = 0;
                     for (int ch = 0; ch < actualChannels_; ch++) {
                         sum += input[(framesRead + i) * actualChannels_ + ch];
                     }
-                    monoBuffer[i] = static_cast<int16_t>(sum / actualChannels_);
+                    accumBuf_[accumFrames_ + i] = static_cast<int16_t>(sum / actualChannels_);
                 }
-                encodeInput = monoBuffer;
             } else {
-                encodeInput = input + (framesRead * MIC_CHANNELS);
+                memcpy(accumBuf_ + accumFrames_, input + framesRead, toCopy * sizeof(int16_t));
             }
 
-            uint8_t packet[1500];
+            accumFrames_ += toCopy;
+            framesRead += toCopy;
 
-            int opusLen = opus_encode(encoder_, encodeInput, FRAME_SIZE,
-                                      packet + HEADER_SIZE, sizeof(packet) - HEADER_SIZE);
+            while (accumFrames_ >= encodeFrames) {
+                uint8_t packet[1500];
+                int opusLen = opus_encode(encoder_, accumBuf_, encodeFrames,
+                                          packet + HEADER_SIZE, sizeof(packet) - HEADER_SIZE);
 
-            if (opusLen > 0) {
-                auto now = std::chrono::steady_clock::now();
-                uint64_t timestamp = std::chrono::duration_cast<std::chrono::microseconds>(
-                    now - streamStart_).count();
+                if (opusLen > 0) {
+                    auto now = std::chrono::steady_clock::now();
+                    uint64_t timestamp = std::chrono::duration_cast<std::chrono::microseconds>(
+                        now - streamStart_).count();
 
-                packet[0] = 0x01; // Version
-                packet[1] = PACKET_MIC_AUDIO; // Type = Mic Audio (0x04)
+                    packet[0] = 0x01; // Version
+                    packet[1] = PACKET_MIC_AUDIO; // Type = Mic Audio (0x04)
 
-                uint32_t seq = sequence_++;
-                uint16_t payloadLen = static_cast<uint16_t>(opusLen);
+                    uint32_t seq = sequence_++;
+                    uint16_t payloadLen = static_cast<uint16_t>(opusLen);
 
-                memcpy(packet + 2, &seq, 4);
-                memcpy(packet + 6, &timestamp, 8);
-                memcpy(packet + 14, &payloadLen, 2);
+                    memcpy(packet + 2, &seq, 4);
+                    memcpy(packet + 6, &timestamp, 8);
+                    memcpy(packet + 14, &payloadLen, 2);
 
-                sendto(socket_, packet, HEADER_SIZE + opusLen, 0,
-                       (struct sockaddr*)&serverAddr_, sizeof(serverAddr_));
+                    sendto(socket_, packet, HEADER_SIZE + opusLen, MSG_DONTWAIT,
+                           (struct sockaddr*)&serverAddr_, sizeof(serverAddr_));
+                }
+
+                int leftover = accumFrames_ - encodeFrames;
+                if (leftover > 0) {
+                    memmove(accumBuf_, accumBuf_ + encodeFrames, leftover * sizeof(int16_t));
+                }
+                accumFrames_ = leftover;
             }
-
-            framesRead += framesToRead;
         }
 
         return oboe::DataCallbackResult::Continue;
@@ -707,6 +930,8 @@ private:
     std::chrono::steady_clock::time_point streamStart_;
     std::atomic<uint32_t> sequence_;
     int actualChannels_ = MIC_CHANNELS;
+    int16_t accumBuf_[AudioFrame::maxFrames * 2]{};
+    int accumFrames_ = 0;
     std::string serverIp_;
     int serverPort_ = 0;
 };
@@ -745,6 +970,9 @@ public:
     std::string connect(const char* serverIp, int serverPort,
                         const char* deviceName, const char* deviceId,
                         const char* pskHex) {
+        // Ensure any previous session/thread/socket (including timed-out sessions) is joined and closed
+        disconnect();
+
         LOGI("[CONN] Connecting to %s:%d as '%s' (id=%s, psk=%s)",
              serverIp, serverPort, deviceName, deviceId,
              strlen(pskHex) > 0 ? "present" : "empty");
@@ -755,6 +983,13 @@ public:
             LOGE("[CONN] Failed to create socket");
             return "error|socket_failed";
         }
+
+        // Enlarge UDP receive buffer to 256 KB and tag outgoing control/ping packets as WMM Voice (DSCP EF 0xB8)
+        int sockBufBytes = 262144;
+        setsockopt(socket_, SOL_SOCKET, SO_RCVBUF, &sockBufBytes, sizeof(sockBufBytes));
+        setsockopt(socket_, SOL_SOCKET, SO_SNDBUF, &sockBufBytes, sizeof(sockBufBytes));
+        int tos = 0xB8;
+        setsockopt(socket_, IPPROTO_IP, IP_TOS, &tos, sizeof(tos));
 
         memset(&serverAddr_, 0, sizeof(serverAddr_));
         serverAddr_.sin_family = AF_INET;
@@ -871,11 +1106,6 @@ public:
                     LOGE("[CONN] DTLS init failed");
                     dtlsSession_.reset();
                 } else {
-                    // Drive handshake — single-threaded push model:
-                    // 1. continueHandshake() sends outgoing records via bioSend
-                    // 2. recvfrom() collects the server's reply from the socket
-                    // 3. pushReceivedData() feeds it to mbedtls via bioRecvNonBlocking
-                    // bioRecvNonBlocking is always non-blocking so we never deadlock here.
                     auto handshakeStart = std::chrono::steady_clock::now();
                     bool handshakeOk = false;
                     int totalRecvd = 0;
@@ -908,7 +1138,6 @@ public:
                                  attempt, n, (uint8_t)dtlsBuf[0]);
                             dtlsSession_->pushReceivedData((const uint8_t*)dtlsBuf, n);
                         } else if (n < 0) {
-                            // EAGAIN/timeout — expected, just loop
                             if (attempt % 20 == 0) {
                                 LOGI("[CONN] DTLS attempt %d: no data yet (wantRead=%d, totalRecvd=%d)",
                                      attempt, totalWantRead, totalRecvd);
@@ -968,21 +1197,26 @@ public:
     }
 
     void disconnect() {
-        if (!connected_) return;
-        LOGI("[CONN] Disconnecting...");
+        const bool wasConnected = connected_.exchange(false);
+        const bool hasResources = wasConnected || recvThread_.joinable() || (socket_ >= 0) || (dtlsSession_ != nullptr);
+        if (!hasResources) return;
 
-        // Send disconnect control
-        if (connected_) {
+        LOGI("[CONN] Disconnecting (wasConnected=%d)...", wasConnected ? 1 : 0);
+
+        // Send disconnect control if session was still active
+        if (wasConnected && socket_ >= 0) {
             uint8_t packet[17];
             writeHeader(packet, PACKET_CONTROL, 1);
             packet[16] = CTRL_DISCONNECT;
             sendPacket(packet, 17);
         }
 
-        connected_ = false;
-
         if (recvThread_.joinable()) {
-            recvThread_.join();
+            if (recvThread_.get_id() == std::this_thread::get_id()) {
+                recvThread_.detach();
+            } else {
+                recvThread_.join();
+            }
         }
 
         if (dtlsSession_) {
@@ -1149,7 +1383,8 @@ private:
 
         switch (type) {
             case PACKET_AUDIO:
-                // Feed to player
+            case PACKET_AUDIO_PCM:
+                // Feed Opus or zero-lookahead Raw PCM packet to player
                 g_player.feedPacket(data, len);
                 break;
 
@@ -1201,23 +1436,40 @@ private:
 
             case PACKET_SETTINGS: {
                 if (len >= 18) {
-                    uint16_t jitterMs;
+                    uint16_t jitterMs = 10;
                     memcpy(&jitterMs, data + 16, 2);
+                    uint16_t frameMs = 5;
                     if (len >= 20) {
-                        uint16_t frameMs;
                         memcpy(&frameMs, data + 18, 2);
-                        if (frameMs == 5 || frameMs == 10 || frameMs == 20) {
+                        if (frameMs == 2 || frameMs == 5 || frameMs == 10 || frameMs == 20) {
                             g_frameSizeMs.store((int)frameMs);
-                            LOGI("[RECV] Settings: jitter=%u ms, frameSize=%u ms", jitterMs, frameMs);
                             notifyDart("onFrameSizeUpdate", std::to_string(frameMs).c_str());
-                        } else {
-                            LOGI("[RECV] Settings: jitter=%u ms", jitterMs);
                         }
-                    } else {
-                        LOGI("[RECV] Settings: jitter=%u ms", jitterMs);
                     }
+                    uint16_t frameSamples = (frameMs == 2) ? 120 : (uint16_t)(frameMs * 48);
+                    bool isPcm = false;
+                    if (len >= 24) {
+                        uint16_t wireSamples = 0;
+                        memcpy(&wireSamples, data + 20, 2);
+                        if (wireSamples >= 48 && wireSamples <= 960) {
+                            frameSamples = wireSamples;
+                        }
+                        isPcm = (data[22] != 0);
+                    }
+                    g_frameSamples.store((int)frameSamples);
+                    g_isRawPcm.store(isPcm);
+                    LOGI("[RECV] Settings: jitter=%u ms, frame=%u (%u samples = %.2f ms), codec=%s",
+                         jitterMs, frameMs, frameSamples, frameSamples * 1000.0 / SAMPLE_RATE,
+                         isPcm ? "PCM" : "Opus");
+
                     g_player.setJitterBufferMs(jitterMs);
                     notifyDart("onSettingsUpdate", std::to_string(jitterMs).c_str());
+
+                    char cfgJson[128];
+                    snprintf(cfgJson, sizeof(cfgJson),
+                             "{\"jitter\":%u,\"samples\":%u,\"pcm\":%s}",
+                             (unsigned)jitterMs, (unsigned)frameSamples, isPcm ? "true" : "false");
+                    notifyDart("onStreamConfig", cfgJson);
                 }
                 break;
             }
@@ -1289,8 +1541,6 @@ Java_com_audiobridge_audiobridge_MainActivity_nativeStartRecording(
     bool result = g_recorder.start(ipStr, port);
     env->ReleaseStringUTFChars(serverIp, ipStr);
 
-    // Allow Oboe callback to organically handle any necessary restarts on failure.
-    // (We removed the force-restart here because it creates a 250ms gap and causes pops).
     if (result) {
         LOGI("Audio recorder successfully started");
     }
@@ -1316,6 +1566,12 @@ Java_com_audiobridge_audiobridge_MainActivity_nativeSetVolume(
     g_player.setVolume(volume);
 }
 
+JNIEXPORT void JNICALL
+Java_com_audiobridge_audiobridge_MainActivity_nativeSetSystemVolume(
+        JNIEnv* env, jobject thiz, jfloat volume) {
+    g_player.setSystemVolume(volume);
+}
+
 JNIEXPORT jdoubleArray JNICALL
 Java_com_audiobridge_audiobridge_MainActivity_nativeGetLatencyBreakdown(
         JNIEnv* env, jobject thiz) {
@@ -1337,7 +1593,6 @@ Java_com_audiobridge_audiobridge_MainActivity_nativeGetOutputPeakLevel(
 JNIEXPORT jfloat JNICALL
 Java_com_audiobridge_audiobridge_MainActivity_nativeGetInputPeakLevel(
         JNIEnv* env, jobject thiz) {
-    // TODO: add mic recording level tracking
     return 0.0f;
 }
 
@@ -1347,7 +1602,6 @@ JNIEXPORT jstring JNICALL
 Java_com_audiobridge_audiobridge_MainActivity_nativeConnect(
         JNIEnv* env, jobject thiz, jstring serverIp, jint serverPort,
         jstring deviceName, jstring deviceId, jstring pskHex) {
-    // Save activity reference
     if (g_mainActivity) env->DeleteGlobalRef(g_mainActivity);
     g_mainActivity = env->NewGlobalRef(thiz);
 
@@ -1409,4 +1663,3 @@ Java_com_audiobridge_audiobridge_MainActivity_nativeIsDtlsActive(
 }
 
 } // extern "C"
-

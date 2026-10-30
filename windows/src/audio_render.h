@@ -8,6 +8,7 @@
 #include <thread>
 #include <mutex>
 #include <functional>
+#include <limits>
 
 class AudioRender {
 public:
@@ -35,6 +36,7 @@ private:
     IMMDevice* device_ = nullptr;
     IAudioClient* audioClient_ = nullptr;
     IAudioRenderClient* renderClient_ = nullptr;
+    HANDLE renderEvent_ = nullptr;
 
     // Device mix format properties
     uint32_t deviceSampleRate_ = 0;
@@ -52,6 +54,9 @@ private:
     std::mutex bufferMutex_;
     // Internal buffer stores audio in device format (interleaved, device channels, device sample rate)
     std::vector<float> audioBuffer_;  // always float internally, convert on write to WASAPI
+    bool primed_ = false;
+    size_t windowMinFrames_ = (std::numeric_limits<size_t>::max)();
+    uint32_t windowPushCount_ = 0;
 
     bool comInitialized_ = false;
 

@@ -7,6 +7,7 @@
 #include <ctime>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <string>
 #include <fstream>
 
@@ -84,12 +85,25 @@ static LONG WINAPI CrashHandler(EXCEPTION_POINTERS* ex) {
 // --- Settings persistence ---
 
 struct AppSettings {
-    int jitterBufferMs = 20;
-    int frameSizeMs = 10;          // 5, 10, or 20 ms
+    int jitterBufferMs = 10;
+    int frameSizeMs = 2;           // 2 => 2.5ms (120 samples), 5, 10, or 20 ms
+    bool rawPcm = true;            // true = zero-lookahead 16-bit PCM, false = Opus
     bool loopbackMode = true;
     std::string inputDeviceName;   // empty = default
     std::string outputDeviceName;  // empty = default
 };
+
+static uint32_t samplesForFrameSetting(int frameSettingMs) {
+    if (frameSettingMs == 2) return 120; // 2.5 ms @ 48 kHz
+    if (frameSettingMs == 5) return 240;
+    if (frameSettingMs == 10) return 480;
+    if (frameSettingMs == 20) return 960;
+    return 120;
+}
+
+static std::string labelForFrameSetting(int frameSettingMs) {
+    return (frameSettingMs == 2) ? "2.5" : std::to_string(frameSettingMs);
+}
 
 static std::string getSettingsPath() {
     return getExeDir() + "audiobridge_settings.txt";
@@ -108,7 +122,8 @@ static AppSettings loadSettings() {
         std::string key = line.substr(0, eq);
         std::string val = line.substr(eq + 1);
         if (key == "jitter") { try { s.jitterBufferMs = std::stoi(val); } catch (...) {} }
-        else if (key == "frame") { try { int v = std::stoi(val); if (v==5||v==10||v==20) s.frameSizeMs = v; } catch (...) {} }
+        else if (key == "frame") { try { int v = std::stoi(val); if (v==2||v==5||v==10||v==20) s.frameSizeMs = v; } catch (...) {} }
+        else if (key == "codec") { s.rawPcm = (val != "opus"); }
         else if (key == "mode") { s.loopbackMode = (val != "recording"); }
         else if (key == "input") { s.inputDeviceName = val; }
         else if (key == "output") { s.outputDeviceName = val; }
@@ -122,6 +137,7 @@ static void saveSettings(const AppSettings& s) {
     file << "# AudioBridge settings\n";
     file << "jitter=" << s.jitterBufferMs << "\n";
     file << "frame=" << s.frameSizeMs << "\n";
+    file << "codec=" << (s.rawPcm ? "pcm" : "opus") << "\n";
     file << "mode=" << (s.loopbackMode ? "loopback" : "recording") << "\n";
     file << "input=" << s.inputDeviceName << "\n";
     file << "output=" << s.outputDeviceName << "\n";
@@ -178,16 +194,18 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     // Load saved settings
     AppSettings settings = loadSettings();
-    logPrintf("[SETTINGS] Loaded: jitter=%d, frame=%dms, mode=%s, input='%s', output='%s'\n",
-             settings.jitterBufferMs, settings.frameSizeMs,
+    logPrintf("[SETTINGS] Loaded: jitter=%d, frame=%sms (%u samples), codec=%s, mode=%s, input='%s', output='%s'\n",
+             settings.jitterBufferMs, labelForFrameSetting(settings.frameSizeMs).c_str(),
+             samplesForFrameSetting(settings.frameSizeMs),
+             settings.rawPcm ? "pcm" : "opus",
              settings.loopbackMode ? "loopback" : "recording",
              settings.inputDeviceName.c_str(), settings.outputDeviceName.c_str());
 
     // Initialize components — use saved capture mode from settings
     AudioCapture capture;
+    std::wstring initDeviceId;
     {
         // Find saved input device ID if set
-        std::wstring initDeviceId;
         if (!settings.inputDeviceName.empty()) {
             for (const auto& d : AudioCapture::getDevices(settings.loopbackMode)) {
                 std::string name;
@@ -207,12 +225,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                 return 1;
             }
         }
-        // Track which device we initialized with
-        // (will be set properly after reinitAudio lambdas are defined)
     }
-    capture.setFrameSize((uint32_t)(settings.frameSizeMs * 48));
-    gui.addLogMessage("Audio capture initialized: " + std::to_string(capture.getSampleRate()) + " Hz, " +
-                      std::to_string(capture.getChannels()) + " ch");
+    capture.setFrameSize(samplesForFrameSetting(settings.frameSizeMs));
+    gui.addLogMessage(std::string("Audio capture: ") + std::to_string(capture.getSampleRate()) + " Hz, " +
+                      std::to_string(capture.getChannels()) + " ch" +
+                      (capture.isUsingKernelTap() ? " [Direct Kernel WaveRT Tap]" : " [Event WASAPI]"));
 
     OpusEncoderWrapper encoder;
     if (!encoder.initialize()) {
@@ -248,24 +265,41 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     std::mutex mediaWakeMutex;
     std::condition_variable mediaWakeCv;
 
+    std::atomic<bool> useRawPcm{settings.rawPcm};
+
     // Set up GUI callbacks
     gui.setJitterBufferMs(settings.jitterBufferMs);
     gui.setFrameSizeMs(settings.frameSizeMs);
+    gui.setRawPcm(settings.rawPcm);
+
+    auto syncClientSettings = [&]() {
+        network.sendSettings(settings.jitterBufferMs, settings.frameSizeMs,
+                             (uint16_t)samplesForFrameSetting(settings.frameSizeMs),
+                             settings.rawPcm);
+    };
 
     gui.setJitterChangeCallback([&](int bufferMs) {
         gui.addLogMessage("Jitter buffer target: " + std::to_string(bufferMs) + " ms");
         settings.jitterBufferMs = bufferMs;
         saveSettings(settings);
-        network.sendSettings(bufferMs, settings.frameSizeMs);
+        syncClientSettings();
     });
 
     gui.setFrameSizeChangeCallback([&](int frameSizeMs) {
-        int samples = frameSizeMs * 48; // ms * 48kHz / 1000 * 1 = ms * 48
-        gui.addLogMessage("Frame size: " + std::to_string(frameSizeMs) + " ms (" + std::to_string(samples) + " samples)");
+        uint32_t samples = samplesForFrameSetting(frameSizeMs);
+        gui.addLogMessage("Frame size: " + labelForFrameSetting(frameSizeMs) + " ms (" + std::to_string(samples) + " samples)");
         settings.frameSizeMs = frameSizeMs;
         saveSettings(settings);
-        capture.setFrameSize((uint32_t)samples);
-        network.sendSettings(settings.jitterBufferMs, frameSizeMs);
+        capture.setFrameSize(samples);
+        syncClientSettings();
+    });
+
+    gui.setCodecChangeCallback([&](bool rawPcm) {
+        settings.rawPcm = rawPcm;
+        useRawPcm.store(rawPcm, std::memory_order_relaxed);
+        saveSettings(settings);
+        gui.addLogMessage(rawPcm ? "Streaming codec: Raw 16-bit PCM (0ms lookahead)" : "Streaming codec: Opus Low-Delay");
+        syncClientSettings();
     });
 
     gui.setPairApproveCallback([&](const std::string& clientId) {
@@ -290,10 +324,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
             clientName = name;
             packetsSent = 0;
             bytesSent = 0;
-            gui.addLogMessage("Client connected: " + name + " (" + network.getClientAddress() + ")");
+            gui.addLogMessage("Client connected: " + name + " (" + network.getClientAddress() + ")" +
+                              (network.isVoiceQosActive() ? " [Wi-Fi AC_VO]" : ""));
             gui.updateApprovedPeers(network.getApprovedPeers());
             // Send current settings to client
-            network.sendSettings(settings.jitterBufferMs, settings.frameSizeMs);
+            syncClientSettings();
         },
         [&]() {
             gui.addLogMessage("Client disconnected: " + clientName);
@@ -378,7 +413,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     gui.updateApprovedPeers(network.getApprovedPeers());
 
     // Device management state
-    std::wstring currentDeviceId;
+    std::wstring currentDeviceId = initDeviceId;
     std::atomic<bool> deviceInvalidated{false};
     std::wstring currentOutDeviceId;
     std::atomic<bool> outDeviceInvalidated{false};
@@ -386,6 +421,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     // Capture callback
     uint8_t opusBuf[4000];
+    int16_t pcmBuf[960 * 2];
     auto lastAudioSent = std::chrono::steady_clock::now();
 
     AudioCapture::FrameCallback captureCallback = [&](const float* data, uint32_t frameCount) {
@@ -394,16 +430,42 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         // Track peak level
         for (uint32_t i = 0; i < frameCount * 2; i++) {
             float abs = data[i] < 0 ? -data[i] : data[i];
-            float current = peakLevel.load();
-            if (abs > current) peakLevel.store(abs);
+            float current = peakLevel.load(std::memory_order_relaxed);
+            if (abs > current) peakLevel.store(abs, std::memory_order_relaxed);
         }
 
-        int encoded = encoder.encode(data, frameCount, opusBuf, sizeof(opusBuf));
-        if (encoded > 0) {
-            network.sendAudio(opusBuf, encoded);
+        if (useRawPcm.load(std::memory_order_relaxed)) {
+            // Zero-lookahead Raw 16-bit Stereo PCM mode.
+            // Sub-slice into <= 240-frame (960-byte) packets so UDP datagrams never fragment over Wi-Fi MTU.
+            const uint32_t totalSamples = frameCount * 2;
+            for (uint32_t i = 0; i < totalSamples; ++i) {
+                float s = data[i];
+                if (s > 1.0f) s = 1.0f;
+                else if (s < -1.0f) s = -1.0f;
+                int32_t v = static_cast<int32_t>(std::lrintf(s * 32767.0f));
+                if (v > 32767) v = 32767;
+                else if (v < -32768) v = -32768;
+                pcmBuf[i] = static_cast<int16_t>(v);
+            }
+
+            uint32_t offsetFrames = 0;
+            while (offsetFrames < frameCount) {
+                uint32_t subFrames = frameCount - offsetFrames;
+                if (subFrames > 240) subFrames = 240;
+                network.sendAudioPcm(pcmBuf + offsetFrames * 2, (int)subFrames);
+                offsetFrames += subFrames;
+                packetsSent++;
+                bytesSent += subFrames * 4 + 16;
+            }
             lastAudioSent = std::chrono::steady_clock::now();
-            packetsSent++;
-            bytesSent += encoded + 16;
+        } else {
+            int encoded = encoder.encode(data, frameCount, opusBuf, sizeof(opusBuf));
+            if (encoded > 0) {
+                network.sendAudio(opusBuf, encoded);
+                lastAudioSent = std::chrono::steady_clock::now();
+                packetsSent++;
+                bytesSent += encoded + 16;
+            }
         }
     };
 
@@ -445,11 +507,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
             }
         }
 
-        logPrintf("[REINIT] initialized OK: %u Hz, %u ch\n", capture.getSampleRate(), capture.getChannels());
-        gui.addLogMessage("Audio device: " + std::to_string(capture.getSampleRate()) + " Hz, " +
-                          std::to_string(capture.getChannels()) + " ch");
+        logPrintf("[REINIT] initialized OK: %u Hz, %u ch (kernelTap=%d)\n",
+                  capture.getSampleRate(), capture.getChannels(), capture.isUsingKernelTap() ? 1 : 0);
+        gui.addLogMessage(std::string("Audio device: ") + std::to_string(capture.getSampleRate()) + " Hz, " +
+                          std::to_string(capture.getChannels()) + " ch" +
+                          (capture.isUsingKernelTap() ? " [Direct Kernel Tap]" : ""));
 
-        capture.setFrameSize((uint32_t)(settings.frameSizeMs * 48));
+        capture.setFrameSize(samplesForFrameSetting(settings.frameSizeMs));
         logPrintf("[REINIT] starting capture...\n");
         if (!capture.start(captureCallback)) {
             logPrintf("[REINIT] start FAILED\n");
@@ -579,6 +643,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     auto lastKeepalive = startTime;
     auto lastPeakReset = startTime;
     auto lastPing = startTime;
+    auto lastRateTime = startTime;
+    uint64_t lastRateBytes = 0;
+    double rollingKbps = 0.0;
 
     // Tick callback: performs all periodic work previously in the main loop
     gui.setTickCallback([&]() {
@@ -637,6 +704,19 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
             lastPeakReset = now;
         }
 
+        // Compute real-time rolling bitrate every 500ms
+        double rateElapsedSec = std::chrono::duration<double>(now - lastRateTime).count();
+        if (rateElapsedSec >= 0.5) {
+            uint64_t curBytes = bytesSent.load(std::memory_order_relaxed);
+            if (curBytes >= lastRateBytes) {
+                rollingKbps = ((double)(curBytes - lastRateBytes) * 8.0) / (rateElapsedSec * 1000.0);
+            } else {
+                rollingKbps = 0.0;
+            }
+            lastRateBytes = curBytes;
+            lastRateTime = now;
+        }
+
         // Update GUI stats
         ServerStats stats;
         stats.connected = network.isConnected();
@@ -645,10 +725,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         stats.clientAddress = network.getClientAddress();
         stats.packetsSent = packetsSent;
         stats.bytesSent = bytesSent;
-        stats.kbps = (double)bytesSent * 8.0 / 1000.0;
+        stats.kbps = network.isConnected() ? rollingKbps : 0.0;
         stats.peakLevel = peakLevel.load();
         stats.micPeakLevel = micPeakLevel.load();
         stats.encrypted = network.isDtlsActive();
+        stats.rawPcm = gui.getRawPcm();
+        stats.voiceQos = network.isVoiceQosActive();
+        stats.kernelTap = capture.isUsingKernelTap();
         stats.jitterBufferMs = gui.getJitterBufferMs();
         stats.frameSizeMs = gui.getFrameSizeMs();
         stats.sequenceNum = (uint32_t)packetsSent.load();

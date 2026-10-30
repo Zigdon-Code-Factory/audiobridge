@@ -3,9 +3,12 @@
 #include <mmreg.h>
 #include <ks.h>
 #include <ksmedia.h>
+#include <avrt.h>
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+
+#pragma comment(lib, "avrt.lib")
 
 AudioRender::AudioRender() {}
 
@@ -99,18 +102,48 @@ bool AudioRender::initialize(const std::wstring& deviceId) {
         deviceIsFloat_ = false;
     }
 
-    REFERENCE_TIME hnsRequestedDuration = 200000; // 20ms buffer
+    // Prefer event-driven shared WASAPI render at engine default period (~10ms)
     hr = audioClient_->Initialize(
         AUDCLNT_SHAREMODE_SHARED,
+        AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
         0,
-        hnsRequestedDuration,
         0,
         pwfx,
         nullptr);
 
+    if (SUCCEEDED(hr)) {
+        renderEvent_ = CreateEventW(nullptr, false, false, nullptr);
+        if (renderEvent_) {
+            hr = audioClient_->SetEventHandle(renderEvent_);
+            if (FAILED(hr)) {
+                CloseHandle(renderEvent_);
+                renderEvent_ = nullptr;
+            }
+        } else {
+            hr = E_FAIL;
+        }
+    }
+
     if (FAILED(hr)) {
-        CoTaskMemFree(pwfx);
-        return false;
+        // Fallback to 12ms polled buffer if driver rejects event-driven render
+        audioClient_->Release();
+        audioClient_ = nullptr;
+        hr = device_->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void**)&audioClient_);
+        if (FAILED(hr)) {
+            CoTaskMemFree(pwfx);
+            return false;
+        }
+        hr = audioClient_->Initialize(
+            AUDCLNT_SHAREMODE_SHARED,
+            0,
+            120000, // 12ms buffer
+            0,
+            pwfx,
+            nullptr);
+        if (FAILED(hr)) {
+            CoTaskMemFree(pwfx);
+            return false;
+        }
     }
 
     hr = audioClient_->GetService(__uuidof(IAudioRenderClient), (void**)&renderClient_);
@@ -129,6 +162,7 @@ void AudioRender::cleanup() {
     if (audioClient_) { audioClient_->Release(); audioClient_ = nullptr; }
     if (device_) { device_->Release(); device_ = nullptr; }
     if (enumerator_) { enumerator_->Release(); enumerator_ = nullptr; }
+    if (renderEvent_) { CloseHandle(renderEvent_); renderEvent_ = nullptr; }
     if (comInitialized_) {
         CoUninitialize();
         comInitialized_ = false;
@@ -137,6 +171,14 @@ void AudioRender::cleanup() {
 
 bool AudioRender::start() {
     if (!audioClient_ || !renderClient_) return false;
+
+    {
+        std::lock_guard<std::mutex> lock(bufferMutex_);
+        audioBuffer_.clear();
+        primed_ = false;
+        windowMinFrames_ = (std::numeric_limits<size_t>::max)();
+        windowPushCount_ = 0;
+    }
 
     HRESULT hr = audioClient_->Start();
     if (FAILED(hr)) return false;
@@ -148,16 +190,20 @@ bool AudioRender::start() {
 
 void AudioRender::stop() {
     running_ = false;
+    if (renderEvent_) SetEvent(renderEvent_);
     if (thread_.joinable()) thread_.join();
     if (audioClient_) audioClient_->Stop();
     std::lock_guard<std::mutex> lock(bufferMutex_);
     audioBuffer_.clear();
+    primed_ = false;
+    windowMinFrames_ = (std::numeric_limits<size_t>::max)();
+    windowPushCount_ = 0;
 }
 
 void AudioRender::pushAudio(const float* data, uint32_t frameCount) {
-    if (!running_ || deviceChannels_ == 0 || deviceSampleRate_ == 0) return;
+    if (!running_ || deviceChannels_ == 0 || deviceSampleRate_ == 0 || frameCount == 0) return;
 
-    // Convert from 48kHz mono float → device sample rate, device channels, float
+    // Convert from 48kHz mono float -> device sample rate, device channels, float
     // Step 1: Upmix mono to device channel count
     std::vector<float> channelMixed(frameCount * deviceChannels_);
     for (uint32_t i = 0; i < frameCount; i++) {
@@ -168,7 +214,6 @@ void AudioRender::pushAudio(const float* data, uint32_t frameCount) {
     }
 
     // Step 2: Resample if device sample rate differs from 48kHz
-    // Use simple linear interpolation resampler
     std::vector<float>* outputPtr = &channelMixed;
     std::vector<float> resampled;
 
@@ -195,79 +240,142 @@ void AudioRender::pushAudio(const float* data, uint32_t frameCount) {
     }
 
     std::lock_guard<std::mutex> lock(bufferMutex_);
+    if (primed_) {
+        size_t curFramesBefore = audioBuffer_.size() / deviceChannels_;
+        if (curFramesBefore < windowMinFrames_) {
+            windowMinFrames_ = curFramesBefore;
+        }
+    }
+
     audioBuffer_.insert(audioBuffer_.end(), outputPtr->begin(), outputPtr->end());
 
-    // Hard limit on buffer size to avoid huge latency (max 100ms at device rate)
-    size_t maxFrames = deviceSampleRate_ / 10;
-    size_t maxSamples = maxFrames * deviceChannels_;
+    // Hard cap on buffer size to bound worst-case latency spikes (max 45ms at device rate)
+    const size_t maxFrames = (deviceSampleRate_ * 45) / 1000;
+    const size_t maxSamples = maxFrames * deviceChannels_;
     if (audioBuffer_.size() > maxSamples) {
         audioBuffer_.erase(audioBuffer_.begin(), audioBuffer_.begin() + (audioBuffer_.size() - maxSamples));
+    }
+
+    // Windowed (~350ms) minimum-depth catch-up to drain accumulated drift back to ~12ms
+    if (primed_) {
+        windowPushCount_++;
+        const uint32_t pushMs = (std::max)(5u, (frameCount * 1000u) / INPUT_SAMPLE_RATE);
+        const uint32_t windowPushes = (std::max)(20u, 350u / pushMs);
+        if (windowPushCount_ >= windowPushes) {
+            const size_t targetFrames = (deviceSampleRate_ * 12) / 1000;
+            const size_t curFrames = audioBuffer_.size() / deviceChannels_;
+            if (windowMinFrames_ > targetFrames && curFrames > targetFrames) {
+                size_t dropFrames = (std::min)(windowMinFrames_ - targetFrames, curFrames - targetFrames);
+                audioBuffer_.erase(audioBuffer_.begin(), audioBuffer_.begin() + dropFrames * deviceChannels_);
+            }
+            windowMinFrames_ = (std::numeric_limits<size_t>::max)();
+            windowPushCount_ = 0;
+        }
     }
 }
 
 void AudioRender::renderThread() {
-    UINT32 bufferFrameCount;
+    DWORD taskIndex = 0;
+    HANDLE mmcssTask = AvSetMmThreadCharacteristicsW(L"Pro Audio", &taskIndex);
+
+    UINT32 bufferFrameCount = 0;
     audioClient_->GetBufferSize(&bufferFrameCount);
 
-    uint32_t bytesPerFrame = deviceChannels_ * (deviceBitsPerSample_ / 8);
+    REFERENCE_TIME defaultPeriod = 100000; // 10ms fallback
+    REFERENCE_TIME minPeriod = 0;
+    audioClient_->GetDevicePeriod(&defaultPeriod, &minPeriod);
+    UINT32 quantumFrames = static_cast<UINT32>((static_cast<uint64_t>(deviceSampleRate_) * defaultPeriod) / 10000000ULL);
+    if (quantumFrames == 0 || quantumFrames > bufferFrameCount) {
+        quantumFrames = bufferFrameCount;
+    }
+
+    const uint32_t bytesPerFrame = deviceChannels_ * (deviceBitsPerSample_ / 8);
 
     while (running_) {
-        UINT32 numFramesPadding;
+        UINT32 numFramesPadding = 0;
         HRESULT hr = audioClient_->GetCurrentPadding(&numFramesPadding);
         if (FAILED(hr)) {
-            // Check for device invalidation
             if (hr == AUDCLNT_E_DEVICE_INVALIDATED) {
                 if (onDeviceInvalidated_) onDeviceInvalidated_();
             }
             break;
         }
 
-        UINT32 numFramesAvailable = bufferFrameCount - numFramesPadding;
+        UINT32 numFramesAvailable = bufferFrameCount > numFramesPadding ? (bufferFrameCount - numFramesPadding) : 0;
+        uint32_t framesWritten = 0;
 
         if (numFramesAvailable > 0) {
-            BYTE* pData;
-            hr = renderClient_->GetBuffer(numFramesAvailable, &pData);
+            std::lock_guard<std::mutex> lock(bufferMutex_);
+            uint32_t availableFrames = static_cast<uint32_t>(audioBuffer_.size()) / deviceChannels_;
+            const uint32_t primeTarget = (std::max)(quantumFrames, (deviceSampleRate_ * 12) / 1000);
+
+            if (!primed_ && availableFrames >= primeTarget) {
+                primed_ = true;
+            }
+
+            if (primed_ && availableFrames > 0) {
+                framesWritten = (std::min)(numFramesAvailable, availableFrames);
+                BYTE* pData = nullptr;
+                hr = renderClient_->GetBuffer(framesWritten, &pData);
+                if (FAILED(hr)) {
+                    if (hr == AUDCLNT_E_DEVICE_INVALIDATED) {
+                        if (onDeviceInvalidated_) onDeviceInvalidated_();
+                    }
+                    break;
+                }
+
+                if (deviceIsFloat_) {
+                    memcpy(pData, audioBuffer_.data(), framesWritten * deviceChannels_ * sizeof(float));
+                } else {
+                    auto* out16 = reinterpret_cast<int16_t*>(pData);
+                    for (uint32_t i = 0; i < framesWritten * deviceChannels_; i++) {
+                        float s = audioBuffer_[i];
+                        if (s > 1.0f) s = 1.0f;
+                        if (s < -1.0f) s = -1.0f;
+                        out16[i] = static_cast<int16_t>(s * 32767.0f);
+                    }
+                }
+
+                renderClient_->ReleaseBuffer(framesWritten, 0);
+                audioBuffer_.erase(audioBuffer_.begin(), audioBuffer_.begin() + framesWritten * deviceChannels_);
+
+                size_t remFrames = audioBuffer_.size() / deviceChannels_;
+                if (remFrames < windowMinFrames_) {
+                    windowMinFrames_ = remFrames;
+                }
+            } else if (primed_ && availableFrames == 0 && numFramesPadding == 0) {
+                // Mic stream ended or underran completely — re-prime cleanly on next speech burst
+                primed_ = false;
+                windowMinFrames_ = (std::numeric_limits<size_t>::max)();
+                windowPushCount_ = 0;
+            }
+        }
+
+        // Only pad up to a single engine quantum with silent frames when idle/unprimed
+        // (avoids stuffing the full WASAPI buffer with 20ms of trailing silence ahead of new packets)
+        UINT32 totalQueued = numFramesPadding + framesWritten;
+        if (totalQueued < quantumFrames && totalQueued < bufferFrameCount) {
+            UINT32 silenceFrames = (std::min)(quantumFrames - totalQueued, bufferFrameCount - totalQueued);
+            BYTE* pData = nullptr;
+            hr = renderClient_->GetBuffer(silenceFrames, &pData);
             if (FAILED(hr)) {
                 if (hr == AUDCLNT_E_DEVICE_INVALIDATED) {
                     if (onDeviceInvalidated_) onDeviceInvalidated_();
                 }
                 break;
             }
-
-            uint32_t framesToWrite = 0;
-            {
-                std::lock_guard<std::mutex> lock(bufferMutex_);
-                uint32_t availableFrames = static_cast<uint32_t>(audioBuffer_.size()) / deviceChannels_;
-                framesToWrite = std::min(numFramesAvailable, availableFrames);
-
-                if (framesToWrite > 0) {
-                    if (deviceIsFloat_) {
-                        // Device expects float — direct copy
-                        memcpy(pData, audioBuffer_.data(), framesToWrite * deviceChannels_ * sizeof(float));
-                    } else {
-                        // Device expects int16 — convert
-                        auto* out16 = reinterpret_cast<int16_t*>(pData);
-                        for (uint32_t i = 0; i < framesToWrite * deviceChannels_; i++) {
-                            float s = audioBuffer_[i];
-                            if (s > 1.0f) s = 1.0f;
-                            if (s < -1.0f) s = -1.0f;
-                            out16[i] = static_cast<int16_t>(s * 32767.0f);
-                        }
-                    }
-                    audioBuffer_.erase(audioBuffer_.begin(), audioBuffer_.begin() + framesToWrite * deviceChannels_);
-                }
-            }
-
-            // Fill remainder with silence
-            if (framesToWrite < numFramesAvailable) {
-                size_t offset = framesToWrite * bytesPerFrame;
-                size_t silenceBytes = (numFramesAvailable - framesToWrite) * bytesPerFrame;
-                memset(pData + offset, 0, silenceBytes);
-            }
-
-            renderClient_->ReleaseBuffer(numFramesAvailable, 0);
+            memset(pData, 0, silenceFrames * bytesPerFrame);
+            renderClient_->ReleaseBuffer(silenceFrames, AUDCLNT_BUFFERFLAGS_SILENT);
         }
 
-        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        if (!running_) break;
+
+        if (renderEvent_) {
+            WaitForSingleObject(renderEvent_, 10);
+        } else {
+            Sleep(2);
+        }
     }
+
+    if (mmcssTask) AvRevertMmThreadCharacteristics(mmcssTask);
 }

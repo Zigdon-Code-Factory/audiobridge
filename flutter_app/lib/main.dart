@@ -105,9 +105,9 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
   double _rttMs = 0.0;
   double _jitterBufferMs = 0.0;
   double _outputBufferMs = 0.0;
-  double _serverCaptureMs = 10.0; // WASAPI default
+  double _serverCaptureMs = 2.5; // Default 2.5ms Raw PCM frame
   int _serverJitterMs = 0; // Jitter target from server
-  int _serverFrameSizeMs = 10; // Frame size from server
+  bool _isRawPcm = true; // Codec mode from server (true = Raw PCM, false = Opus)
 
   // Now playing info from server
   String _nowPlayingTitle = '';
@@ -213,12 +213,32 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
         case 'onFrameSizeUpdate':
           // Server sent frame size setting
           try {
-            final frameMs = int.tryParse(call.arguments as String? ?? '') ?? 10;
+            final frameMs = int.tryParse(call.arguments as String? ?? '') ?? 2;
             if (mounted) {
               setState(() {
-                _serverFrameSizeMs = frameMs;
-                _serverCaptureMs = frameMs.toDouble();
+                final baseMs = (frameMs == 2) ? 2.5 : frameMs.toDouble();
+                _serverCaptureMs = baseMs + (_isRawPcm ? 0.0 : 2.5);
               });
+            }
+          } catch (_) {}
+          break;
+
+        case 'onStreamConfig':
+          try {
+            final jsonStr = call.arguments as String? ?? '';
+            if (jsonStr.isNotEmpty) {
+              final cfg = jsonDecode(jsonStr) as Map<String, dynamic>;
+              final jitter = (cfg['jitter'] as num?)?.toInt() ?? _serverJitterMs;
+              final samples = (cfg['samples'] as num?)?.toInt() ?? 120;
+              final pcm = (cfg['pcm'] as bool?) ?? true;
+              if (mounted) {
+                setState(() {
+                  _serverJitterMs = jitter;
+                  _isRawPcm = pcm;
+                  final frameExactMs = samples * 1000.0 / 48000.0;
+                  _serverCaptureMs = frameExactMs + (pcm ? 0.0 : 2.5);
+                });
+              }
             }
           } catch (_) {}
           break;
@@ -535,13 +555,38 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
     }
   }
 
-  void _sendDiscovery() {
+  Future<void> _sendDiscovery() async {
+    final sock = _discoverySocket;
+    if (sock == null) return;
     final data = Uint8List.fromList('AB_DISCOVER'.codeUnits);
-    _discoverySocket?.send(
-      data,
-      InternetAddress('255.255.255.255'),
-      4011,
-    );
+    final targets = <String>{'255.255.255.255'};
+
+    try {
+      final interfaces = await NetworkInterface.list(
+        type: InternetAddressType.IPv4,
+        includeLinkLocal: false,
+      );
+      for (final iface in interfaces) {
+        for (final addr in iface.addresses) {
+          final parts = addr.address.split('.');
+          if (parts.length == 4 && parts[0] != '127') {
+            targets.add('${parts[0]}.${parts[1]}.${parts[2]}.255');
+          }
+        }
+      }
+    } catch (_) {}
+
+    for (final s in _knownServers) {
+      if (s.lastIp.isNotEmpty) {
+        targets.add(s.lastIp);
+      }
+    }
+
+    for (final host in targets) {
+      try {
+        sock.send(data, InternetAddress(host), 4011);
+      } catch (_) {}
+    }
   }
 
   void _stopDiscovery() {
@@ -729,7 +774,11 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
               ),
               const SizedBox(height: 16),
               _latencyRow('Network (one-way)', networkOneWay, cs),
-              _latencyRow('Server frame (${_serverFrameSizeMs}ms)', _serverCaptureMs, cs),
+              _latencyRow(
+                'Server frame (${_isRawPcm ? 'Raw PCM' : 'Opus +2.5ms'})',
+                _serverCaptureMs,
+                cs,
+              ),
               _latencyRow('Jitter buffer${_serverJitterMs > 0 ? ' (target: ${_serverJitterMs}ms)' : ''}', _jitterBufferMs, cs),
               _latencyRow('Audio output buffer', _outputBufferMs, cs),
               const SizedBox(height: 8),

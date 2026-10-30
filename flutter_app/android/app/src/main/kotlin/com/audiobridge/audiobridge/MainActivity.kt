@@ -7,19 +7,39 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.database.ContentObserver
+import android.media.AudioDeviceInfo
 import android.media.AudioManager
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
+import android.provider.Settings
 import android.content.pm.PackageManager
 import android.util.Log
 import androidx.core.content.ContextCompat
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
+import kotlin.math.pow
 
 class MainActivity : FlutterActivity() {
     private val CHANNEL = "com.audiobridge/audio"
     private var nativeStarted = false
     private var bluetoothScoActive = false
+    private var volumeReceiverRegistered = false
+
+    private val volumeReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            syncSystemVolume()
+        }
+    }
+
+    private val volumeObserver = object : ContentObserver(Handler(Looper.getMainLooper())) {
+        override fun onChange(selfChange: Boolean) {
+            super.onChange(selfChange)
+            syncSystemVolume()
+        }
+    }
 
     companion object {
         var methodChannel: MethodChannel? = null
@@ -39,6 +59,7 @@ class MainActivity : FlutterActivity() {
     private external fun nativeStopRecording()
     private external fun nativeSetMuted(muted: Boolean)
     private external fun nativeSetVolume(volume: Float)
+    private external fun nativeSetSystemVolume(volume: Float)
     private external fun nativeGetLatencyBreakdown(): DoubleArray
     private external fun nativeGetOutputPeakLevel(): Float
     private external fun nativeGetInputPeakLevel(): Float
@@ -112,8 +133,85 @@ class MainActivity : FlutterActivity() {
         }
     }
 
+    private fun syncSystemVolume() {
+        try {
+            val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+            val maxVol = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+            val minVol = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                audioManager.getStreamMinVolume(AudioManager.STREAM_MUSIC)
+            } else 0
+            val curVol = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
+            val isMuted = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                audioManager.isStreamMute(AudioManager.STREAM_MUSIC)
+            } else (curVol <= 0)
+
+            val gain: Float = when {
+                isMuted || curVol <= minVol -> 0.0f
+                curVol >= maxVol -> 1.0f
+                else -> {
+                    var computed: Float? = null
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                        try {
+                            var devType = AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
+                            for (dev in audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)) {
+                                when (dev.type) {
+                                    AudioDeviceInfo.TYPE_WIRED_HEADPHONES,
+                                    AudioDeviceInfo.TYPE_WIRED_HEADSET,
+                                    AudioDeviceInfo.TYPE_USB_HEADSET,
+                                    AudioDeviceInfo.TYPE_USB_DEVICE,
+                                    AudioDeviceInfo.TYPE_BLUETOOTH_A2DP,
+                                    AudioDeviceInfo.TYPE_BLE_HEADSET -> {
+                                        devType = dev.type
+                                        break
+                                    }
+                                }
+                            }
+                            val db = audioManager.getStreamVolumeDb(AudioManager.STREAM_MUSIC, curVol, devType)
+                            computed = if (db <= -90f) 0.0f else 10.0.pow((db / 20.0)).toFloat().coerceIn(0.0f, 1.0f)
+                        } catch (_: Exception) {}
+                    }
+                    if (computed != null) {
+                        computed
+                    } else {
+                        val span = (maxVol - minVol).coerceAtLeast(1)
+                        val norm = (curVol - minVol).toDouble() / span.toDouble()
+                        10.0.pow((-48.0 * (1.0 - norm)) / 20.0).toFloat().coerceIn(0.0f, 1.0f)
+                    }
+                }
+            }
+            nativeSetSystemVolume(gain)
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to sync system volume: ${e.message}")
+        }
+    }
+
+    private fun registerVolumeTracking() {
+        if (volumeReceiverRegistered) return
+        try {
+            val filter = IntentFilter("android.media.VOLUME_CHANGED_ACTION")
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                registerReceiver(volumeReceiver, filter, Context.RECEIVER_EXPORTED)
+            } else {
+                registerReceiver(volumeReceiver, filter)
+            }
+            contentResolver.registerContentObserver(Settings.System.CONTENT_URI, true, volumeObserver)
+            volumeReceiverRegistered = true
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to register volume tracking: ${e.message}")
+        }
+    }
+
+    private fun unregisterVolumeTracking() {
+        if (!volumeReceiverRegistered) return
+        try { unregisterReceiver(volumeReceiver) } catch (_: Exception) {}
+        try { contentResolver.unregisterContentObserver(volumeObserver) } catch (_: Exception) {}
+        volumeReceiverRegistered = false
+    }
+
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
+        registerVolumeTracking()
+        syncSystemVolume()
 
         val channel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL)
         methodChannel = channel
@@ -157,9 +255,11 @@ class MainActivity : FlutterActivity() {
                         startService(serviceIntent)
                     }
 
+                    syncSystemVolume()
                     if (!nativeStarted) {
                         nativeStarted = nativeStartAudio()
                     }
+                    syncSystemVolume()
                     result.success(nativeStarted)
                 }
                 "stopAudio" -> {
@@ -310,6 +410,7 @@ class MainActivity : FlutterActivity() {
     }
 
     override fun onDestroy() {
+        unregisterVolumeTracking()
         methodChannel = null
         super.onDestroy()
     }

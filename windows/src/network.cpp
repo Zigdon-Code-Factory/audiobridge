@@ -16,6 +16,8 @@ static const char* packetTypeName(uint8_t type) {
         case 0x05: return "MEDIA_INFO";
         case 0x06: return "PING";
         case 0x07: return "PONG";
+        case 0x08: return "SETTINGS";
+        case 0x09: return "AUDIO_PCM";
         default: return "UNKNOWN";
     }
 }
@@ -80,6 +82,20 @@ bool Network::initialize(const std::string& serverName) {
     DWORD timeout = 100; // 100ms
     setsockopt(streamSocket_, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout, sizeof(timeout));
 
+    // Enlarge UDP send/receive socket buffers to 256 KB so low-latency Raw PCM bursts never drop
+    int sockBufBytes = 262144;
+    setsockopt(streamSocket_, SOL_SOCKET, SO_SNDBUF, (char*)&sockBufBytes, sizeof(sockBufBytes));
+    setsockopt(streamSocket_, SOL_SOCKET, SO_RCVBUF, (char*)&sockBufBytes, sizeof(sockBufBytes));
+
+    // Initialize Windows qWAVE handle for 802.11e WMM Voice (AC_VO / DSCP 46 EF) Wi-Fi prioritization
+    QOS_VERSION qosVer{1, 0};
+    if (QOSCreateHandle(&qosVer, &qosHandle_)) {
+        printf("[NET] qWAVE QoS handle initialized (Wi-Fi WMM AC_VO Voice ready)\n");
+    } else {
+        qosHandle_ = nullptr;
+        printf("[NET] WARN: QOSCreateHandle failed (err=%lu), continuing without qWAVE\n", GetLastError());
+    }
+
     running_ = true;
     discoveryThread_ = std::thread(&Network::discoveryThread, this);
     streamThread_ = std::thread(&Network::streamThread, this);
@@ -99,6 +115,11 @@ void Network::shutdown() {
     if (discoveryThread_.joinable()) discoveryThread_.join();
     if (streamThread_.joinable()) streamThread_.join();
     endDtlsSession();
+    detachVoiceQosFlow();
+    if (qosHandle_) {
+        QOSCloseHandle(qosHandle_);
+        qosHandle_ = nullptr;
+    }
     if (discoverySocket_ != INVALID_SOCKET) { closesocket(discoverySocket_); discoverySocket_ = INVALID_SOCKET; }
     if (streamSocket_ != INVALID_SOCKET) { closesocket(streamSocket_); streamSocket_ = INVALID_SOCKET; }
     WSACleanup();
@@ -344,6 +365,7 @@ void Network::streamThread() {
                         std::lock_guard<std::mutex> lock(clientMutex_);
                         clientAddr_ = senderAddr;
                     }
+                    attachVoiceQosFlow(senderAddr);
 
                     if (pskHex.empty()) {
                         pskHex = DtlsSession::generatePsk();
@@ -390,6 +412,7 @@ void Network::streamThread() {
                         std::lock_guard<std::mutex> lock(clientMutex_);
                         clientAddr_ = senderAddr;
                     }
+                    attachVoiceQosFlow(senderAddr);
                     connected_ = true;
                     paused_ = false;
                     sequence_ = 0;
@@ -445,6 +468,7 @@ void Network::streamThread() {
                                 std::lock_guard<std::mutex> lock2(clientMutex_);
                                 clientAddr_ = senderAddr;
                             }
+                            attachVoiceQosFlow(senderAddr);
 
                             // Send accept with PSK
                             std::string acceptMsg = "AB_ACCEPT|" + DtlsSession::pskToBase64(pskHex);
@@ -609,12 +633,14 @@ void Network::writeHeader(uint8_t* buf, uint8_t type, uint16_t payloadLen) {
     uint64_t timestamp = std::chrono::duration_cast<std::chrono::microseconds>(
         now - streamStart_).count();
 
+    const bool isAudio = (type == PACKET_AUDIO || type == PACKET_AUDIO_PCM);
+    const uint32_t seq = isAudio ? sequence_.fetch_add(1, std::memory_order_relaxed) : 0;
+
     buf[0] = 0x01; // version
     buf[1] = type;
-    memcpy(buf + 2, &sequence_, 4);
+    memcpy(buf + 2, &seq, 4);
     memcpy(buf + 6, &timestamp, 8);
     memcpy(buf + 14, &payloadLen, 2);
-    sequence_++;
 }
 
 void Network::sendPacket(const uint8_t* data, size_t len) {
@@ -702,6 +728,63 @@ void Network::sendAudio(const uint8_t* opusData, int opusLen) {
     sendPacket(packet, 16 + opusLen);
 }
 
+void Network::sendAudioPcm(const int16_t* pcmStereo, int frameCount) {
+    if (!connected_ || paused_) return;
+    if (!pcmStereo || frameCount <= 0) return;
+
+    const int payloadLen = frameCount * 2 * (int)sizeof(int16_t);
+    if (payloadLen <= 0 || payloadLen + 16 > 2048) {
+        printf("[NET] sendAudioPcm: invalid frameCount=%d (payloadLen=%d)\n", frameCount, payloadLen);
+        return;
+    }
+
+    static int pcmCount = 0;
+    pcmCount++;
+    if (pcmCount <= 5 || (pcmCount % 5000) == 0) {
+        printf("[NET] sendAudioPcm #%d: frames=%d (%d bytes), qos=%s, dtls=%s\n",
+               pcmCount, frameCount, payloadLen,
+               isVoiceQosActive() ? "AC_VO" : "BE",
+               dtlsActive_ ? "YES" : "NO");
+    }
+
+    uint8_t packet[2048];
+    writeHeader(packet, PACKET_AUDIO_PCM, (uint16_t)payloadLen);
+    memcpy(packet + 16, pcmStereo, payloadLen);
+    sendPacket(packet, 16 + payloadLen);
+}
+
+void Network::attachVoiceQosFlow(const sockaddr_in& destAddr) {
+    std::lock_guard<std::mutex> lock(qosMutex_);
+    if (!qosHandle_ || streamSocket_ == INVALID_SOCKET) return;
+
+    QOS_FLOWID prevFlow = qosFlowId_.exchange(0);
+    if (prevFlow != 0) {
+        QOSRemoveSocketFromFlow(qosHandle_, streamSocket_, prevFlow, 0);
+    }
+
+    QOS_FLOWID newFlow = 0;
+    sockaddr_in target = destAddr;
+    if (QOSAddSocketToFlow(qosHandle_, streamSocket_, reinterpret_cast<PSOCKADDR>(&target),
+                           QOSTrafficTypeVoice, QOS_NON_ADAPTIVE_FLOW, &newFlow)) {
+        qosFlowId_.store(newFlow, std::memory_order_relaxed);
+        char ipStr[INET_ADDRSTRLEN]{};
+        inet_ntop(AF_INET, &target.sin_addr, ipStr, sizeof(ipStr));
+        printf("[NET] Attached Wi-Fi WMM Voice QoS (AC_VO / DSCP EF, flowId=%lu) -> %s:%u\n",
+               (unsigned long)newFlow, ipStr, ntohs(target.sin_port));
+    } else {
+        printf("[NET] WARN: QOSAddSocketToFlow(Voice) failed (err=%lu)\n", GetLastError());
+    }
+}
+
+void Network::detachVoiceQosFlow() {
+    std::lock_guard<std::mutex> lock(qosMutex_);
+    QOS_FLOWID prevFlow = qosFlowId_.exchange(0);
+    if (prevFlow != 0 && qosHandle_ && streamSocket_ != INVALID_SOCKET) {
+        QOSRemoveSocketFromFlow(qosHandle_, streamSocket_, prevFlow, 0);
+        printf("[NET] Detached Wi-Fi WMM Voice QoS flowId=%lu\n", (unsigned long)prevFlow);
+    }
+}
+
 void Network::sendKeepalive() {
     if (!connected_) return;
 
@@ -739,18 +822,25 @@ void Network::sendMediaInfo(const std::string& json) {
     sendPacket(packet, 16 + payloadLen);
 }
 
-void Network::sendSettings(int jitterMs, int frameSizeMs) {
+void Network::sendSettings(int jitterMs, int frameSizeMs, uint16_t frameSamples, bool rawPcm) {
     if (!connected_) return;
 
     uint8_t packet[32];
-    uint16_t payloadLen = 4;
+    uint16_t payloadLen = 8;
     writeHeader(packet, PACKET_SETTINGS, payloadLen);
     uint16_t jitter = (uint16_t)jitterMs;
     uint16_t frameMs = (uint16_t)frameSizeMs;
+    uint16_t samples = frameSamples > 0 ? frameSamples : (uint16_t)(frameSizeMs * 48);
+    uint8_t codec = rawPcm ? 1 : 0; // 0 = Opus, 1 = Raw 16-bit PCM
+    uint8_t flags = isVoiceQosActive() ? 1 : 0;
     memcpy(packet + 16, &jitter, 2);
     memcpy(packet + 18, &frameMs, 2);
+    memcpy(packet + 20, &samples, 2);
+    packet[22] = codec;
+    packet[23] = flags;
     sendPacket(packet, 16 + payloadLen);
-    printf("[NET] Sent settings to client: jitter=%dms frameSize=%dms\n", jitterMs, frameSizeMs);
+    printf("[NET] Sent settings to client: jitter=%dms frame=%dms (%u samples) codec=%s qos=%s\n",
+           jitterMs, frameSizeMs, samples, rawPcm ? "PCM" : "Opus", flags ? "AC_VO" : "BE");
 }
 
 std::string Network::getClientAddress() const {
@@ -996,6 +1086,17 @@ bool Network::startDtlsHandshake(const sockaddr_in& clientAddr, const std::strin
                 connectedClientId_.clear();
                 return false;
             }
+        } else if (firstByte == 0x01 && n >= 16 &&
+                   sender.sin_addr.s_addr == clientAddr.sin_addr.s_addr) {
+            printf("[NET] Client started plaintext v1 stream (type=0x%02X), skipping DTLS wait\n",
+                   (uint8_t)buf[1]);
+            std::lock_guard<std::mutex> lock(dtlsMutex_);
+            if (dtlsSession_) {
+                dtlsSession_->teardown();
+                dtlsSession_.reset();
+            }
+            connectedClientId_.clear();
+            return false;
         } else {
             printf("[NET] Non-DTLS packet during handshake: firstByte=0x%02X, len=%d, ignoring\n",
                    firstByte, n);

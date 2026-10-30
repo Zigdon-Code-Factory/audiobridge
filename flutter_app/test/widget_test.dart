@@ -37,4 +37,32 @@ void main() {
     expect(restored.macVerified, isFalse);
     expect(ServerInfo.fromJson({}).pskHex, isEmpty);
   });
+  testWidgets('Handles native stream config, frame size, and pair pending callbacks cleanly', (tester) async {
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, (call) async => null);
+    addTearDown(() {
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(channel, null);
+    });
+    await tester.pumpWidget(const AudioBridgeApp());
+    await tester.pump();
+
+    const codec = StandardMethodCodec();
+    Future<void> emitNative(String method, Object? args) async {
+      final data = codec.encodeMethodCall(MethodCall(method, args));
+      await TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .handlePlatformMessage(channel.name, data, (_) {});
+      await tester.pump();
+    }
+
+    await emitNative('onStreamConfig', '{"jitter":10,"samples":120,"pcm":true}');
+    await emitNative('onFrameSizeUpdate', '2');
+    await emitNative('onStreamConfig', '{"jitter":15,"samples":240,"pcm":false}');
+    await emitNative('onSettingsUpdate', '12');
+    await emitNative('onPairPending', '');
+    expect(find.text('Awaiting approval...'), findsOneWidget);
+    await tester.pumpWidget(const SizedBox.shrink());
+    await tester.pump();
+    expect(tester.takeException(), isNull);
+  });
 }

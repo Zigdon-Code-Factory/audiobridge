@@ -2,6 +2,7 @@
 #include <WinSock2.h>
 #include <WS2tcpip.h>
 #include <iphlpapi.h>
+#include <qos2.h>
 #include <cstdint>
 #include <string>
 #include <atomic>
@@ -16,24 +17,26 @@
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "iphlpapi.lib")
+#pragma comment(lib, "qwave.lib")
 
 struct PacketHeader {
     uint8_t version;    // 0x01
-    uint8_t type;       // 0x01=audio, 0x02=keepalive, 0x03=control
+    uint8_t type;       // 0x01=audio(opus), 0x09=audio(pcm), 0x02=keepalive, 0x03=control
     uint32_t sequence;
     uint64_t timestamp; // microseconds since stream start
     uint16_t payloadLen;
 };
 
 enum PacketType : uint8_t {
-    PACKET_AUDIO     = 0x01,
-    PACKET_KEEPALIVE = 0x02,
-    PACKET_CONTROL   = 0x03,
-    PACKET_MIC_AUDIO = 0x04,
+    PACKET_AUDIO      = 0x01,
+    PACKET_KEEPALIVE  = 0x02,
+    PACKET_CONTROL    = 0x03,
+    PACKET_MIC_AUDIO  = 0x04,
     PACKET_MEDIA_INFO = 0x05,
-    PACKET_PING      = 0x06,
-    PACKET_PONG      = 0x07,
-    PACKET_SETTINGS  = 0x08,
+    PACKET_PING       = 0x06,
+    PACKET_PONG       = 0x07,
+    PACKET_SETTINGS   = 0x08,
+    PACKET_AUDIO_PCM  = 0x09,
 };
 
 enum ControlCmd : uint8_t {
@@ -99,9 +102,13 @@ public:
     bool isConnected() const { return connected_; }
     bool isPaused() const { return paused_; }
     bool isDtlsActive() const { return dtlsActive_; }
+    bool isVoiceQosActive() const { return qosFlowId_.load(std::memory_order_relaxed) != 0; }
 
-    // Send audio packet (16-byte header + opus payload)
+    // Send Opus audio packet (16-byte header + opus payload)
     void sendAudio(const uint8_t* opusData, int opusLen);
+
+    // Send zero-lookahead Raw 16-bit Stereo PCM audio packet (16-byte header + interleaved int16 stereo)
+    void sendAudioPcm(const int16_t* pcmStereo, int frameCount);
 
     // Send keepalive
     void sendKeepalive();
@@ -115,8 +122,8 @@ public:
     // Send media info to connected client
     void sendMediaInfo(const std::string& json);
 
-    // Send jitter buffer settings to connected client (ms)
-    void sendSettings(int jitterMs, int frameSizeMs = 10);
+    // Send jitter buffer, frame size, exact sample quantum, and codec mode to connected client
+    void sendSettings(int jitterMs, int frameSizeMs = 5, uint16_t frameSamples = 240, bool rawPcm = true);
 
     std::string getClientAddress() const;
     std::string getServerMac() const { return macAddress_; }
@@ -126,6 +133,8 @@ private:
     void streamThread();
     void writeHeader(uint8_t* buf, uint8_t type, uint16_t payloadLen);
     void sendPacket(const uint8_t* data, size_t len);
+    void attachVoiceQosFlow(const sockaddr_in& destAddr);
+    void detachVoiceQosFlow();
     static std::string getMacAddress();
 
     // DTLS
@@ -148,6 +157,11 @@ private:
     SOCKET discoverySocket_ = INVALID_SOCKET;
     SOCKET streamSocket_ = INVALID_SOCKET;
 
+    // Windows qWAVE 802.11e WMM Voice (AC_VO / DSCP 46 EF) QoS state
+    HANDLE qosHandle_ = nullptr;
+    std::atomic<QOS_FLOWID> qosFlowId_{0};
+    std::mutex qosMutex_;
+
     std::atomic<bool> running_{false};
     std::atomic<bool> connected_{false};
     std::atomic<bool> paused_{false};
@@ -158,7 +172,7 @@ private:
     sockaddr_in clientAddr_{};
     mutable std::mutex clientMutex_;
 
-    uint32_t sequence_ = 0;
+    std::atomic<uint32_t> sequence_{0};
     std::chrono::steady_clock::time_point streamStart_;
     std::chrono::steady_clock::time_point lastClientPacket_;
 
