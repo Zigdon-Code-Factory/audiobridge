@@ -272,7 +272,13 @@ void Network::streamThread() {
                 const std::string request(buf, received);
                 if (request.rfind("AB_CONNECT2|", 0) == 0) {
                     // An unauthenticated connect must never evict a live session.
-                    if (!connected_) acceptSecureConnection(senderAddr, request);
+                    if (!connected_) {
+                        acceptSecureConnection(senderAddr, request);
+                    } else {
+                        const char* busy = "AB_REJECT|Server already connected. Disconnect the other device first.";
+                        sendto(streamSocket_, busy, static_cast<int>(strlen(busy)), 0,
+                               (sockaddr*)&senderAddr, sizeof(senderAddr));
+                    }
                 } else if (request.rfind("AB_CONNECT|", 0) == 0) {
                     const char* reject = "AB_REJECT|Encryption required: update both apps";
                     sendto(streamSocket_, reject, static_cast<int>(strlen(reject)), 0,

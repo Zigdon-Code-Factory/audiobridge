@@ -136,6 +136,14 @@ int main() {
         Client client(server.getStreamPort());
         key = pair(client);
         assert(server.getApprovedPeers().at(id).pskHex == key);
+        // A second phone gets an actionable busy response, not a silent timeout.
+        // Its unauthenticated request must not replace or pause the active stream.
+        {
+            Client second(server.getStreamPort());
+            second.text("AB_CONNECT2|Second phone|second-id|" + std::string(64, '0') + "|pair");
+            assert(second.response() == "AB_REJECT|Server already connected. Disconnect the other device first.");
+            assert(server.isConnected() && !server.isPaused() && connections == 1);
+        }
         // Spoofed raw controls from the actual endpoint must still be rejected.
         uint8_t rawControl[17] = {1, PACKET_CONTROL};
         rawControl[14] = 1; rawControl[16] = CTRL_PAUSE;

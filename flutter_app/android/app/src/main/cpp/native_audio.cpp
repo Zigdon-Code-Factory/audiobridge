@@ -307,6 +307,7 @@ public:
         lastSampleR_ = 0;
         framesSinceLog_ = 0;
         callbackCount_ = 0;
+        renderedPeak_ = 0;
 
         // Request SharingMode::Exclusive for direct 1.0ms (48-frame) hardware MMAP access,
         // bypassing AAudioService's 6.0ms shared mixer ring buffer! Oboe automatically falls
@@ -648,6 +649,12 @@ public:
             }
         }
 
+        // Observe the actual samples handed to Oboe after both volume controls.
+        // A nonzero decoded peak alone does not establish audible output.
+        for (int i = 0; i < numFrames * CHANNELS; ++i) {
+            renderedPeak_ = std::max(renderedPeak_, std::abs(static_cast<int32_t>(output[i])));
+        }
+
         // Periodic Oboe callback stats (every ~3 seconds regardless of callback size)
         framesSinceLog_ += numFrames;
         if (callbackCount_ <= 3 || framesSinceLog_ >= SAMPLE_RATE * 3) {
@@ -657,15 +664,16 @@ public:
                 callbackEnd - callbackStart).count();
             int32_t xruns = stream ? stream->getXRunCount().value() : 0;
             LOGI("[OBOE] Callback #%llu (%s): numFrames=%d, gap=%.1fms, dur=%.2fms, "
-                 "jbufMs=%.1f, rem=%d, peak=%d, xruns=%d, underruns=%llu, fadeFrames=%llu",
+                 "jbufMs=%.1f, rem=%d, peak=%d, renderedPeak=%d, appGain=%.4f, systemGain=%.4f, xruns=%d, underruns=%llu, fadeFrames=%llu",
                  (unsigned long long)callbackCount_,
                  isExclusiveMmap_.load(std::memory_order_relaxed) ? "EXCL" : "SHRD",
                  numFrames, callbackGapMs, callbackDurationMs,
                  jitterBuffer_.queuedSampleFrames() * 1000.0 / SAMPLE_RATE,
-                 playbackFrame_.remaining(), (int)outputPeak_, xruns,
+                 playbackFrame_.remaining(), (int)outputPeak_, renderedPeak_, appVol, sysVol, xruns,
                  (unsigned long long)totalPlaybackUnderruns_,
                  (unsigned long long)totalSilenceFrames_);
             outputPeak_ = 0;
+            renderedPeak_ = 0;
         }
 
         return oboe::DataCallbackResult::Continue;
@@ -721,6 +729,7 @@ private:
     uint64_t totalPlaybackUnderruns_ = 0;
     uint64_t totalSilenceFrames_ = 0;
     int16_t outputPeak_ = 0;
+    int32_t renderedPeak_ = 0; // Playback callback only; reset before stream start.
 };
 
 // --- AudioRecorder (Microphone to PC) ---
