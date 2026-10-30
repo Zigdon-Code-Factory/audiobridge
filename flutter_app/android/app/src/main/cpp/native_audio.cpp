@@ -309,11 +309,8 @@ public:
         callbackCount_ = 0;
         renderedPeak_ = 0;
 
-        // Request SharingMode::Exclusive for direct 1.0ms (48-frame) hardware MMAP access,
-        // bypassing AAudioService's 6.0ms shared mixer ring buffer! Oboe automatically falls
-        // back to SharingMode::Shared if Exclusive MMAP is unavailable; when Exclusive is
-        // granted, we apply Android's STREAM_MUSIC volume curve in software so hardware
-        // volume keys work identically.
+        // AAudio applies Android media volume even for exclusive MMAP streams.
+        // Apply only the independent app gain in our callback.
         oboe::AudioStreamBuilder builder;
         builder.setDirection(oboe::Direction::Output)
                ->setPerformanceMode(oboe::PerformanceMode::LowLatency)
@@ -634,12 +631,11 @@ public:
             }
         }
 
-        // Apply app volume * Android STREAM_MUSIC volume (in Exclusive MMAP mode where HAL bypasses AudioFlinger volume)
+        // Android/AAudio applies system volume after this callback, including
+        // exclusive MMAP. Reapplying its volume curve here attenuates twice.
         const float appVol = volume_.load(std::memory_order_relaxed);
-        const float sysVol = isExclusiveMmap_.load(std::memory_order_relaxed)
-            ? systemVolume_.load(std::memory_order_relaxed)
-            : 1.0f;
-        const float vol = appVol * sysVol;
+        const float sysVol = 1.0f;
+        const float vol = appVol;
         if (vol <= 0.0001f) {
             memset(output, 0, numFrames * CHANNELS * sizeof(int16_t));
         } else if (vol < 0.999f) {
@@ -1338,6 +1334,14 @@ private:
                         connected_ = false;
                         notifyDart("onDisconnected", "server_disconnect");
                     }
+                }
+                break;
+
+            case 0x0a: // Encrypted multi-stream status: mic ownership, phone count.
+                if (len == 18) {
+                    const std::string status = std::string("{\"micAllowed\":") +
+                        (data[16] ? "true" : "false") + ",\"clients\":" + std::to_string(data[17]) + "}";
+                    notifyDart("onSessionInfo", status.c_str());
                 }
                 break;
 

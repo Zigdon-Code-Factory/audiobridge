@@ -1,7 +1,7 @@
 # AudioBridge - Communication Specification v2.0
 
 ## Overview
-Stream system audio from a Windows/Linux/macOS PC to an Android phone over local WiFi with sub-50ms latency. All audio and control traffic is encrypted via DTLS.
+Stream the same system audio from a Windows/Linux/macOS PC to up to eight Android phones over local WiFi. All audio and control traffic is encrypted via independent DTLS sessions. Playback latency depends on capture, buffering, the network and each phone; receivers are not synchronized speakers.
 
 ## Architecture
 ```
@@ -37,6 +37,13 @@ Only discovery, public pairing material, and accept/reject messages are plaintex
 
 ## Audio Stream Protocol (DTLS over UDP)
 
+### Multiple receivers
+- Up to eight active or pending connections share one capture/encoder. Pairing or handshaking does not suspend existing streams. Only one new pairing approval is shown at a time; saved-key reconnects can proceed independently.
+- Each endpoint has its own DTLS state, audio sequence counter, pause state, heartbeat, RTT and timeout. Disconnecting, revoking or losing one receiver does not stop the others.
+- Capture source, codec, frame quantum and jitter target are common desktop settings. App volume and mute are local to each phone; pause/resume affects that receiver. Media commands control the shared PC player.
+- The first connected phone owns microphone return. Other phones receive playback but their mic packets are ignored. When the owner disconnects, the next oldest connection becomes eligible and the server resets the microphone decoder. The phone reports eligibility rather than mixing unrelated microphone streams.
+- Android applies its system media volume through AAudio. The playback callback applies only the independent app-volume gain, avoiding double attenuation.
+
 ### Packet Format (binary, little-endian)
 Packets are encrypted inside DTLS records. The inner (plaintext) format:
 ```
@@ -63,17 +70,20 @@ Offset  Size   Field
 | Pong | 0x07 | Bidirectional | RTT response (echoed timestamp) |
 | Settings | 0x08 | Server→Client | Jitter, frame quantum, codec and QoS |
 | PCM Audio | 0x09 | Server→Client | Raw 16-bit stereo PCM |
+| Session Info | 0x0a | Server→Client | Two bytes: mic eligibility (0/1), active receiver count |
+
+Session Info is encrypted and sent on membership changes and heartbeats. Older clients may ignore it; the server still enforces microphone ownership. Audio sequence numbers advance independently per receiver only for audio packets sent to it.
 
 ### Audio Parameters
-- **Codec:** Opus
+- **Codec:** Opus or raw signed 16-bit PCM
 - **Sample rate:** 48000 Hz
 - **Channels:** 2 (stereo server→client), 1 (mono client→server mic)
-- **Frame size:** 480 samples (10ms) — optimized for low latency
+- **Capture frame size:** 120/240/480/960 samples (2.5/5/10/20 ms). PCM is split into packets of at most 240 stereo frames, keeping each DTLS datagram below the LAN MTU even with a 20 ms capture quantum.
 - **Bitrate:** 128 kbps
 - **Application mode:** OPUS_APPLICATION_RESTRICTED_LOWDELAY
 
 ### Keepalive
-- Server sends keepalive (type 0x02, no payload) every 500ms when no audio
+- Server sends keepalive (type 0x02, no payload) to each receiver every 500ms, including paused receivers
 - Client sends keepalive every 1000ms
 - Disconnect after 5 seconds without authenticated application packets
 

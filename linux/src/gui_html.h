@@ -338,7 +338,7 @@ function updateStatusCard(s) {
 
     if (s.connected) {
         dot.className = 'status-dot ' + (s.paused ? 'yellow' : 'green');
-        text.textContent = s.paused ? 'Paused' : 'Streaming';
+        text.textContent = s.paused ? 'Paused' : ('Streaming to ' + (s.clientCount || 1) + ((s.clientCount || 1) === 1 ? ' phone' : ' phones'));
         text.style.color = s.paused ? 'var(--yellow)' : 'var(--green)';
         conn.style.display = '';
         disc.style.display = 'none';

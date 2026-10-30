@@ -250,6 +250,8 @@ std::string ServerGui::buildStateJson() {
     s.reserve(2048);
     s += "{";
     s += "\"connected\":" + std::string(stats_.connected ? "true" : "false") + ",";
+    s += "\"micOwner\":\"" + escapeJson(stats_.micOwner) + "\",";
+    s += "\"clientCount\":" + std::to_string(stats_.clientCount) + ",";
     s += "\"paused\":" + std::string(stats_.paused ? "true" : "false") + ",";
     s += "\"clientName\":\"" + escapeJson(stats_.clientName) + "\",";
     s += "\"clientAddress\":\"" + escapeJson(stats_.clientAddress) + "\",";

@@ -9,6 +9,7 @@ public:
     ~OpusDecoderWrapper();
 
     bool initialize();
+    void reset() { if (decoder_) opus_decoder_ctl(decoder_, OPUS_RESET_STATE); }
 
     // Decode an opus packet to 48kHz mono float samples
     // Returns number of frames decoded (e.g., 480 for 10ms frame), or 0 on error

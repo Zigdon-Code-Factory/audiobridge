@@ -13,7 +13,7 @@
 #include <map>
 #include <memory>
 #include <condition_variable>
-#include "dtls_session.h"
+#include "secure_server.h"
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "iphlpapi.lib")
@@ -61,6 +61,7 @@ public:
     using ConnectCallback = std::function<void(const std::string& clientName)>;
     using DisconnectCallback = std::function<void()>;
     using PauseCallback = std::function<void(bool paused)>;
+    // A null/zero packet resets decoder state when the return-mic owner changes.
     using MicAudioCallback = std::function<void(const uint8_t* opusData, int opusLen)>;
     // Called when an unknown peer wants to pair. Return value ignored;
     // call approvePeer()/rejectPeer() from any thread.
@@ -102,10 +103,10 @@ public:
     void revokePeer(const std::string& clientId);
     std::string getPeerName(const std::string& clientId) const;
 
-    bool isConnected() const { return connected_; }
-    bool isPaused() const { return paused_; }
-    bool isDtlsActive() const { return dtlsActive_; }
-    bool isVoiceQosActive() const { return qosFlowId_.load(std::memory_order_relaxed) != 0; }
+    bool isConnected() const { return getClientCount() > 0; }
+    bool isPaused() const { return sessions_ && sessions_->allPaused(); }
+    bool isDtlsActive() const { return isConnected(); }
+    bool isVoiceQosActive() const { return qosFlowCount_.load(std::memory_order_relaxed) != 0; }
 
     // Send Opus audio packet (16-byte header + opus payload)
     void sendAudio(const uint8_t* opusData, int opusLen);
@@ -120,7 +121,7 @@ public:
     void sendPing();
 
     // Get smoothed client RTT in milliseconds
-    double getClientRtt() const { return clientRttMs_.load(); }
+    double getClientRtt() const;
 
     // Send media info to connected client
     void sendMediaInfo(const std::string& json);
@@ -128,63 +129,39 @@ public:
     // Send jitter buffer, frame size, exact sample quantum, and codec mode to connected client
     void sendSettings(int jitterMs, int frameSizeMs = 5, uint16_t frameSamples = 240, bool rawPcm = true);
 
+    size_t getClientCount() const { return sessions_ ? sessions_->count() : 0; }
+    std::string getClientNames() const;
+    std::string getMicOwnerName() const { return sessions_ ? sessions_->micOwner() : ""; }
     std::string getClientAddress() const;
     std::string getServerMac() const { return macAddress_; }
 
 private:
     void discoveryThread();
     void streamThread();
-    void writeHeader(uint8_t* buf, uint8_t type, uint16_t payloadLen);
-    void sendPacket(const uint8_t* data, size_t len);
-    void attachVoiceQosFlow(const sockaddr_in& destAddr);
-    void detachVoiceQosFlow();
     static std::string getMacAddress();
-
-    // DTLS
-    void acceptSecureConnection(const sockaddr_in& peer, const std::string& request);
-    bool startDtlsHandshake(const sockaddr_in& clientAddr, const std::string& clientId, const std::string& storedKey);
-    void endDtlsSession();
-    void endDtlsSessionLocked(); // Must be called with dtlsMutex_ held
     std::string getPeerPsk(const std::string& clientId) const;
     void setPeerPsk(const std::string& clientId, const std::string& pskHex);
-
-    // Peer persistence
     void loadApprovedPeers();
-    void saveApprovedPeers();
+    void saveApprovedPeers(); // Caller holds peersMutex_.
     bool isPeerApproved(const std::string& clientId) const;
     void touchPeer(const std::string& clientId, const std::string& clientName);
     std::string getPeersFilePath() const;
-
     uint16_t streamPort_ = 4012;
-    std::string serverName_;
-    std::string macAddress_;
-    SOCKET discoverySocket_ = INVALID_SOCKET;
-    SOCKET streamSocket_ = INVALID_SOCKET;
-
-    // Windows qWAVE 802.11e WMM Voice (AC_VO / DSCP 46 EF) QoS state
+    std::string serverName_, macAddress_;
+#ifdef _WIN32
+    SOCKET discoverySocket_ = INVALID_SOCKET, streamSocket_ = INVALID_SOCKET;
     HANDLE qosHandle_ = nullptr;
-    std::atomic<QOS_FLOWID> qosFlowId_{0};
+    std::atomic<size_t> qosFlowCount_{0};
+    std::map<std::string, QOS_FLOWID> qosFlows_;
     std::mutex qosMutex_;
-
+    void refreshVoiceQos();
+    void detachVoiceQosFlow();
+#else
+    int discoverySocket_ = -1, streamSocket_ = -1;
+#endif
     std::atomic<bool> running_{false};
-    std::atomic<bool> connected_{false};
-    std::atomic<bool> paused_{false};
-
-    std::thread discoveryThread_;
-    std::thread streamThread_;
-
-    sockaddr_in clientAddr_{};
-    mutable std::mutex clientMutex_;
-
-    std::atomic<uint32_t> sequence_{0};
-    std::chrono::steady_clock::time_point streamStart_;
-    std::chrono::steady_clock::time_point lastClientPacket_;
-
-    // RTT measurement
-    std::atomic<double> clientRttMs_{0.0};
-    std::chrono::steady_clock::time_point lastPingSent_;
-    bool pingPending_ = false;
-
+    std::thread discoveryThread_, streamThread_;
+    std::unique_ptr<SecureServer> sessions_;
     ConnectCallback onConnect_;
     DisconnectCallback onDisconnect_;
     PauseCallback onPause_;
@@ -192,33 +169,6 @@ private:
     PairRequestCallback onPairRequest_;
     MediaCommandCallback onMediaCommand_;
     MediaInfoRequestCallback onMediaInfoRequest_;
-
-    // Approved peers (clientId -> ApprovedPeer)
     std::map<std::string, ApprovedPeer> approvedPeers_;
     mutable std::mutex peersMutex_;
-
-    // Pending pair request state
-    struct PendingPeer {
-        std::string clientId;
-        std::string clientName;
-        sockaddr_in addr;
-        int addrLen;
-        bool responded = false;
-        bool approved = false;
-    };
-    PendingPeer pendingPeer_;
-    std::mutex pendingMutex_;
-    std::condition_variable pendingCv_;
-
-    // DTLS session (protected by dtlsMutex_)
-    std::mutex dtlsMutex_;
-    std::unique_ptr<DtlsSession> dtlsSession_;
-    std::atomic<bool> dtlsActive_{false};
-    std::string connectedClientId_;
-
-    // Per-connection diagnostic counters (reset on each new connection)
-    std::atomic<int> dtlsRecvCount_{0};
-    std::atomic<int> dtlsDecryptCount_{0};
-    std::atomic<int> dtlsSendCount_{0};
-    std::atomic<int> dtlsSendErrCount_{0};
 };

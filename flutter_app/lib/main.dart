@@ -97,6 +97,8 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
   bool _isEncrypted = false; // DTLS active
   String _micSource = 'auto'; // 'auto', 'phone', 'bluetooth'
   bool _micBusy = false;
+  bool _micAllowed = true;
+  int _connectedPhones = 1;
   int _connectionEpoch = 0;
   int _discoveryEpoch = 0;
 
@@ -163,6 +165,25 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
               _disconnect();
               break;
           }
+          break;
+
+        case 'onSessionInfo':
+          try {
+            final info = jsonDecode(call.arguments as String) as Map<String, dynamic>;
+            if (!mounted) break;
+            setState(() {
+              _micAllowed = info['micAllowed'] == true;
+              _connectedPhones = (info['clients'] as num?)?.toInt() ?? 1;
+            });
+            if (!_micAllowed && _isRecording) {
+              if (_state == ConnectionState_.connected) {
+                await _toggleMic(false);
+              } else {
+                _isRecording = false;
+                await _channel.invokeMethod('stopRecording');
+              }
+            }
+          } catch (_) {}
           break;
 
         case 'onMediaInfo':
@@ -621,6 +642,8 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
   Future<void> _connectToServer(InternetAddress address, int port, String name, String mac) async {
     if (_state == ConnectionState_.connecting || _state == ConnectionState_.pairPending) return;
     final epoch = ++_connectionEpoch;
+    _micAllowed = true;
+    _connectedPhones = 1;
     setState(() {
       _state = ConnectionState_.connecting;
       _statusMessage = 'Connecting to $name...';
@@ -693,7 +716,7 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
       if (!mounted || epoch != _connectionEpoch) return;
 
       // Start mic recording if enabled
-      if (_isRecording) {
+      if (_isRecording && _micAllowed) {
         try {
           final recording = await _channel.invokeMethod<bool>('startRecording', {
             'ip': address.address,
@@ -701,8 +724,11 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
             'micSource': _micSource,
           });
           if (!mounted || epoch != _connectionEpoch) return;
-          _isRecording = recording == true;
-          if (!_isRecording) {
+          _isRecording = recording == true && _micAllowed;
+          if (recording == true && !_micAllowed) {
+            await _channel.invokeMethod('stopRecording');
+          }
+          if (!_isRecording && _micAllowed) {
             ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Microphone could not start. Tap Mic Off to retry.')));
           }
         } catch (_) {
@@ -892,6 +918,7 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
   // --- Media Controls ---
 
   Future<void> _toggleMic(bool enable) async {
+    if (enable && !_micAllowed) return;
     if (_micBusy || _state != ConnectionState_.connected || _serverAddress.isEmpty) return;
     final epoch = _connectionEpoch;
     setState(() => _micBusy = true);
@@ -1072,9 +1099,10 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
   // ---- Connected View ----
   Widget _buildConnectedView(ColorScheme cs) {
     return Center(
-      child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 32),
+      child: SingleChildScrollView(
+        padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 24),
         child: Column(
+          mainAxisSize: MainAxisSize.min,
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
             // Speaker icon
@@ -1342,14 +1370,19 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
             // Mic control
             _buildControlButton(
               icon: _isRecording ? Icons.mic_rounded : Icons.mic_off_rounded,
-              label: _isRecording ? 'Mic On' : 'Mic Off',
+              label: !_micAllowed ? 'Mic on first phone' : (_isRecording ? 'Mic On' : 'Mic Off'),
               isActive: _isRecording,
               activeColor: cs.primary,
-              onTap: () => _toggleMic(!_isRecording),
+              onTap: () { if (_micAllowed) _toggleMic(!_isRecording); },
               cs: cs,
             ),
             const SizedBox(height: 16),
 
+            if (_connectedPhones > 1) ...[
+              Text('Streaming to $_connectedPhones phones', style: Theme.of(context).textTheme.bodySmall),
+              const SizedBox(height: 8),
+            ],
+            Text('App volume', style: Theme.of(context).textTheme.labelMedium),
             // Volume slider
             Row(
               children: [

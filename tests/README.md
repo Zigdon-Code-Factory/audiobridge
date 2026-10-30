@@ -14,6 +14,25 @@ When the apps' mbedTLS checkout exists at `windows/build/_deps/mbedtls-src`, the
 
 The security tests exercise X25519/HKDF agreement, the comparison code and identity commitment, invalid keys, legacy key rejection, DTLS cookies and retransmission, all application packet types, tampering, duplicate/reordered records, previous-session replay, wrong PSKs/identities, and plaintext rejection. The Windows integration test runs the production server on temporary ports and verifies approval/denial, the encrypted READY barrier, mic and metadata delivery, authenticated reconnect, and resistance to plaintext disconnect/control injection. It stores test peer records beside the test executable and revokes its generated peer when finished.
 
+On Windows, `multistream_test` runs eight independent DTLS clients against the
+production server. It verifies exact PCM samples at all four frame sizes, Opus
+and metadata fan-out, per-client sequence numbers, pause isolation, pending
+pairing while audio continues, slot limits, wrong-key isolation, microphone
+ownership/handoff, individual disconnect/revocation and timeout isolation.
+
+For a manual soak alongside a physical phone, build `lan_stream_probe` and run:
+
+```powershell
+./windows/build/security-tests-vs/Release/lan_stream_probe.exe SERVER_IP 4012 180
+```
+
+Compare its printed six-digit code with the desktop approval prompt. Each run
+uses a fresh temporary identity. It counts encrypted audio delivery, nonzero PCM
+and sequence gaps without saving audio; it is not an audible playback test.
+Revoke its `LAN test receiver` pairing in the desktop UI after testing. Multiple
+probe processes exercise concurrent receivers; physical phones are still needed
+to evaluate their playback and Wi-Fi behavior.
+
 For hardware validation, update both apps, compare the six-digit codes, and approve only a match. Exercise PC audio, phone mic, metadata and media controls for at least three minutes with DTLS shown on both devices. Check native logs for disconnects, authentication errors, packet loss, decode errors and underruns. Test a reconnect without another pairing prompt. Do not infer end-to-end latency or audible quality solely from successful packet tests.
 
 On Windows, `microphone_test` exercises the bounded microphone FIFO, prefill and
@@ -43,6 +62,9 @@ flutter test integration_test/phone_controls_test.dart -d DEVICE_SERIAL --dart-d
 ```
 
 Allow AudioBridge's microphone/notification/Bluetooth permissions. The Flutter
+control test expects the phone to be the first/only receiver so it owns mic
+return. Test a secondary phone's disabled mic state and ownership handoff
+separately. The Flutter
 test installer can remove existing app data; compare and approve a fresh pairing
 code on the PC if prompted. The test never auto-approves a code. It exercises
 device-name cancel/blank/save/restore, scan start/stop, discovery, latency details,

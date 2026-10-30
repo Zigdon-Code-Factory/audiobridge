@@ -14,6 +14,8 @@ struct ApprovedPeer;
 
 struct ServerStats {
     bool connected = false;
+    int clientCount = 0;
+    std::string micOwner;
     bool paused = false;
     std::string clientName;
     std::string clientAddress;

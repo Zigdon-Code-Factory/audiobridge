@@ -180,20 +180,19 @@ int main(int argc, char* argv[]) {
 
     network.setCallbacks(
         [&](const std::string& name) {
-            clientName = name;
             packetsSent = 0;
             bytesSent = 0;
             gui.addLogMessage("Client connected: " + name + " (" + network.getClientAddress() + ")");
             gui.updateApprovedPeers(network.getApprovedPeers());
         },
         [&]() {
-            gui.addLogMessage("Client disconnected: " + clientName);
-            clientName.clear();
+            gui.addLogMessage("Connected phones: " + std::to_string(network.getClientCount()));
         },
         [&](bool paused) {
             gui.addLogMessage(std::string("Stream ") + (paused ? "PAUSED" : "RESUMED"));
         },
         [&](const uint8_t* opusData, int opusLen) {
+            if (!opusData && opusLen == 0) { decoder.reset(); return; }
             float pcmOutput[960];
             int frames = decoder.decode(opusData, opusLen, pcmOutput, 960);
             if (frames > 0) render.pushAudio(pcmOutput, frames);
@@ -279,8 +278,10 @@ int main(int argc, char* argv[]) {
 
         ServerStats stats;
         stats.connected = network.isConnected();
+        stats.clientCount = static_cast<int>(network.getClientCount());
+        stats.micOwner = network.getMicOwnerName();
         stats.paused = network.isPaused();
-        stats.clientName = clientName;
+        stats.clientName = network.getClientNames();
         stats.clientAddress = network.getClientAddress();
         stats.packetsSent = packetsSent;
         stats.bytesSent = bytesSent;

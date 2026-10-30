@@ -457,7 +457,7 @@ function updateStatusCard(s) {
 
     if (s.connected) {
         dot.className = 'status-dot ' + (s.paused ? 'yellow' : 'green');
-        text.textContent = s.paused ? 'Paused' : 'Streaming';
+        text.textContent = s.paused ? 'Paused' : ('Streaming to ' + (s.clientCount || 1) + ((s.clientCount || 1) === 1 ? ' phone' : ' phones'));
         text.style.color = s.paused ? 'var(--yellow)' : 'var(--green)';
         conn.style.display = '';
         disc.style.display = 'none';
@@ -473,7 +473,7 @@ function updateStatusCard(s) {
         }
 
         var clientInfoEl = document.getElementById('clientInfo');
-        clientInfoEl.innerHTML = escapeHtml(s.clientName) + '  \u2022  ' + escapeHtml(s.clientAddress) + badges;
+        clientInfoEl.innerHTML = escapeHtml(s.clientName) + '  \u2022  ' + escapeHtml(s.clientAddress) + badges + '<br><small>Microphone return: ' + escapeHtml(s.micOwner || 'None') + '</small>';
 
         var sendLevel = Math.min(s.peakLevel, 1.0);
         var sendFill = document.getElementById('sendLevelFill');
