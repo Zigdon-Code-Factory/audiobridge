@@ -59,7 +59,9 @@ void main() {
     await emitNative('onFrameSizeUpdate', '2');
     await emitNative('onStreamConfig', '{"jitter":15,"samples":240,"pcm":false}');
     await emitNative('onSettingsUpdate', '12');
-    await emitNative('onPairPending', '');
+    await emitNative('onPairPending', '123456');
+    expect(find.textContaining('Pairing code: 123456'), findsOneWidget);
+    expect(find.textContaining('only if both codes match'), findsOneWidget);
     expect(find.text('Awaiting approval...'), findsOneWidget);
     await tester.pumpWidget(const SizedBox.shrink());
     await tester.pump();

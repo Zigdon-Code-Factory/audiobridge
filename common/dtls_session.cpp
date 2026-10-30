@@ -1,8 +1,6 @@
 #include "dtls_session.h"
 
 #include <mbedtls/error.h>
-#include <mbedtls/base64.h>
-#include <mbedtls/debug.h>
 
 // MBEDTLS_ERR_NET_SEND_FAILED / RECV_FAILED are in net_sockets.h which
 // may not be available on all platforms (e.g. Android NDK). Define fallbacks.
@@ -37,7 +35,7 @@ DtlsSession::~DtlsSession() {
     teardown();
 }
 
-bool DtlsSession::init(int socketFd, const sockaddr_in& peerAddr, PskLookupFn pskLookup) {
+bool DtlsSession::init(DtlsSocket socketFd, const sockaddr_in& peerAddr, PskLookupFn pskLookup) {
     if (initialized_) teardown();
 
     socketFd_ = socketFd;
@@ -49,6 +47,8 @@ bool DtlsSession::init(int socketFd, const sockaddr_in& peerAddr, PskLookupFn ps
     mbedtls_entropy_init(&entropy_);
     mbedtls_ctr_drbg_init(&ctrDrbg_);
     mbedtls_ssl_cookie_init(&cookie_);
+    cookieSetup_ = true;
+    initialized_ = true;
 
     // Seed the DRBG
     const char* pers = "audiobridge_dtls_server";
@@ -75,6 +75,8 @@ bool DtlsSession::init(int socketFd, const sockaddr_in& peerAddr, PskLookupFn ps
 
     // Set cipher suite
     mbedtls_ssl_conf_ciphersuites(&conf_, ciphersuites);
+    mbedtls_ssl_conf_dtls_anti_replay(&conf_, MBEDTLS_SSL_ANTI_REPLAY_ENABLED);
+    mbedtls_ssl_conf_handshake_timeout(&conf_, 250, 2000);
 
     // Set RNG
     mbedtls_ssl_conf_rng(&conf_, mbedtls_ctr_drbg_random, &ctrDrbg_);
@@ -105,7 +107,7 @@ bool DtlsSession::init(int socketFd, const sockaddr_in& peerAddr, PskLookupFn ps
                               mbedtls_timing_get_delay);
 
     // Set BIO callbacks (push model)
-    mbedtls_ssl_set_bio(&ssl_, this, bioSend, nullptr, bioRecv);
+    mbedtls_ssl_set_bio(&ssl_, this, bioSend, bioRecvNonBlocking, nullptr);
 
     // Set client transport ID for cookie verification
     // Use the peer's IP:port as the client ID
@@ -122,7 +124,7 @@ bool DtlsSession::init(int socketFd, const sockaddr_in& peerAddr, PskLookupFn ps
     return true;
 }
 
-bool DtlsSession::initClient(int socketFd, const sockaddr_in& serverAddr,
+bool DtlsSession::initClient(DtlsSocket socketFd, const sockaddr_in& serverAddr,
                                const std::string& identity, const std::vector<uint8_t>& psk) {
     if (initialized_) teardown();
 
@@ -133,7 +135,8 @@ bool DtlsSession::initClient(int socketFd, const sockaddr_in& serverAddr,
     mbedtls_ssl_config_init(&conf_);
     mbedtls_entropy_init(&entropy_);
     mbedtls_ctr_drbg_init(&ctrDrbg_);
-    // NOTE: do NOT call mbedtls_ssl_cookie_init here — cookies are server-only.
+    initialized_ = true;
+    // Cookies are server-only.
     // cookieSetup_ stays false; teardown() will skip mbedtls_ssl_cookie_free().
 
     const char* pers = "audiobridge_dtls_client";
@@ -157,6 +160,8 @@ bool DtlsSession::initClient(int socketFd, const sockaddr_in& serverAddr,
     mbedtls_ssl_conf_min_tls_version(&conf_, MBEDTLS_SSL_VERSION_TLS1_2);
     mbedtls_ssl_conf_max_tls_version(&conf_, MBEDTLS_SSL_VERSION_TLS1_2);
     mbedtls_ssl_conf_ciphersuites(&conf_, ciphersuites);
+    mbedtls_ssl_conf_dtls_anti_replay(&conf_, MBEDTLS_SSL_ANTI_REPLAY_ENABLED);
+    mbedtls_ssl_conf_handshake_timeout(&conf_, 250, 2000);
     mbedtls_ssl_conf_rng(&conf_, mbedtls_ctr_drbg_random, &ctrDrbg_);
 
     // Set PSK directly (client knows its own identity and key)
@@ -194,13 +199,23 @@ bool DtlsSession::initClient(int socketFd, const sockaddr_in& serverAddr,
 
 void DtlsSession::pushReceivedData(const uint8_t* data, size_t len) {
     std::lock_guard<std::mutex> lock(recvMutex_);
-    recvBuf_.assign(data, data + len);
-    recvReady_ = true;
-    recvCv_.notify_one();
+    // Bound memory while preserving datagram boundaries.
+    if (len == 0 || len > 65535 || recvQueue_.size() >= 32) return;
+    recvQueue_.emplace_back(data, data + len);
 }
 
 int DtlsSession::continueHandshake() {
+    if (!initialized_) return -1;
     int ret = mbedtls_ssl_handshake(&ssl_);
+    if (ret == MBEDTLS_ERR_SSL_HELLO_VERIFY_REQUIRED && isServer_) {
+        // A cookie challenge is an expected part of the DTLS handshake.
+        ret = mbedtls_ssl_session_reset(&ssl_);
+        unsigned char clientId[6];
+        memcpy(clientId, &peerAddr_.sin_addr, 4);
+        memcpy(clientId + 4, &peerAddr_.sin_port, 2);
+        if (ret == 0) ret = mbedtls_ssl_set_client_transport_id(&ssl_, clientId, sizeof(clientId));
+        return ret == 0 ? MBEDTLS_ERR_SSL_WANT_READ : ret;
+    }
     if (ret == 0) {
         established_ = true;
         printf("[DTLS] Handshake complete! cipher=%s peer=%s:%d\n",
@@ -292,11 +307,8 @@ void DtlsSession::teardown() {
     // Clear receive buffer
     {
         std::lock_guard<std::mutex> lock(recvMutex_);
-        recvBuf_.clear();
-        recvReady_ = false;
+        recvQueue_.clear();
     }
-    // Wake any blocked bioRecv
-    recvCv_.notify_all();
 
     printf("[DTLS] Session torn down\n");
 }
@@ -317,61 +329,19 @@ int DtlsSession::bioSend(void* ctx, const unsigned char* buf, size_t len) {
 #endif
         return MBEDTLS_ERR_NET_SEND_FAILED;
     }
-    printf("[DTLS] bioSend: sent %zd/%zu bytes (record[0]=0x%02x)\n",
-           sent, len, len > 0 ? buf[0] : 0);
     return (int)sent;
 }
 
-int DtlsSession::bioRecv(void* ctx, unsigned char* buf, size_t len, uint32_t timeout) {
-    auto* self = static_cast<DtlsSession*>(ctx);
-
-    std::unique_lock<std::mutex> lock(self->recvMutex_);
-
-    if (!self->recvReady_) {
-        if (timeout == 0) {
-            // Non-blocking: no data available
-            return MBEDTLS_ERR_SSL_WANT_READ;
-        }
-        // Wait for data up to timeout (server path: data pushed from separate thread)
-        printf("[DTLS] bioRecv: waiting up to %ums for data (server path)\n", timeout);
-        auto waitResult = self->recvCv_.wait_for(lock, std::chrono::milliseconds(timeout),
-                                                  [self] { return self->recvReady_; });
-        if (!waitResult) {
-            printf("[DTLS] bioRecv: timed out after %ums\n", timeout);
-            return MBEDTLS_ERR_SSL_TIMEOUT;
-        }
-    }
-
-    // Copy data from internal buffer
-    size_t copyLen = std::min(len, self->recvBuf_.size());
-    memcpy(buf, self->recvBuf_.data(), copyLen);
-    self->recvBuf_.clear();
-    self->recvReady_ = false;
-
-    printf("[DTLS] bioRecv: delivered %zu bytes (buf[0]=0x%02x)\n",
-           copyLen, copyLen > 0 ? buf[0] : 0);
-    return (int)copyLen;
-}
-
-// Non-blocking recv for client handshake — returns WANT_READ immediately if no data.
-// The handshake loop alternates continueHandshake() / recvfrom()+pushReceivedData()
-// in the same thread, so we must never block here or we'd deadlock.
+// Both peers drive the socket and handshake in one thread. Never block here.
 int DtlsSession::bioRecvNonBlocking(void* ctx, unsigned char* buf, size_t len) {
     auto* self = static_cast<DtlsSession*>(ctx);
-
     std::lock_guard<std::mutex> lock(self->recvMutex_);
-    if (!self->recvReady_) {
-        return MBEDTLS_ERR_SSL_WANT_READ;
-    }
-
-    size_t copyLen = std::min(len, self->recvBuf_.size());
-    memcpy(buf, self->recvBuf_.data(), copyLen);
-    self->recvBuf_.clear();
-    self->recvReady_ = false;
-
-    printf("[DTLS] bioRecvNonBlocking: delivered %zu bytes (buf[0]=0x%02x)\n",
-           copyLen, copyLen > 0 ? buf[0] : 0);
-    return (int)copyLen;
+    if (self->recvQueue_.empty()) return MBEDTLS_ERR_SSL_WANT_READ;
+    auto packet = std::move(self->recvQueue_.front());
+    self->recvQueue_.pop_front();
+    if (packet.size() > len) return MBEDTLS_ERR_SSL_BUFFER_TOO_SMALL;
+    memcpy(buf, packet.data(), packet.size());
+    return static_cast<int>(packet.size());
 }
 
 // --- PSK Callback ---
@@ -400,48 +370,8 @@ int DtlsSession::pskCallback(void* ctx, mbedtls_ssl_context* ssl,
 
 // --- Static Helpers ---
 
-std::string DtlsSession::generatePsk() {
-    mbedtls_entropy_context entropy;
-    mbedtls_ctr_drbg_context ctrDrbg;
-    mbedtls_entropy_init(&entropy);
-    mbedtls_ctr_drbg_init(&ctrDrbg);
-
-    const char* pers = "audiobridge_psk_gen";
-    mbedtls_ctr_drbg_seed(&ctrDrbg, mbedtls_entropy_func, &entropy,
-                           (const unsigned char*)pers, strlen(pers));
-
-    uint8_t key[32];
-    mbedtls_ctr_drbg_random(&ctrDrbg, key, sizeof(key));
-
-    mbedtls_ctr_drbg_free(&ctrDrbg);
-    mbedtls_entropy_free(&entropy);
-
-    return bytesToHex(std::vector<uint8_t>(key, key + sizeof(key)));
-}
-
-std::string DtlsSession::pskToBase64(const std::string& pskHex) {
-    auto bytes = hexToBytes(pskHex);
-    size_t olen = 0;
-    // Get required output length
-    mbedtls_base64_encode(nullptr, 0, &olen, bytes.data(), bytes.size());
-    std::vector<unsigned char> out(olen);
-    mbedtls_base64_encode(out.data(), out.size(), &olen, bytes.data(), bytes.size());
-    return std::string(out.begin(), out.begin() + olen);
-}
-
-std::string DtlsSession::base64ToPskHex(const std::string& b64) {
-    size_t olen = 0;
-    mbedtls_base64_decode(nullptr, 0, &olen,
-                           (const unsigned char*)b64.data(), b64.size());
-    std::vector<unsigned char> out(olen);
-    int ret = mbedtls_base64_decode(out.data(), out.size(), &olen,
-                                     (const unsigned char*)b64.data(), b64.size());
-    if (ret != 0) return "";
-    out.resize(olen);
-    return bytesToHex(std::vector<uint8_t>(out.begin(), out.end()));
-}
-
 std::vector<uint8_t> DtlsSession::hexToBytes(const std::string& hex) {
+    if (hex.size() % 2 != 0) return {};
     std::vector<uint8_t> bytes;
     bytes.reserve(hex.size() / 2);
     for (size_t i = 0; i + 1 < hex.size(); i += 2) {
@@ -452,6 +382,7 @@ std::vector<uint8_t> DtlsSession::hexToBytes(const std::string& hex) {
             if (c >= '0' && c <= '9') byte |= (c - '0');
             else if (c >= 'a' && c <= 'f') byte |= (c - 'a' + 10);
             else if (c >= 'A' && c <= 'F') byte |= (c - 'A' + 10);
+            else return {};
         }
         bytes.push_back(byte);
     }

@@ -28,6 +28,7 @@ class AudioForegroundService : Service() {
     private var serverName: String = "AudioBridge"
     private var isMicMuted: Boolean = false
     private var isPaused: Boolean = false
+    private var mediaPlaying: Boolean = false
 
     companion object {
         const val ACTION_TOGGLE_MIC = "com.audiobridge.ACTION_TOGGLE_MIC"
@@ -40,15 +41,11 @@ class AudioForegroundService : Service() {
         override fun onReceive(context: Context, intent: Intent) {
             when (intent.action) {
                 ACTION_TOGGLE_MIC -> {
-                    isMicMuted = !isMicMuted
-                    updateNotification()
                     Handler(Looper.getMainLooper()).post {
                         MainActivity.methodChannel?.invokeMethod("onMediaAction", "toggleMic")
                     }
                 }
                 ACTION_TOGGLE_PAUSE -> {
-                    isPaused = !isPaused
-                    updateNotification()
                     Handler(Looper.getMainLooper()).post {
                         MainActivity.methodChannel?.invokeMethod("onMediaAction", "togglePause")
                     }
@@ -83,6 +80,7 @@ class AudioForegroundService : Service() {
         if (intent?.action == ACTION_UPDATE_STATE) {
             isMicMuted = intent.getBooleanExtra("micMuted", isMicMuted)
             isPaused = intent.getBooleanExtra("paused", isPaused)
+            mediaPlaying = intent.getBooleanExtra("mediaPlaying", mediaPlaying)
             serverName = intent.getStringExtra("serverName") ?: serverName
             updateNotification()
             return START_NOT_STICKY
@@ -91,6 +89,7 @@ class AudioForegroundService : Service() {
         serverName = intent?.getStringExtra("serverName") ?: "AudioBridge"
         isMicMuted = false
         isPaused = false
+        mediaPlaying = false
 
         val notification = buildNotification()
 
@@ -145,8 +144,8 @@ class AudioForegroundService : Service() {
         val micIcon = if (isMicMuted) android.R.drawable.ic_lock_silent_mode else android.R.drawable.ic_btn_speak_now
         val micLabel = if (isMicMuted) "Mic On" else "Mic Off"
 
-        val pauseIcon = if (isPaused) android.R.drawable.ic_media_play else android.R.drawable.ic_media_pause
-        val pauseLabel = if (isPaused) "Resume" else "Pause"
+        val pauseIcon = if (mediaPlaying) android.R.drawable.ic_media_pause else android.R.drawable.ic_media_play
+        val pauseLabel = if (mediaPlaying) "Pause" else "Play"
 
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle(serverName)

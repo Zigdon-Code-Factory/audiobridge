@@ -13,6 +13,7 @@
 
 #include "audio_capture.h"
 #include "audio_render.h"
+#include "virtual_microphone.h"
 #include "opus_encoder.h"
 #include "opus_decoder.h"
 #include "network.h"
@@ -89,6 +90,7 @@ struct AppSettings {
     int frameSizeMs = 2;           // 2 => 2.5ms (120 samples), 5, 10, or 20 ms
     bool rawPcm = true;            // true = zero-lookahead 16-bit PCM, false = Opus
     bool loopbackMode = true;
+    bool preferNativeMic = true;
     std::string inputDeviceName;   // empty = default
     std::string outputDeviceName;  // empty = default
 };
@@ -127,6 +129,7 @@ static AppSettings loadSettings() {
         else if (key == "mode") { s.loopbackMode = (val != "recording"); }
         else if (key == "input") { s.inputDeviceName = val; }
         else if (key == "output") { s.outputDeviceName = val; }
+        else if (key == "native_mic") { s.preferNativeMic = (val != "0"); }
     }
     return s;
 }
@@ -141,6 +144,7 @@ static void saveSettings(const AppSettings& s) {
     file << "mode=" << (s.loopbackMode ? "loopback" : "recording") << "\n";
     file << "input=" << s.inputDeviceName << "\n";
     file << "output=" << s.outputDeviceName << "\n";
+    file << "native_mic=" << (s.preferNativeMic ? "1" : "0") << "\n";
 }
 
 
@@ -253,6 +257,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         render.start();
     }
 
+    // The service lease lasts for the app lifetime, independently of phone pairing.
+    VirtualMicrophone virtualMic;
+    virtualMic.start();
+    std::atomic<bool> useVirtualMic{false};
+    const std::wstring nativeMicId = L"audiobridge:microphone";
+
     Network network;
     std::atomic<uint64_t> packetsSent{0};
     std::atomic<uint64_t> bytesSent{0};
@@ -341,7 +351,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
             float pcmOutput[960];
             int frames = decoder.decode(opusData, opusLen, pcmOutput, 960);
             if (frames > 0) {
-                render.pushAudio(pcmOutput, frames);
+                if (useVirtualMic.load()) virtualMic.pushAudio(pcmOutput, frames);
+                else render.pushAudio(pcmOutput, frames);
                 // Track mic peak level for UI meter
                 float peak = 0.0f;
                 for (int i = 0; i < frames; i++) {
@@ -352,9 +363,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                 micPeakLevel.store(peak > prev ? peak : prev * 0.85f + peak * 0.15f);
             }
         },
-        [&](const std::string& clientId, const std::string& name) {
+        [&](const std::string& clientId, const std::string& name, const std::string& code) {
+            if (clientId.empty()) { gui.clearPairRequest(); return; }
             gui.addLogMessage("Pair request from: " + name + " (ID: " + clientId + ")");
-            gui.showPairRequest(clientId, name);
+            gui.showPairRequest(clientId, name, code);
         },
         [&](uint8_t cmd) {
             const char* cmdName = "";
@@ -482,6 +494,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     auto refreshOutDeviceList = [&]() {
         auto devs = AudioRender::getDevices();
         std::vector<std::pair<std::wstring, std::wstring>> devList;
+        devList.push_back({nativeMicId, virtualMic.status() == VirtualMicrophone::Status::Ready
+            ? L"AudioBridge Microphone" : L"AudioBridge Microphone (unavailable)"});
         for (const auto& d : devs) {
             devList.push_back({d.first, d.second});
         }
@@ -529,8 +543,17 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     // Helper: reinitialize audio render with error recovery
     auto reinitOutAudio = [&](const std::wstring& deviceId) -> bool {
+        useVirtualMic = deviceId == nativeMicId;
         render.stop();
         render.cleanup();
+
+        if (useVirtualMic.load()) {
+            gui.addLogMessage(virtualMic.status() == VirtualMicrophone::Status::Ready
+                ? "Phone mic routes directly to AudioBridge Microphone. Select it as the input in your other apps."
+                : "AudioBridge Microphone unavailable. Install the signed microphone driver/service, or select a receiving device.");
+            refreshOutDeviceList();
+            return virtualMic.status() == VirtualMicrophone::Status::Ready;
+        }
 
         if (!render.initialize(deviceId)) {
             gui.addLogMessage("ERROR: Failed to init receiving device, trying default...");
@@ -582,9 +605,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     gui.setOutDeviceChangeCallback([&](const std::wstring& deviceId) {
         currentOutDeviceId = deviceId;
+        settings.preferNativeMic = deviceId == nativeMicId;
         gui.addLogMessage("Switching receiving device...");
         reinitOutAudio(deviceId);
-        settings.outputDeviceName.clear();
+        if (deviceId != nativeMicId) settings.outputDeviceName.clear();
         for (const auto& [devId, devName] : AudioRender::getDevices()) {
             if (devId == deviceId) {
                 for (wchar_t wc : devName) settings.outputDeviceName += (wc < 128 ? (char)wc : '?');
@@ -646,10 +670,26 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     auto lastRateTime = startTime;
     uint64_t lastRateBytes = 0;
     double rollingKbps = 0.0;
+    auto lastMicStatus = VirtualMicrophone::Status::Starting;
 
     // Tick callback: performs all periodic work previously in the main loop
     gui.setTickCallback([&]() {
         auto now = std::chrono::steady_clock::now();
+
+        const auto micStatus = virtualMic.status();
+        if (micStatus != lastMicStatus) {
+            lastMicStatus = micStatus;
+            if (micStatus == VirtualMicrophone::Status::Ready && settings.preferNativeMic) {
+                currentOutDeviceId = nativeMicId;
+                reinitOutAudio(nativeMicId);
+            } else if (micStatus == VirtualMicrophone::Status::Unavailable) {
+                gui.addLogMessage("AudioBridge Microphone unavailable (Windows error " +
+                    std::to_string(virtualMic.error()) + "). " +
+                    (useVirtualMic.load() ? "Mic output is silent until it reconnects." :
+                     "Current receiving device remains active; the native microphone needs its signed driver and service."));
+            }
+            refreshOutDeviceList();
+        }
 
         // Handle sending device invalidation
         if (deviceInvalidated.exchange(false)) {
@@ -665,7 +705,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         }
 
         // Handle receiving device invalidation
-        if (outDeviceInvalidated.exchange(false)) {
+        if (outDeviceInvalidated.exchange(false) && !useVirtualMic.load()) {
             if (currentOutDeviceId.empty()) {
                 gui.addLogMessage("Default receiving device changed, reinitializing...");
                 reinitOutAudio(L"");
@@ -835,6 +875,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     render.stop();
     capture.stop();
     network.shutdown();
+    virtualMic.stop();
     CoUninitialize();
     timeEndPeriod(1);
 

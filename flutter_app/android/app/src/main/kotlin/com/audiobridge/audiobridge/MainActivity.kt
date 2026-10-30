@@ -61,6 +61,7 @@ class MainActivity : FlutterActivity() {
     private external fun nativeSetVolume(volume: Float)
     private external fun nativeSetSystemVolume(volume: Float)
     private external fun nativeGetLatencyBreakdown(): DoubleArray
+    private external fun nativeGetAudioState(): DoubleArray
     private external fun nativeGetOutputPeakLevel(): Float
     private external fun nativeGetInputPeakLevel(): Float
 
@@ -349,6 +350,7 @@ class MainActivity : FlutterActivity() {
                             action = AudioForegroundService.ACTION_UPDATE_STATE
                             putExtra("micMuted", args["micMuted"] as? Boolean ?: false)
                             putExtra("paused", args["paused"] as? Boolean ?: false)
+                            putExtra("mediaPlaying", args["mediaPlaying"] as? Boolean ?: false)
                             putExtra("serverName", args["serverName"] as? String ?: "AudioBridge")
                         }
                         startService(updateIntent)
@@ -402,6 +404,16 @@ class MainActivity : FlutterActivity() {
                     result.success(mapOf(
                         "output" to nativeGetOutputPeakLevel().toDouble(),
                         "input" to nativeGetInputPeakLevel().toDouble()
+                    ))
+                }
+                "getAudioState" -> {
+                    val state = nativeGetAudioState()
+                    result.success(mapOf(
+                        "playing" to (state[0] != 0.0),
+                        "recording" to (state[1] != 0.0),
+                        "muted" to (state[2] != 0.0),
+                        "volume" to state[3],
+                        "systemVolume" to state[4]
                     ))
                 }
                 else -> result.notImplemented()

@@ -43,6 +43,7 @@ add_executable(audiobridge WIN32
     src/main.cpp
     src/audio_capture.cpp
     src/audio_render.cpp
+    src/virtual_microphone.cpp
     src/opus_encoder.cpp
     src/opus_decoder.cpp
     src/network.cpp
@@ -66,10 +67,16 @@ target_link_libraries(audiobridge PRIVATE
     avrt
     iphlpapi
     windowsapp
+    advapi32
     mbedtls
     mbedcrypto
     mbedx509
 )
+
+add_executable(audiobridge_mic_service src/mic_service.cpp)
+target_compile_definitions(audiobridge_mic_service PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX _WIN32_WINNT=0x0A00)
+target_link_libraries(audiobridge_mic_service PRIVATE swdevice cfgmgr32 advapi32)
+set_property(TARGET audiobridge_mic_service PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
 target_compile_definitions(audiobridge PRIVATE
     WIN32_LEAN_AND_MEAN

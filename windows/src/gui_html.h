@@ -346,8 +346,10 @@ input[type=range]::-webkit-slider-thumb {
     <div class="card-header">PAIRING REQUEST</div>
     <div class="pair-name" id="pairRequestName"></div>
     <div class="pair-id" id="pairRequestId"></div>
+    <div id="pairCode" style="font-size:28px;letter-spacing:6px;margin:12px 0"></div>
+    <p>Compare this code with your phone. Approve only if both codes match.</p>
     <div class="btn-row">
-        <button class="btn approve" id="btnApprove">Approve</button>
+        <button class="btn approve" id="btnApprove">Codes match — approve</button>
         <button class="btn deny" id="btnDeny">Deny</button>
     </div>
 </div>
@@ -585,6 +587,7 @@ function updatePairRequest(pr) {
     var card = document.getElementById('pairRequestCard');
     if (pr.pending) {
         currentPairId = pr.clientId;
+        document.getElementById('pairCode').textContent = pr.code;
         document.getElementById('pairRequestName').textContent =
             '"' + pr.clientName + '" wants to connect';
         document.getElementById('pairRequestId').textContent =
@@ -597,7 +600,8 @@ function updatePairRequest(pr) {
 }
 
 // Called from C++ via eval for immediate pair request notification
-function showPairRequest(clientId, name) {
+function showPairRequest(clientId, name, code) {
+    document.getElementById('pairCode').textContent = code;
     currentPairId = clientId;
     document.getElementById('pairRequestName').textContent =
         '"' + name + '" wants to connect';

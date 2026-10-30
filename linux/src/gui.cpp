@@ -267,6 +267,7 @@ std::string ServerGui::buildStateJson() {
     s += "\"pairRequest\":{";
     s += "\"pending\":" + std::string(pairRequest_.pending ? "true" : "false") + ",";
     s += "\"clientId\":\"" + escapeJson(pairRequest_.clientId) + "\",";
+    s += "\"code\":\"" + escapeJson(pairRequest_.code) + "\",";
     s += "\"clientName\":\"" + escapeJson(pairRequest_.clientName) + "\"";
     s += "},";
 
@@ -331,17 +332,17 @@ void ServerGui::updateApprovedPeers(const std::map<std::string, ApprovedPeer>& p
     }
 }
 
-void ServerGui::showPairRequest(const std::string& clientId, const std::string& name) {
+void ServerGui::showPairRequest(const std::string& clientId, const std::string& name, const std::string& code) {
     {
         std::lock_guard<std::mutex> lock(dataMutex_);
-        pairRequest_ = {clientId, name, true};
+        pairRequest_ = {clientId, name, code, true};
     }
     // Push immediately via dispatch for responsiveness
     if (webview_) {
         // Use JSON-encoded strings with double quotes for safe JS embedding
-        webview_->dispatch([this, clientId, name] {
+        webview_->dispatch([this, clientId, name, code] {
             webview_->eval("showPairRequest(\"" + escapeJson(clientId) +
-                          "\",\"" + escapeJson(name) + "\")");
+                          "\",\"" + escapeJson(name) + "\",\"" + escapeJson(code) + "\")");
         });
     }
 }

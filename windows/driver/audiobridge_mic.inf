@@ -1,0 +1,87 @@
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = MEDIA
+ClassGuid   = {4d36e96c-e325-11ce-bfc1-08002be10318}
+Provider    = %ProviderName%
+CatalogFile = audiobridge_mic.cat
+DriverVer   = 10/30/2026,1.0.0.0
+PnpLockdown = 1
+
+[SourceDisksNames]
+1 = %DiskName%,,,
+
+[SourceDisksFiles]
+audiobridge_mic.sys = 1
+
+[DestinationDirs]
+DefaultDestDir = 13 ; Run from the Driver Store
+
+[Manufacturer]
+%MfgName% = AudioBridgeMfg,NTamd64.10.0...22000
+
+[AudioBridgeMfg.NTamd64.10.0...22000]
+%DeviceDesc% = AudioBridgeMic_Install, AudioBridge\Microphone
+
+[AudioBridgeMic_Install.NT]
+Include   = ks.inf, wdmaudio.inf
+Needs     = KS.Registration, WDMAUDIO.Registration
+CopyFiles = AudioBridgeMic_CopyFiles
+AddReg    = AudioBridgeMic_AddReg
+
+[AudioBridgeMic_CopyFiles]
+audiobridge_mic.sys
+
+[AudioBridgeMic_AddReg]
+HKR,,AssociatedFilters,,"wdmaud,swmidi,redbook"
+HKR,,Driver,,audiobridge_mic.sys
+HKR,Drivers,SubClasses,,"wave,mixer"
+HKR,Drivers\wave\wdmaud.drv,Driver,,wdmaud.drv
+HKR,Drivers\mixer\wdmaud.drv,Driver,,wdmaud.drv
+HKR,Drivers\wave\wdmaud.drv,Description,,%DeviceDesc%
+HKR,Drivers\mixer\wdmaud.drv,Description,,%DeviceDesc%
+
+[AudioBridgeMic_Install.NT.Interfaces]
+AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_Wave%,     AudioBridgeMic.I.Wave
+AddInterface = %KSCATEGORY_CAPTURE%,   %KSNAME_Wave%,     AudioBridgeMic.I.Wave
+AddInterface = %KSCATEGORY_REALTIME%, %KSNAME_Wave%,     AudioBridgeMic.I.Wave
+AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_Topology%, AudioBridgeMic.I.Topo
+AddInterface = %KSCATEGORY_TOPOLOGY%, %KSNAME_Topology%, AudioBridgeMic.I.Topo
+
+[AudioBridgeMic.I.Wave]
+AddReg = AudioBridgeMic.I.Wave.AddReg
+
+[AudioBridgeMic.I.Wave.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%WaveFriendlyName%
+
+[AudioBridgeMic.I.Topo]
+AddReg = AudioBridgeMic.I.Topo.AddReg
+
+[AudioBridgeMic.I.Topo.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%DeviceDesc%
+
+[AudioBridgeMic_Install.NT.Services]
+AddService = AudioBridgeMic, 0x00000002, AudioBridgeMic_Service_Inst
+
+[AudioBridgeMic_Service_Inst]
+DisplayName    = %ServiceDesc%
+ServiceType    = 1 ; SERVICE_KERNEL_DRIVER
+StartType      = 3 ; SERVICE_DEMAND_START
+ErrorControl   = 1 ; SERVICE_ERROR_NORMAL
+ServiceBinary  = %13%\audiobridge_mic.sys
+
+[Strings]
+ProviderName       = "AudioBridge"
+MfgName            = "AudioBridge"
+DiskName           = "AudioBridge Virtual Audio Installation Media"
+DeviceDesc         = "AudioBridge Microphone"
+WaveFriendlyName   = "AudioBridge Microphone"
+ServiceDesc        = "AudioBridge Microphone Driver"
+Proxy.CLSID        = "{17CCA71B-ECD7-11D0-B908-00A0C9223196}"
+KSCATEGORY_AUDIO   = "{6994AD04-93EF-11D0-A3CC-00A0C9223196}"
+KSCATEGORY_CAPTURE  = "{65E8773D-8F56-11D0-A3B9-00A0C9223196}"
+KSCATEGORY_REALTIME= "{EB115FFC-10C8-4964-831D-6DCB02E6F23F}"
+KSCATEGORY_TOPOLOGY= "{DDA54A40-1E4C-11D1-A050-405705C10000}"
+KSNAME_Wave        = "Wave"
+KSNAME_Topology    = "Topology"

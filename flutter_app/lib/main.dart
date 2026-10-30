@@ -96,6 +96,9 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
   bool _isPaused = false; // stream paused
   bool _isEncrypted = false; // DTLS active
   String _micSource = 'auto'; // 'auto', 'phone', 'bluetooth'
+  bool _micBusy = false;
+  int _connectionEpoch = 0;
+  int _discoveryEpoch = 0;
 
   // Audio level meters
   double _outputLevel = 0.0; // 0.0-1.0 receiving level
@@ -177,6 +180,7 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
                   _nowPlayingPositionMs = (info['p'] as int?) ?? 0;
                   _nowPlayingDurationMs = (info['d'] as int?) ?? 0;
                 });
+                if (_state == ConnectionState_.connected) _updateServiceState();
               }
             }
           } catch (_) {}
@@ -193,7 +197,8 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
           if (mounted) {
             setState(() {
               _state = ConnectionState_.pairPending;
-              _statusMessage = 'Waiting for server approval...';
+              final code = call.arguments as String? ?? '';
+              _statusMessage = 'Pairing code: $code\nApprove on your PC only if both codes match.';
             });
           }
           break;
@@ -256,6 +261,7 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
   }
 
   void _handleNativeDisconnect(String reason) {
+    ++_connectionEpoch;
     _keepaliveTimer?.cancel();
     _keepaliveTimer = null;
     _latencyTimer?.cancel();
@@ -368,7 +374,7 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
       final dir = await _appDir;
       final file = File('${dir.path}/device_name.txt');
       await file.writeAsString(name);
-      setState(() => _deviceName = name);
+      if (mounted) setState(() => _deviceName = name);
     } catch (_) {}
   }
 
@@ -479,18 +485,25 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
       }
     });
     _pulseController.repeat();
+    final epoch = ++_discoveryEpoch;
 
     try {
-      _discoverySocket = await RawDatagramSocket.bind(
+      final socket = await RawDatagramSocket.bind(
         InternetAddress.anyIPv4,
         0,
         reuseAddress: true,
       );
-      _discoverySocket!.broadcastEnabled = true;
+      if (!mounted || epoch != _discoveryEpoch) {
+        socket.close();
+        return;
+      }
+      _discoverySocket = socket;
+      socket.broadcastEnabled = true;
 
-      _discoverySocket!.listen((event) {
+      socket.listen((event) {
+        if (!mounted || epoch != _discoveryEpoch) return;
         if (event == RawSocketEvent.read) {
-          final datagram = _discoverySocket!.receive();
+          final datagram = socket.receive();
           if (datagram != null) {
             final msg = String.fromCharCodes(datagram.data);
             if (msg.startsWith('AB_OFFER|')) {
@@ -532,6 +545,8 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
         }
       });
     } catch (e) {
+      if (!mounted || epoch != _discoveryEpoch) return;
+      _stopDiscovery();
       setState(() {
         _state = ConnectionState_.disconnected;
         _statusMessage = 'Discovery error: $e';
@@ -590,6 +605,7 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
   }
 
   void _stopDiscovery() {
+    ++_discoveryEpoch;
     _discoveryTimer?.cancel();
     _discoveryTimer = null;
     _timeoutTimer?.cancel();
@@ -603,6 +619,8 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
   // --- Connection ---
 
   Future<void> _connectToServer(InternetAddress address, int port, String name, String mac) async {
+    if (_state == ConnectionState_.connecting || _state == ConnectionState_.pairPending) return;
+    final epoch = ++_connectionEpoch;
     setState(() {
       _state = ConnectionState_.connecting;
       _statusMessage = 'Connecting to $name...';
@@ -627,8 +645,9 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
         'deviceId': _deviceId,
         'pskHex': storedPsk,
       });
+      if (!mounted || epoch != _connectionEpoch) return;
 
-      if (result == null || (!result.startsWith('accepted'))) {
+      if (result == null || (result != 'accepted' && !result.startsWith('accepted|'))) {
         String message;
         if (result == 'timeout') {
           message = 'Server did not respond';
@@ -662,19 +681,35 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
       } catch (_) {
         _isEncrypted = false;
       }
+      if (!mounted || epoch != _connectionEpoch) return;
+      if (!_isEncrypted) throw StateError('Encrypted connection required');
 
       // Start audio playback
-      await _channel.invokeMethod('startAudio', {'serverName': name});
+      final started = await _channel.invokeMethod<bool>('startAudio', {'serverName': name});
+      if (!mounted || epoch != _connectionEpoch) return;
+      if (started != true) throw StateError('Could not start audio playback');
+      await _channel.invokeMethod('setVolume', _volume);
+      await _channel.invokeMethod('setMuted', _isMuted);
+      if (!mounted || epoch != _connectionEpoch) return;
 
       // Start mic recording if enabled
       if (_isRecording) {
         try {
-          await _channel.invokeMethod('startRecording', {
+          final recording = await _channel.invokeMethod<bool>('startRecording', {
             'ip': address.address,
             'port': port,
             'micSource': _micSource,
           });
-        } catch (_) {}
+          if (!mounted || epoch != _connectionEpoch) return;
+          _isRecording = recording == true;
+          if (!_isRecording) {
+            ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Microphone could not start. Tap Mic Off to retry.')));
+          }
+        } catch (_) {
+          if (!mounted || epoch != _connectionEpoch) return;
+          _isRecording = false;
+          ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Microphone unavailable. Check microphone permission and try again.')));
+        }
       }
 
       // Record connection with PSK
@@ -727,6 +762,11 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
         } catch (_) {}
       });
     } catch (e) {
+      if (!mounted || epoch != _connectionEpoch) return;
+      for (final method in ['stopRecording', 'stopAudio', 'disconnect']) {
+        try { await _channel.invokeMethod(method); } catch (_) {}
+      }
+      if (!mounted || epoch != _connectionEpoch) return;
       setState(() {
         _state = ConnectionState_.disconnected;
         _statusMessage = 'Connection error: $e';
@@ -852,49 +892,42 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
   // --- Media Controls ---
 
   Future<void> _toggleMic(bool enable) async {
-    setState(() {
-      _isRecording = enable;
-    });
-
-    if (_state != ConnectionState_.connected || _serverAddress.isEmpty) return;
-
-    if (enable) {
-      try {
-        await _channel.invokeMethod('startRecording', {
+    if (_micBusy || _state != ConnectionState_.connected || _serverAddress.isEmpty) return;
+    final epoch = _connectionEpoch;
+    setState(() => _micBusy = true);
+    try {
+      if (enable) {
+        final started = await _channel.invokeMethod<bool>('startRecording', {
           'ip': _serverAddress,
           'port': 4012,
           'micSource': _micSource,
         });
-      } catch (e) {
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text('Failed to start mic: $e')),
-          );
-        }
-      }
-    } else {
-      try {
+        if (started != true) throw StateError('Audio input did not start');
+      } else {
         await _channel.invokeMethod('stopRecording');
-      } catch (_) {}
+      }
+      if (mounted && epoch == _connectionEpoch) setState(() => _isRecording = enable);
+    } catch (e) {
+      if (mounted && epoch == _connectionEpoch) {
+        setState(() => _isRecording = false);
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Failed to start mic: $e')));
+      }
+    } finally {
+      if (mounted) setState(() => _micBusy = false);
+      if (_state == ConnectionState_.connected && epoch == _connectionEpoch) _updateServiceState();
     }
-    _updateServiceState();
   }
 
   Future<void> _switchMicSource(String source) async {
-    if (source == _micSource) return;
+    if (source == _micSource || _micBusy) return;
+    final epoch = _connectionEpoch;
     setState(() {
       _micSource = source;
     });
     // Restart recording with new source if currently recording
     if (_isRecording && _state == ConnectionState_.connected) {
-      try {
-        await _channel.invokeMethod('stopRecording');
-        await _channel.invokeMethod('startRecording', {
-          'ip': _serverAddress,
-          'port': 4012,
-          'micSource': _micSource,
-        });
-      } catch (_) {}
+      await _toggleMic(false);
+      if (mounted && epoch == _connectionEpoch && _state == ConnectionState_.connected) await _toggleMic(true);
     }
   }
 
@@ -945,12 +978,14 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
       _channel.invokeMethod('updateServiceState', {
         'micMuted': !_isRecording,
         'paused': _isPaused,
+        'mediaPlaying': _nowPlayingStatus == 1,
         'serverName': _serverName,
       });
     } catch (_) {}
   }
 
   Future<void> _disconnect() async {
+    ++_connectionEpoch;
     _keepaliveTimer?.cancel();
     _keepaliveTimer = null;
     _latencyTimer?.cancel();
@@ -959,11 +994,9 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
     _timeoutTimer = null;
     _stopDiscovery();
 
-    try {
-      await _channel.invokeMethod('stopRecording');
-      await _channel.invokeMethod('stopAudio');
-      await _channel.invokeMethod('disconnect');
-    } catch (_) {}
+    for (final method in ['stopRecording', 'stopAudio', 'disconnect']) {
+      try { await _channel.invokeMethod(method); } catch (_) {}
+    }
 
     if (mounted) {
       setState(() {
@@ -1146,6 +1179,7 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
 
             // Latency pill (tappable for breakdown)
             GestureDetector(
+              key: const ValueKey('latencyBreakdown'),
               onTap: () => _showLatencyBreakdown(cs),
               child: Container(
                 padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
@@ -1177,6 +1211,7 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
             // Now playing info
             if (_nowPlayingTitle.isNotEmpty) ...[
               GestureDetector(
+              key: const ValueKey('refreshMediaInfo'),
               onTap: _requestMediaInfo,
               child: Container(
                 width: double.infinity,
@@ -1268,6 +1303,7 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
 
                 // Play/Pause button (larger, center)
                 GestureDetector(
+                  key: const ValueKey('mediaPlayPause'),
                   onTap: _mediaPlayPause,
                   child: Container(
                     width: 72,
@@ -1281,7 +1317,8 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
                       ),
                     ),
                     child: Icon(
-                      Icons.play_arrow_rounded,
+                      _nowPlayingStatus == 1 ? Icons.pause_rounded : Icons.play_arrow_rounded,
+                      semanticLabel: _nowPlayingStatus == 1 ? 'Pause media' : 'Play media',
                       size: 36,
                       color: cs.onPrimary,
                     ),
@@ -1317,12 +1354,14 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
             Row(
               children: [
                 GestureDetector(
+                  key: const ValueKey('mutePlayback'),
                   onTap: _toggleMute,
                   child: Icon(
                     _isMuted || _volume == 0.0
                         ? Icons.volume_off_rounded
                         : (_volume < 0.5 ? Icons.volume_down_rounded : Icons.volume_up_rounded),
                     size: 24,
+                    semanticLabel: _isMuted ? 'Unmute playback' : 'Mute playback',
                     color: _isMuted ? cs.onSurface.withOpacity(0.35) : cs.primary,
                   ),
                 ),
@@ -1337,6 +1376,7 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
                       thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 8),
                     ),
                     child: Slider(
+                      key: const ValueKey('playbackVolume'),
                       value: _isMuted ? 0.0 : _volume,
                       onChanged: (v) => _setVolume(v),
                     ),
@@ -1366,6 +1406,7 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
               ),
               child: DropdownButtonHideUnderline(
                 child: DropdownButton<String>(
+                  key: const ValueKey('micSource'),
                   value: _micSource,
                   isDense: true,
                   dropdownColor: cs.surfaceContainerHighest,
@@ -1378,7 +1419,7 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
                     DropdownMenuItem(value: 'bluetooth', child: Text('Mic: Bluetooth')),
                     DropdownMenuItem(value: 'phone', child: Text('Mic: Phone')),
                   ],
-                  onChanged: (v) {
+                  onChanged: _micBusy ? null : (v) {
                     if (v != null) _switchMicSource(v);
                   },
                 ),
@@ -1504,6 +1545,7 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
         Padding(
           padding: const EdgeInsets.symmetric(horizontal: 24),
           child: GestureDetector(
+            key: const ValueKey('editDeviceName'),
             onTap: _showEditDeviceNameDialog,
             child: Container(
               width: double.infinity,
@@ -1533,6 +1575,18 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
         ),
         const SizedBox(height: 16),
 
+        if (!isScanning)
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 16),
+            child: Text(
+              _statusMessage,
+              textAlign: TextAlign.center,
+              style: isPairPending
+                  ? Theme.of(context).textTheme.titleLarge
+                  : Theme.of(context).textTheme.bodyMedium,
+            ),
+          ),
+
         // Scan button
         Padding(
           padding: const EdgeInsets.symmetric(horizontal: 24),
@@ -1540,7 +1594,7 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
             width: double.infinity,
             height: 56,
             child: FilledButton.icon(
-              onPressed: isConnecting ? null : _startDiscovery,
+              onPressed: (isConnecting || isPairPending) ? null : _startDiscovery,
               icon: isScanning
                   ? SizedBox(
                       width: 20,
@@ -1566,7 +1620,7 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
                     : isPairPending
                         ? 'Awaiting approval...'
                         : isScanning
-                            ? 'Scanning...'
+                            ? 'Stop Scanning'
                             : 'Scan for Servers',
                 style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
               ),

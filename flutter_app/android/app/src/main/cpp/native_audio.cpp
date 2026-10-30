@@ -277,6 +277,11 @@ class AudioPlayer : public oboe::AudioStreamDataCallback, public oboe::AudioStre
 public:
     AudioPlayer() : decoder_(nullptr), running_(false), muted_(false), volume_(1.0f), systemVolume_(1.0f) {}
 
+    bool isRunning() const { return running_.load(); }
+    bool isMuted() const { return muted_.load(); }
+    float volume() const { return volume_.load(); }
+    float systemVolume() const { return systemVolume_.load(); }
+
     void setMuted(bool muted) { muted_.store(muted); }
     void setVolume(float vol) { volume_.store(vol < 0.0f ? 0.0f : (vol > 1.0f ? 1.0f : vol)); }
     void setSystemVolume(float vol) { systemVolume_.store(vol < 0.0f ? 0.0f : (vol > 1.0f ? 1.0f : vol)); }
@@ -286,6 +291,8 @@ public:
     }
 
     bool start() {
+        std::lock_guard<std::recursive_mutex> lifecycle(lifecycleMutex_);
+        if (running_) return true;
         int error;
         decoder_ = opus_decoder_create(SAMPLE_RATE, CHANNELS, &error);
         if (error != OPUS_OK || !decoder_) {
@@ -379,6 +386,7 @@ public:
     }
 
     void stop() {
+        std::lock_guard<std::recursive_mutex> lifecycle(lifecycleMutex_);
         running_ = false;
         isExclusiveMmap_.store(false, std::memory_order_relaxed);
         std::shared_ptr<oboe::AudioStream> oldStream;
@@ -400,6 +408,10 @@ public:
     }
 
     void feedPacket(const uint8_t* data, int length) {
+        // Serialize decoder lifetime with start/stop without blocking the receive
+        // worker during device teardown. The real-time output callback never takes this lock.
+        std::unique_lock<std::recursive_mutex> lifecycle(lifecycleMutex_, std::try_to_lock);
+        if (!lifecycle.owns_lock()) return;
         if (!running_ || length < HEADER_SIZE) return;
 
         uint8_t version = data[0];
@@ -664,7 +676,12 @@ public:
         if (error == oboe::Result::ErrorDisconnected) {
             LOGI("Audio device disconnected, restarting stream...");
             // Restart on a new thread — callbacks must not block
-            std::thread([this]() {
+            std::thread([this, stream]() {
+                std::lock_guard<std::recursive_mutex> lifecycle(lifecycleMutex_);
+                {
+                    std::lock_guard<std::mutex> lock(streamMutex_);
+                    if (!running_ || stream_.get() != stream) return;
+                }
                 stop();
                 start();
             }).detach();
@@ -675,6 +692,7 @@ public:
 
 private:
     OpusDecoder* decoder_;
+    std::recursive_mutex lifecycleMutex_;
     mutable std::mutex streamMutex_;
     std::shared_ptr<oboe::AudioStream> stream_;
     JitterBuffer jitterBuffer_;
@@ -710,11 +728,18 @@ private:
 // The server-side Opus decoder must also be configured for mono.
 static constexpr int MIC_CHANNELS = 1;
 
+// Enqueue into the authenticated connection; never perform socket I/O on Oboe.
+static void sendEncryptedMic(const uint8_t* data, size_t len);
+
 class AudioRecorder : public oboe::AudioStreamDataCallback, public oboe::AudioStreamErrorCallback {
 public:
-    AudioRecorder() : encoder_(nullptr), running_(false), socket_(-1), sequence_(0) {}
+    AudioRecorder() : encoder_(nullptr), running_(false), sequence_(0) {}
+
+    bool isRunning() const { return running_.load(); }
 
     bool start(const char* serverIp, int serverPort) {
+        std::lock_guard<std::recursive_mutex> lifecycle(lifecycleMutex_);
+        if (running_) return true;
         // Save connection info for restart on device change
         serverIp_ = serverIp;
         serverPort_ = serverPort;
@@ -725,33 +750,6 @@ public:
         encoder_ = opus_encoder_create(SAMPLE_RATE, MIC_CHANNELS, OPUS_APPLICATION_RESTRICTED_LOWDELAY, &error);
         if (error != OPUS_OK || !encoder_) {
             LOGE("Failed to create Opus encoder: %s", opus_strerror(error));
-            return false;
-        }
-
-        // Configure non-blocking UDP Socket so sendto never stalls Oboe's input callback
-        socket_ = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-        if (socket_ < 0) {
-            LOGE("Failed to create socket for recording");
-            opus_encoder_destroy(encoder_);
-            encoder_ = nullptr;
-            return false;
-        }
-        int flags = fcntl(socket_, F_GETFL, 0);
-        if (flags >= 0) {
-            fcntl(socket_, F_SETFL, flags | O_NONBLOCK);
-        }
-        int tos = 0xB8; // DSCP 46 EF (WMM Voice)
-        setsockopt(socket_, IPPROTO_IP, IP_TOS, &tos, sizeof(tos));
-
-        memset(&serverAddr_, 0, sizeof(serverAddr_));
-        serverAddr_.sin_family = AF_INET;
-        serverAddr_.sin_port = htons(serverPort);
-        if (inet_pton(AF_INET, serverIp, &serverAddr_.sin_addr) <= 0) {
-            LOGE("Invalid server IP address: %s", serverIp);
-            close(socket_);
-            socket_ = -1;
-            opus_encoder_destroy(encoder_);
-            encoder_ = nullptr;
             return false;
         }
 
@@ -809,6 +807,7 @@ public:
     }
 
     void stop() {
+        std::lock_guard<std::recursive_mutex> lifecycle(lifecycleMutex_);
         running_ = false;
         if (stream_) {
             stream_->requestStop();
@@ -825,7 +824,7 @@ public:
             void* audioData,
             int32_t numFrames) override {
 
-        if (!running_ || !encoder_ || socket_ < 0) {
+        if (!running_ || !encoder_) {
             return oboe::DataCallbackResult::Stop;
         }
 
@@ -863,7 +862,7 @@ public:
             while (accumFrames_ >= encodeFrames) {
                 uint8_t packet[1500];
                 int opusLen = opus_encode(encoder_, accumBuf_, encodeFrames,
-                                          packet + HEADER_SIZE, sizeof(packet) - HEADER_SIZE);
+                                          packet + HEADER_SIZE, 1200);
 
                 if (opusLen > 0) {
                     auto now = std::chrono::steady_clock::now();
@@ -880,8 +879,7 @@ public:
                     memcpy(packet + 6, &timestamp, 8);
                     memcpy(packet + 14, &payloadLen, 2);
 
-                    sendto(socket_, packet, HEADER_SIZE + opusLen, MSG_DONTWAIT,
-                           (struct sockaddr*)&serverAddr_, sizeof(serverAddr_));
+                    sendEncryptedMic(packet, HEADER_SIZE + opusLen);
                 }
 
                 int leftover = accumFrames_ - encodeFrames;
@@ -898,7 +896,9 @@ public:
     void onErrorAfterClose(oboe::AudioStream* stream, oboe::Result error) override {
         if (error == oboe::Result::ErrorDisconnected) {
             LOGI("Recording device disconnected, restarting stream...");
-            std::thread([this]() {
+            std::thread([this, stream]() {
+                std::lock_guard<std::recursive_mutex> lifecycle(lifecycleMutex_);
+                if (!running_ || stream_.get() != stream) return;
                 stop();
                 if (!serverIp_.empty()) {
                     start(serverIp_.c_str(), serverPort_);
@@ -906,7 +906,10 @@ public:
             }).detach();
         } else {
             LOGE("Recording stream error: %s", oboe::convertToText(error));
-            stop();
+            std::thread([this, stream]() {
+                std::lock_guard<std::recursive_mutex> lifecycle(lifecycleMutex_);
+                if (stream_.get() == stream) stop();
+            }).detach();
         }
     }
 
@@ -916,17 +919,12 @@ private:
             opus_encoder_destroy(encoder_);
             encoder_ = nullptr;
         }
-        if (socket_ >= 0) {
-            close(socket_);
-            socket_ = -1;
-        }
     }
 
     OpusEncoder* encoder_;
+    std::recursive_mutex lifecycleMutex_;
     std::shared_ptr<oboe::AudioStream> stream_;
     std::atomic<bool> running_;
-    int socket_;
-    struct sockaddr_in serverAddr_;
     std::chrono::steady_clock::time_point streamStart_;
     std::atomic<uint32_t> sequence_;
     int actualChannels_ = MIC_CHANNELS;
@@ -939,6 +937,9 @@ private:
 // --- ConnectionManager (DTLS + Connection Protocol) ---
 
 #include "dtls_session.h"
+#include "secure_pairing.h"
+#include <deque>
+#include <condition_variable>
 #include <mbedtls/error.h>
 
 // Global instances — declared before ConnectionManager so it can use g_player
@@ -966,237 +967,138 @@ public:
         disconnect();
     }
 
-    // Blocking connect — runs on background thread from JNI
-    std::string connect(const char* serverIp, int serverPort,
-                        const char* deviceName, const char* deviceId,
-                        const char* pskHex) {
-        // Ensure any previous session/thread/socket (including timed-out sessions) is joined and closed
+    // Blocking connect runs on the JNI worker, with bounded network deadlines.
+    std::string connect(const char* serverIp, int serverPort, const char* deviceName,
+                        const char* deviceId, const char* pskHex) {
+        cancelled_ = true;
+        std::lock_guard<std::recursive_mutex> lifecycle(lifecycleMutex_);
         disconnect();
-
-        LOGI("[CONN] Connecting to %s:%d as '%s' (id=%s, psk=%s)",
-             serverIp, serverPort, deviceName, deviceId,
-             strlen(pskHex) > 0 ? "present" : "empty");
-
-        // Create UDP socket
+        cancelled_ = false;
+        const std::string name(deviceName), id(deviceId);
+        if (!SecurePairing::validField(name, 128) || !SecurePairing::validField(id, 128))
+            return "error|Invalid device identity";
+        SecurePairing exchange;
+        if (!exchange.generate()) return "error|Key generation failed";
         socket_ = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-        if (socket_ < 0) {
-            LOGE("[CONN] Failed to create socket");
-            return "error|socket_failed";
-        }
-
-        // Enlarge UDP receive buffer to 256 KB and tag outgoing control/ping packets as WMM Voice (DSCP EF 0xB8)
-        int sockBufBytes = 262144;
-        setsockopt(socket_, SOL_SOCKET, SO_RCVBUF, &sockBufBytes, sizeof(sockBufBytes));
-        setsockopt(socket_, SOL_SOCKET, SO_SNDBUF, &sockBufBytes, sizeof(sockBufBytes));
-        int tos = 0xB8;
-        setsockopt(socket_, IPPROTO_IP, IP_TOS, &tos, sizeof(tos));
-
-        memset(&serverAddr_, 0, sizeof(serverAddr_));
+        if (socket_ < 0) return "error|socket_failed";
+        auto fail = [&](const std::string& reason) {
+            dtlsSession_.reset();
+            dtlsActive_ = false;
+            close(socket_);
+            socket_ = -1;
+            return reason;
+        };
+        serverAddr_ = {};
         serverAddr_.sin_family = AF_INET;
         serverAddr_.sin_port = htons(serverPort);
-        if (inet_pton(AF_INET, serverIp, &serverAddr_.sin_addr) <= 0) {
-            LOGE("[CONN] Invalid server IP: %s", serverIp);
-            close(socket_);
-            socket_ = -1;
-            return "error|invalid_ip";
-        }
-
-        // Set receive timeout for blocking recvfrom
-        struct timeval tv;
-        tv.tv_sec = 5;
-        tv.tv_usec = 0;
+        if (inet_pton(AF_INET, serverIp, &serverAddr_.sin_addr) != 1) return fail("error|invalid_ip");
+        int sockBufBytes = 262144, tos = 0xB8;
+        setsockopt(socket_, SOL_SOCKET, SO_RCVBUF, &sockBufBytes, sizeof(sockBufBytes));
+        setsockopt(socket_, SOL_SOCKET, SO_SNDBUF, &sockBufBytes, sizeof(sockBufBytes));
+        setsockopt(socket_, IPPROTO_IP, IP_TOS, &tos, sizeof(tos));
+        timeval tv{0, 100000};
         setsockopt(socket_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-
-        // Send AB_CONNECT
-        std::string connectMsg = std::string("AB_CONNECT|") + deviceName + "|" + deviceId;
-        sendto(socket_, connectMsg.c_str(), connectMsg.size(), 0,
-               (struct sockaddr*)&serverAddr_, sizeof(serverAddr_));
-        LOGI("[CONN] Sent AB_CONNECT (%zu bytes)", connectMsg.size());
-
-        // Wait for response
-        char buf[2048];
-        struct sockaddr_in fromAddr;
-        socklen_t fromLen = sizeof(fromAddr);
-        int received = recvfrom(socket_, buf, sizeof(buf) - 1, 0,
-                                (struct sockaddr*)&fromAddr, &fromLen);
-
-        if (received <= 0) {
-            LOGE("[CONN] No response from server (timeout)");
-            close(socket_);
-            socket_ = -1;
-            return "timeout";
-        }
-
-        buf[received] = '\0';
-        LOGI("[CONN] Got response: '%.*s' (%d bytes)", std::min(received, 100), buf, received);
-
-        if (strncmp(buf, "AB_REJECT", 9) == 0) {
-            std::string reason = received > 10 ? std::string(buf + 10) : "rejected";
-            close(socket_);
-            socket_ = -1;
-            return "rejected|" + reason;
-        }
-
-        if (strncmp(buf, "AB_PAIR_PENDING", 15) == 0) {
-            LOGI("[CONN] Pair pending, notifying UI and waiting...");
-            // Notify Dart via JNI callback
-            notifyDart("onPairPending", "");
-
-            // Wait up to 35 seconds for the actual accept/reject
-            tv.tv_sec = 35;
-            setsockopt(socket_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-
-            received = recvfrom(socket_, buf, sizeof(buf) - 1, 0,
-                                (struct sockaddr*)&fromAddr, &fromLen);
-            if (received <= 0) {
-                close(socket_);
-                socket_ = -1;
-                return "pair_pending";
-            }
-            buf[received] = '\0';
-            LOGI("[CONN] After pair pending, got: '%.*s'", std::min(received, 100), buf);
-
-            if (strncmp(buf, "AB_REJECT", 9) == 0) {
-                std::string reason = received > 10 ? std::string(buf + 10) : "rejected";
-                close(socket_);
-                socket_ = -1;
-                return "rejected|" + reason;
-            }
-        }
-
-        if (strncmp(buf, "AB_ACCEPT", 9) != 0) {
-            LOGE("[CONN] Unexpected response: %s", buf);
-            close(socket_);
-            socket_ = -1;
-            return "error|unexpected_response";
-        }
-
-        // Extract PSK if provided (AB_ACCEPT|<base64_psk>)
-        std::string newPskHex;
-        if (received > 10 && buf[9] == '|') {
-            std::string b64Psk(buf + 10, received - 10);
-            // Trim whitespace
-            while (!b64Psk.empty() && (b64Psk.back() == '\n' || b64Psk.back() == '\r' || b64Psk.back() == '\0'))
-                b64Psk.pop_back();
-            newPskHex = DtlsSession::base64ToPskHex(b64Psk);
-            LOGI("[CONN] Got PSK from server (hex len=%zu)", newPskHex.size());
-        }
-
-        // Determine which PSK to use for DTLS
-        std::string activePsk = newPskHex.empty() ? std::string(pskHex) : newPskHex;
-
-        // DTLS disabled: the server completes its handshake before the client can,
-        // then floods the client with encrypted app-data (type=0x01) which the client
-        // sees instead of handshake records (type=0x16).  Until this race is fixed,
-        // connect unencrypted so both sides agree on the same protocol.
-        if (false && !activePsk.empty()) {
-
-            // Attempt DTLS handshake
-            LOGI("[CONN] Starting DTLS handshake...");
-
-            // Switch to short timeout for DTLS
-            tv.tv_sec = 0;
-            tv.tv_usec = 100000; // 100ms
-            setsockopt(socket_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-
-            try {
-                dtlsSession_ = std::make_unique<DtlsSession>();
-                auto pskBytes = DtlsSession::hexToBytes(activePsk);
-                if (!dtlsSession_->initClient(socket_, serverAddr_, std::string(deviceId), pskBytes)) {
-                    LOGE("[CONN] DTLS init failed");
-                    dtlsSession_.reset();
-                } else {
-                    auto handshakeStart = std::chrono::steady_clock::now();
-                    bool handshakeOk = false;
-                    int totalRecvd = 0;
-                    int totalWantRead = 0;
-
-                    LOGI("[CONN] DTLS handshake loop starting (psk=%zu bytes)", pskBytes.size());
-
-                    for (int attempt = 0; attempt < 500; attempt++) {
-                        int ret = dtlsSession_->continueHandshake();
-                        if (ret == 0) {
-                            handshakeOk = true;
-                            break;
-                        }
-                        if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
-                            char errBuf[128];
-                            mbedtls_strerror(ret, errBuf, sizeof(errBuf));
-                            LOGE("[CONN] DTLS handshake fatal error at attempt %d: -0x%04x (%s)",
-                                 attempt, -ret, errBuf);
-                            break;
-                        }
-                        if (ret == MBEDTLS_ERR_SSL_WANT_READ) totalWantRead++;
-
-                        // Feed incoming DTLS records from the socket
-                        char dtlsBuf[2048];
-                        int n = recvfrom(socket_, dtlsBuf, sizeof(dtlsBuf), 0,
-                                         (struct sockaddr*)&fromAddr, &fromLen);
-                        if (n > 0) {
-                            totalRecvd++;
-                            LOGI("[CONN] DTLS attempt %d: recvfrom got %d bytes (type=0x%02x), feeding to mbedtls",
-                                 attempt, n, (uint8_t)dtlsBuf[0]);
-                            dtlsSession_->pushReceivedData((const uint8_t*)dtlsBuf, n);
-                        } else if (n < 0) {
-                            if (attempt % 20 == 0) {
-                                LOGI("[CONN] DTLS attempt %d: no data yet (wantRead=%d, totalRecvd=%d)",
-                                     attempt, totalWantRead, totalRecvd);
-                            }
-                        }
-
-                        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
-                            std::chrono::steady_clock::now() - handshakeStart).count();
-                        if (elapsed > 10) {
-                            LOGE("[CONN] DTLS handshake timeout (>10s) after %d attempts, recvd=%d packets",
-                                 attempt, totalRecvd);
-                            break;
-                        }
+        auto sendText = [&](const std::string& msg) {
+            sendto(socket_, msg.data(), msg.size(), 0, (sockaddr*)&serverAddr_, sizeof(serverAddr_));
+        };
+        auto receive = [&](uint8_t* data, size_t size) {
+            sockaddr_in from{};
+            socklen_t fromLen = sizeof(from);
+            int n = recvfrom(socket_, data, size, 0, (sockaddr*)&from, &fromLen);
+            return n > 0 && from.sin_addr.s_addr == serverAddr_.sin_addr.s_addr &&
+                from.sin_port == serverAddr_.sin_port ? n : 0;
+        };
+        std::string key = SecurePairing::validStoredKey(pskHex) ? pskHex : "";
+        const std::string hello = "AB_CONNECT2|" + name + "|" + id + "|" +
+            SecurePairing::commitment(name, id, exchange.publicKey()) + "|" + (key.empty() ? "pair" : "resume");
+        sendText(hello);
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        auto retry = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+        std::string serverPublic, newKey;
+        bool accepted = false;
+        uint8_t packet[4096];
+        while (!cancelled_ && std::chrono::steady_clock::now() < deadline) {
+            int n = receive(packet, sizeof(packet));
+            if (n > 0) {
+                const std::string msg(reinterpret_cast<char*>(packet), n);
+                if (msg.rfind("AB_REJECT|", 0) == 0) return fail("rejected|" + msg.substr(10));
+                if (msg.rfind("AB_KEY2|", 0) == 0) {
+                    const auto pub = msg.substr(8);
+                    // Never allow a challenge to change after the public key reveal.
+                    if (!serverPublic.empty() && serverPublic != pub) return fail("error|Pairing key changed");
+                    if (serverPublic.empty()) {
+                        std::string code;
+                        if (!exchange.derive(pub, name, id, false, newKey, code)) return fail("error|Invalid pairing key");
+                        serverPublic = pub;
+                        key = newKey;
+                        notifyDart("onPairPending", code.c_str());
+                        deadline = std::chrono::steady_clock::now() + std::chrono::seconds(35);
                     }
-
-                    if (handshakeOk) {
-                        dtlsActive_ = true;
-                        LOGI("[CONN] DTLS handshake complete — encrypted");
-                    } else {
-                        LOGE("[CONN] DTLS handshake failed, falling back to unencrypted");
-                        try {
-                            if (dtlsSession_) {
-                                dtlsSession_->teardown();
-                            }
-                        } catch (...) {
-                            LOGE("[CONN] Exception during DTLS teardown (ignored)");
-                        }
-                        dtlsSession_.reset();
-                    }
+                    sendText("AB_KEY2|" + exchange.publicKey());
+                } else if (msg == "AB_ACCEPT2") {
+                    if (!SecurePairing::validStoredKey(key)) return fail("error|Pairing required");
+                    accepted = true;
+                    break;
                 }
-            } catch (const std::exception& e) {
-                LOGE("[CONN] DTLS exception: %s", e.what());
-                try { dtlsSession_.reset(); } catch (...) {}
-            } catch (...) {
-                LOGE("[CONN] Unknown DTLS exception");
-                try { dtlsSession_.reset(); } catch (...) {}
+            }
+            if (serverPublic.empty() && std::chrono::steady_clock::now() >= retry) {
+                sendText(hello);
+                retry = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
             }
         }
-
-        // Connection established
-        connected_ = true;
+        if (!accepted) return fail("timeout");
+        dtlsSession_ = std::make_unique<DtlsSession>();
+        if (!dtlsSession_->initClient(socket_, serverAddr_, id, DtlsSession::hexToBytes(key.substr(3))))
+            return fail("dtls_failed");
+        deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        bool ready = false;
+        retry = std::chrono::steady_clock::now();
+        while (!cancelled_ && std::chrono::steady_clock::now() < deadline) {
+            if (!dtlsSession_->isEstablished()) {
+                int ret = dtlsSession_->continueHandshake();
+                if (ret != 0 && ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE)
+                    return fail("dtls_failed");
+            } else {
+                if (std::chrono::steady_clock::now() >= retry) {
+                    if (dtlsSession_->send(reinterpret_cast<const uint8_t*>("AB_READY2"), 9) != 9) return fail("dtls_failed");
+                    retry = std::chrono::steady_clock::now() + std::chrono::milliseconds(250);
+                }
+                uint8_t plain[4096];
+                int n = dtlsSession_->recv(plain, sizeof(plain));
+                if (n == 9 && memcmp(plain, "AB_READY2", 9) == 0) { ready = true; break; }
+                if (n < 0) return fail("dtls_failed");
+            }
+            int n = receive(packet, sizeof(packet));
+            if (n > 0 && packet[0] >= 20 && packet[0] <= 25) dtlsSession_->pushReceivedData(packet, n);
+        }
+        if (!ready || cancelled_) return fail("dtls_failed");
+        dtlsActive_ = true;
         streamStart_ = std::chrono::steady_clock::now();
         lastServerPacket_ = streamStart_;
         sequence_ = 0;
-
-        // Switch to short timeout for recv thread
-        tv.tv_sec = 0;
-        tv.tv_usec = 100000; // 100ms
-        setsockopt(socket_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-
-        // Start recv thread
+        connected_ = true;
+        micThread_ = std::thread(&ConnectionManager::micSendLoop, this);
         recvThread_ = std::thread(&ConnectionManager::recvLoop, this);
+        return newKey.empty() ? "accepted" : "accepted|" + newKey;
+    }
 
-        LOGI("[CONN] Connected! dtls=%s", dtlsActive_ ? "YES" : "NO");
-
-        return newPskHex.empty() ? "accepted" : ("accepted|" + newPskHex);
+    void enqueueMic(const uint8_t* data, size_t len) {
+        if (!connected_ || len > 1500) return;
+        // The real-time callback must never wait for encryption or a network send.
+        std::unique_lock<std::mutex> lock(micMutex_, std::try_to_lock);
+        if (!lock || !connected_ || micCount_ == 8) return;
+        auto& packet = micPackets_[(micHead_ + micCount_) % 8];
+        memcpy(packet.data, data, len);
+        packet.len = len;
+        ++micCount_;
+        micCv_.notify_one();
     }
 
     void disconnect() {
+        // Cancel an in-flight handshake before waiting for its owner. Receive
+        // deadlines are 100 ms, so teardown never frees a live TLS context.
+        cancelled_ = true;
+        std::lock_guard<std::recursive_mutex> lifecycle(lifecycleMutex_);
         const bool wasConnected = connected_.exchange(false);
         const bool hasResources = wasConnected || recvThread_.joinable() || (socket_ >= 0) || (dtlsSession_ != nullptr);
         if (!hasResources) return;
@@ -1211,6 +1113,14 @@ public:
             sendPacket(packet, 17);
         }
 
+        micCv_.notify_all();
+        if (micThread_.joinable()) micThread_.join();
+        {
+            std::lock_guard<std::mutex> lock(micMutex_);
+            micCount_ = 0;
+            micHead_ = 0;
+        }
+
         if (recvThread_.joinable()) {
             if (recvThread_.get_id() == std::this_thread::get_id()) {
                 recvThread_.detach();
@@ -1219,11 +1129,11 @@ public:
             }
         }
 
-        if (dtlsSession_) {
-            dtlsSession_->teardown();
+        {
+            std::lock_guard<std::mutex> lock(dtlsMutex_);
+            dtlsActive_ = false;
             dtlsSession_.reset();
         }
-        dtlsActive_ = false;
 
         if (socket_ >= 0) {
             close(socket_);
@@ -1275,12 +1185,23 @@ private:
     }
 
     void sendPacket(const uint8_t* data, size_t len) {
-        if (dtlsActive_ && dtlsSession_) {
-            std::lock_guard<std::mutex> lock(dtlsMutex_);
-            dtlsSession_->send(data, len);
-        } else {
-            sendto(socket_, data, len, 0,
-                   (struct sockaddr*)&serverAddr_, sizeof(serverAddr_));
+        std::lock_guard<std::mutex> lock(dtlsMutex_);
+        if (dtlsActive_ && dtlsSession_) dtlsSession_->send(data, len);
+    }
+
+    void micSendLoop() {
+        while (connected_) {
+            MicPacket packet;
+            {
+                std::unique_lock<std::mutex> lock(micMutex_);
+                micCv_.wait_for(lock, std::chrono::milliseconds(100), [this] { return !connected_ || micCount_ > 0; });
+                if (!connected_) break;
+                if (micCount_ == 0) continue;
+                packet = micPackets_[micHead_];
+                micHead_ = (micHead_ + 1) % 8;
+                --micCount_;
+            }
+            sendPacket(packet.data, packet.len);
         }
     }
 
@@ -1321,11 +1242,17 @@ private:
             // SCHED_RR requires CAP_SYS_NICE, fall back to nice value
             setpriority(PRIO_PROCESS, 0, -16); // ANDROID_PRIORITY_AUDIO
         }
-        char buf[2048];
+        char buf[4096];
         struct sockaddr_in fromAddr;
         socklen_t fromLen;
 
         while (connected_) {
+            // Unauthenticated traffic must not keep a dead session alive.
+            if (std::chrono::steady_clock::now() - lastServerPacket_ > std::chrono::seconds(5)) {
+                connected_ = false;
+                notifyDart("onDisconnected", "timeout");
+                break;
+            }
             fromLen = sizeof(fromAddr);
             int received = recvfrom(socket_, buf, sizeof(buf), 0,
                                      (struct sockaddr*)&fromAddr, &fromLen);
@@ -1343,7 +1270,8 @@ private:
                 continue;
             }
 
-            lastServerPacket_ = std::chrono::steady_clock::now();
+            if (fromAddr.sin_addr.s_addr != serverAddr_.sin_addr.s_addr ||
+                fromAddr.sin_port != serverAddr_.sin_port) continue;
             uint8_t firstByte = (uint8_t)buf[0];
 
             // DTLS record
@@ -1361,6 +1289,7 @@ private:
                 }
 
                 if (n > 0) {
+                    lastServerPacket_ = std::chrono::steady_clock::now();
                     processPacket(plainBuf, n);
                 } else if (n < 0 && n != MBEDTLS_ERR_SSL_WANT_READ) {
                     LOGE("[RECV] DTLS recv error: -0x%04x", -n);
@@ -1368,16 +1297,16 @@ private:
                     notifyDart("onDisconnected", "dtls_error");
                     break;
                 }
-            } else if (!dtlsActive_ && received >= 16) {
-                // Unencrypted packet
-                processPacket((const uint8_t*)buf, received);
             }
         }
         LOGI("[RECV] Thread exiting");
     }
 
     void processPacket(const uint8_t* data, int len) {
-        if (len < 16) return;
+        if (len < 16 || data[0] != 1) return;
+        uint16_t declaredLen;
+        memcpy(&declaredLen, data + 14, 2);
+        if (len != 16 + declaredLen) return;
 
         uint8_t type = data[1];
 
@@ -1476,6 +1405,14 @@ private:
         }
     }
 
+    std::recursive_mutex lifecycleMutex_;
+    std::atomic<bool> cancelled_{false};
+    struct MicPacket { uint8_t data[1500]; size_t len = 0; };
+    MicPacket micPackets_[8];
+    size_t micHead_ = 0, micCount_ = 0;
+    std::mutex micMutex_;
+    std::condition_variable micCv_;
+    std::thread micThread_;
     int socket_ = -1;
     struct sockaddr_in serverAddr_{};
     std::unique_ptr<DtlsSession> dtlsSession_;
@@ -1493,6 +1430,10 @@ private:
 
 // Global connection manager instance
 static ConnectionManager g_connMgr;
+
+static void sendEncryptedMic(const uint8_t* data, size_t len) {
+    g_connMgr.enqueueMic(data, len);
+}
 
 // Save JVM reference for JNI callbacks
 JNIEXPORT jint JNI_OnLoad(JavaVM* vm, void* reserved) {
@@ -1570,6 +1511,17 @@ JNIEXPORT void JNICALL
 Java_com_audiobridge_audiobridge_MainActivity_nativeSetSystemVolume(
         JNIEnv* env, jobject thiz, jfloat volume) {
     g_player.setSystemVolume(volume);
+}
+
+JNIEXPORT jdoubleArray JNICALL
+Java_com_audiobridge_audiobridge_MainActivity_nativeGetAudioState(JNIEnv* env, jobject) {
+    jdouble values[] = {g_player.isRunning() ? 1.0 : 0.0,
+                       g_recorder.isRunning() ? 1.0 : 0.0,
+                       g_player.isMuted() ? 1.0 : 0.0,
+                       g_player.volume(), g_player.systemVolume()};
+    jdoubleArray result = env->NewDoubleArray(5);
+    if (result) env->SetDoubleArrayRegion(result, 0, 5, values);
+    return result;
 }
 
 JNIEXPORT jdoubleArray JNICALL

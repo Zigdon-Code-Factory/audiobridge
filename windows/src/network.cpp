@@ -1,4 +1,5 @@
 #include "network.h"
+#include "secure_pairing.h"
 #include <cstdio>
 #include <cstring>
 #include <vector>
@@ -28,7 +29,7 @@ Network::~Network() {
     shutdown();
 }
 
-bool Network::initialize(const std::string& serverName) {
+bool Network::initialize(const std::string& serverName, uint16_t discoveryPort, uint16_t streamPort) {
     serverName_ = serverName;
     macAddress_ = getMacAddress();
 
@@ -55,7 +56,7 @@ bool Network::initialize(const std::string& serverName) {
 
     sockaddr_in bindAddr{};
     bindAddr.sin_family = AF_INET;
-    bindAddr.sin_port = htons(4011);
+    bindAddr.sin_port = htons(discoveryPort);
     bindAddr.sin_addr.s_addr = INADDR_ANY;
 
     if (bind(discoverySocket_, (sockaddr*)&bindAddr, sizeof(bindAddr)) == SOCKET_ERROR) {
@@ -72,11 +73,15 @@ bool Network::initialize(const std::string& serverName) {
 
     setsockopt(streamSocket_, SOL_SOCKET, SO_REUSEADDR, (char*)&reuseAddr, sizeof(reuseAddr));
 
-    bindAddr.sin_port = htons(4012);
+    bindAddr.sin_port = htons(streamPort);
     if (bind(streamSocket_, (sockaddr*)&bindAddr, sizeof(bindAddr)) == SOCKET_ERROR) {
         printf("[NET] Failed to bind stream socket on port 4012: %d\n", WSAGetLastError());
         return false;
     }
+
+    int boundLen = sizeof(bindAddr);
+    if (getsockname(streamSocket_, (sockaddr*)&bindAddr, &boundLen) != 0) return false;
+    streamPort_ = ntohs(bindAddr.sin_port);
 
     // Set non-blocking receive timeout on stream socket for keepalive checks
     DWORD timeout = 100; // 100ms
@@ -112,6 +117,7 @@ bool Network::initialize(const std::string& serverName) {
 void Network::shutdown() {
     printf("[NET] shutdown() called, running_=%d\n", running_.load());
     running_ = false;
+    pendingCv_.notify_all();
     if (discoveryThread_.joinable()) discoveryThread_.join();
     if (streamThread_.joinable()) streamThread_.join();
     endDtlsSession();
@@ -149,8 +155,8 @@ void Network::discoveryThread() {
         buf[received] = '\0';
         if (strcmp(buf, "AB_DISCOVER") == 0) {
             char response[512];
-            snprintf(response, sizeof(response), "AB_OFFER|%s|4012|%s",
-                     serverName_.c_str(), macAddress_.c_str());
+            snprintf(response, sizeof(response), "AB_OFFER|%s|%u|%s",
+                     serverName_.c_str(), unsigned(streamPort_), macAddress_.c_str());
 
             sendto(discoverySocket_, response, (int)strlen(response), 0,
                    (sockaddr*)&senderAddr, addrLen);
@@ -163,66 +169,35 @@ void Network::discoveryThread() {
 }
 
 void Network::streamThread() {
-    printf("[NET] Stream thread started (tid=%lu)\n", GetCurrentThreadId());
-    char buf[2048];
+    char buf[4096];
     while (running_) {
         sockaddr_in senderAddr{};
         int addrLen = sizeof(senderAddr);
-
         int received = recvfrom(streamSocket_, buf, sizeof(buf) - 1, 0,
-                                 (sockaddr*)&senderAddr, &addrLen);
-
+                                (sockaddr*)&senderAddr, &addrLen);
         if (received > 0) {
-            uint8_t firstByte = (uint8_t)buf[0];
-
-            // DTLS record (content types 20-25) — feed to DTLS engine
-            bool isDtls;
-            DtlsSession* session;
-            {
-                std::lock_guard<std::mutex> lock(dtlsMutex_);
-                isDtls = dtlsActive_;
-                session = dtlsSession_.get();
-            }
-
-            if (isDtls && session && firstByte >= 20 && firstByte <= 25) {
-                dtlsRecvCount_++;
-                if (dtlsRecvCount_ <= 5 || (dtlsRecvCount_ % 1000) == 0) {
-                    printf("[NET] DTLS record #%d received (%d bytes, type=%d)\n",
-                           dtlsRecvCount_.load(), received, firstByte);
-                }
-
-                // Push data and decrypt under lock
+            if (static_cast<uint8_t>(buf[0]) >= 20 && static_cast<uint8_t>(buf[0]) <= 25) {
+                uint8_t plainBuf[4096];
+                int n = 0;
                 {
                     std::lock_guard<std::mutex> lock(dtlsMutex_);
-                    if (!dtlsSession_) {
-                        printf("[NET] WARN: dtlsSession_ became null between check and use\n");
-                        goto check_timeout;
+                    if (connected_ && dtlsSession_ && dtlsActive_ &&
+                        senderAddr.sin_addr.s_addr == clientAddr_.sin_addr.s_addr &&
+                        senderAddr.sin_port == clientAddr_.sin_port) {
+                        dtlsSession_->pushReceivedData(reinterpret_cast<const uint8_t*>(buf), received);
+                        n = dtlsSession_->recv(plainBuf, sizeof(plainBuf));
                     }
-                    dtlsSession_->pushReceivedData((const uint8_t*)buf, received);
                 }
-
-                uint8_t plainBuf[2048];
-                int n;
-                {
-                    std::lock_guard<std::mutex> lock(dtlsMutex_);
-                    if (!dtlsSession_) {
-                        printf("[NET] WARN: dtlsSession_ null before recv\n");
-                        goto check_timeout;
-                    }
-                    n = dtlsSession_->recv(plainBuf, sizeof(plainBuf));
-                }
-
                 if (n > 0) {
-                    dtlsDecryptCount_++;
-                    if (dtlsDecryptCount_ <= 5 || (dtlsDecryptCount_ % 1000) == 0) {
-                        printf("[NET] Decrypted #%d: %d bytes, pkt type=0x%02X (%s)\n",
-                               dtlsDecryptCount_.load(), n,
-                               n >= 2 ? plainBuf[1] : 0,
-                               n >= 2 ? packetTypeName(plainBuf[1]) : "?");
-                    }
                     lastClientPacket_ = std::chrono::steady_clock::now();
+                    // The client retries READY if our acknowledgement was lost.
+                    if (n == 9 && memcmp(plainBuf, "AB_READY2", 9) == 0) {
+                        sendPacket(reinterpret_cast<const uint8_t*>("AB_READY2"), 9);
+                    }
+                    uint16_t declaredLen = 0;
+                    if (n >= 16) memcpy(&declaredLen, plainBuf + 14, 2);
                     // Process decrypted application data (same as binary packet handling)
-                    if (n >= 16) {
+                    if (n >= 16 && plainBuf[0] == 1 && n == 16 + declaredLen) {
                         uint8_t type = plainBuf[1];
                         if (type == PACKET_CONTROL && n >= 17) {
                             uint8_t cmd = plainBuf[16];
@@ -285,347 +260,122 @@ void Network::streamThread() {
                             }
                         }
                         // PACKET_KEEPALIVE: lastClientPacket_ already updated above
-                    } else {
-                        printf("[NET] WARN: Decrypted packet too short (%d bytes, need >=16)\n", n);
                     }
+
                 } else if (n < 0) {
-                    // DTLS session broken
-                    printf("[NET] DTLS recv error (n=%d), disconnecting\n", n);
-                    {
-                        std::lock_guard<std::mutex> lock(dtlsMutex_);
-                        endDtlsSessionLocked();
-                    }
+                    endDtlsSession();
                     connected_ = false;
                     paused_ = false;
                     if (onDisconnect_) onDisconnect_();
                 }
-                goto check_timeout;
-            }
-
-            // During DTLS handshake (not yet established), feed DTLS records
-            {
-                std::lock_guard<std::mutex> lock(dtlsMutex_);
-                if (dtlsSession_ && !dtlsActive_ && firstByte >= 20 && firstByte <= 25) {
-                    dtlsSession_->pushReceivedData((const uint8_t*)buf, received);
-                    // Handshake is driven by startDtlsHandshake(), not here
-                    goto check_timeout;
+            } else {
+                const std::string request(buf, received);
+                if (request.rfind("AB_CONNECT2|", 0) == 0) {
+                    // An unauthenticated connect must never evict a live session.
+                    if (!connected_) acceptSecureConnection(senderAddr, request);
+                } else if (request.rfind("AB_CONNECT|", 0) == 0) {
+                    const char* reject = "AB_REJECT|Encryption required: update both apps";
+                    sendto(streamSocket_, reject, static_cast<int>(strlen(reject)), 0,
+                           (sockaddr*)&senderAddr, sizeof(senderAddr));
                 }
-            }
-
-            buf[received] = '\0';
-
-            // Check for text control messages
-            if (strncmp(buf, "AB_CONNECT|", 11) == 0) {
-                printf("[NET] ---- AB_CONNECT received (%d bytes) ----\n", received);
-
-                // Disconnect existing client if any
-                if (connected_) {
-                    printf("[NET] Disconnecting existing client before accepting new one\n");
-                    {
-                        std::lock_guard<std::mutex> lock(dtlsMutex_);
-                        endDtlsSessionLocked();
-                    }
-                    connected_ = false;
-                    paused_ = false;
-                    if (onDisconnect_) onDisconnect_();
-                }
-
-                // Parse: AB_CONNECT|<name>|<clientId>
-                std::string payload(buf + 11);
-                std::string clientName = payload;
-                std::string clientId;
-
-                size_t sep = payload.find('|');
-                if (sep != std::string::npos) {
-                    clientName = payload.substr(0, sep);
-                    clientId = payload.substr(sep + 1);
-                }
-
-                // Sanitize: trim trailing whitespace/nulls from clientId
-                while (!clientId.empty() && (clientId.back() == '\0' || clientId.back() == '\n' || clientId.back() == '\r')) {
-                    clientId.pop_back();
-                }
-
-                char senderStr[INET_ADDRSTRLEN];
-                inet_ntop(AF_INET, &senderAddr.sin_addr, senderStr, sizeof(senderStr));
-                printf("[NET] AB_CONNECT from '%s' (id: '%s', len=%zu) at %s:%d\n",
-                       clientName.c_str(), clientId.c_str(), clientId.size(),
-                       senderStr, ntohs(senderAddr.sin_port));
-
-                // Check if this peer is approved
-                if (!clientId.empty() && isPeerApproved(clientId)) {
-                    // Known peer — auto-accept
-                    std::string storedName = getPeerName(clientId);
-                    std::string pskHex = getPeerPsk(clientId);
-                    printf("[NET] Known peer '%s', PSK %s (len=%zu)\n", storedName.c_str(),
-                           pskHex.empty() ? "EMPTY (will generate)" : "present", pskHex.size());
-                    touchPeer(clientId, clientName);
-
-                    {
-                        std::lock_guard<std::mutex> lock(clientMutex_);
-                        clientAddr_ = senderAddr;
-                    }
-                    attachVoiceQosFlow(senderAddr);
-
-                    if (pskHex.empty()) {
-                        pskHex = DtlsSession::generatePsk();
-                        printf("[NET] Generated new PSK for peer %s\n", clientId.c_str());
-                        setPeerPsk(clientId, pskHex);
-                    }
-                    // Always send PSK so client is guaranteed to have it
-                    std::string acceptMsg = "AB_ACCEPT|" + DtlsSession::pskToBase64(pskHex);
-                    sendto(streamSocket_, acceptMsg.c_str(), (int)acceptMsg.size(), 0,
-                           (sockaddr*)&senderAddr, addrLen);
-                    printf("[NET] Sent AB_ACCEPT with PSK to %s (%s), msg len=%zu\n",
-                           storedName.c_str(), clientId.c_str(), acceptMsg.size());
-
-                    // Reset per-connection diagnostic counters
-                    dtlsRecvCount_ = 0;
-                    dtlsDecryptCount_ = 0;
-                    dtlsSendCount_ = 0;
-                    dtlsSendErrCount_ = 0;
-
-                    // Perform DTLS handshake
-                    printf("[NET] Starting DTLS handshake...\n");
-                    if (startDtlsHandshake(senderAddr, clientId)) {
-                        connected_ = true;
-                        paused_ = false;
-                        sequence_ = 0;
-                        streamStart_ = std::chrono::steady_clock::now();
-                        lastClientPacket_ = streamStart_;
-                        printf("[NET] DTLS connected to %s (encrypted)\n", storedName.c_str());
-                        if (onConnect_) onConnect_(storedName);
-                    } else {
-                        // DTLS failed — fall back to unencrypted
-                        printf("[NET] DTLS handshake FAILED, falling back to unencrypted for %s\n", storedName.c_str());
-                        connected_ = true;
-                        paused_ = false;
-                        sequence_ = 0;
-                        streamStart_ = std::chrono::steady_clock::now();
-                        lastClientPacket_ = streamStart_;
-                        if (onConnect_) onConnect_(storedName);
-                    }
-                } else if (clientId.empty()) {
-                    // Legacy client without ID — no DTLS
-                    printf("[NET] Legacy client (no ID), accepting without DTLS\n");
-                    {
-                        std::lock_guard<std::mutex> lock(clientMutex_);
-                        clientAddr_ = senderAddr;
-                    }
-                    attachVoiceQosFlow(senderAddr);
-                    connected_ = true;
-                    paused_ = false;
-                    sequence_ = 0;
-                    streamStart_ = std::chrono::steady_clock::now();
-                    lastClientPacket_ = streamStart_;
-
-                    const char* accept = "AB_ACCEPT";
-                    sendto(streamSocket_, accept, (int)strlen(accept), 0,
-                           (sockaddr*)&senderAddr, addrLen);
-
-                    printf("[NET] Accepted legacy client: %s\n", clientName.c_str());
-                    if (onConnect_) onConnect_(clientName);
-                } else {
-                    // Unknown peer — require approval
-                    printf("[NET] Unknown peer, sending AB_PAIR_PENDING\n");
-                    const char* pending = "AB_PAIR_PENDING";
-                    sendto(streamSocket_, pending, (int)strlen(pending), 0,
-                           (sockaddr*)&senderAddr, addrLen);
-
-                    printf("[NET] New device wants to pair: '%s' (ID: %s)\n",
-                           clientName.c_str(), clientId.c_str());
-
-                    // Set up pending state
-                    {
-                        std::lock_guard<std::mutex> lock(pendingMutex_);
-                        pendingPeer_.clientId = clientId;
-                        pendingPeer_.clientName = clientName;
-                        pendingPeer_.addr = senderAddr;
-                        pendingPeer_.addrLen = addrLen;
-                        pendingPeer_.responded = false;
-                        pendingPeer_.approved = false;
-                    }
-
-                    // Notify via callback (e.g. console prompt)
-                    if (onPairRequest_) {
-                        onPairRequest_(clientId, clientName);
-                    }
-
-                    // Wait for approval (up to 30 seconds)
-                    {
-                        std::unique_lock<std::mutex> lock(pendingMutex_);
-                        pendingCv_.wait_for(lock, std::chrono::seconds(30), [this] {
-                            return pendingPeer_.responded || !running_;
-                        });
-
-                        if (pendingPeer_.responded && pendingPeer_.approved) {
-                            // Generate PSK for new peer
-                            std::string pskHex = DtlsSession::generatePsk();
-                            touchPeer(clientId, clientName);
-                            setPeerPsk(clientId, pskHex);
-
-                            {
-                                std::lock_guard<std::mutex> lock2(clientMutex_);
-                                clientAddr_ = senderAddr;
-                            }
-                            attachVoiceQosFlow(senderAddr);
-
-                            // Send accept with PSK
-                            std::string acceptMsg = "AB_ACCEPT|" + DtlsSession::pskToBase64(pskHex);
-                            sendto(streamSocket_, acceptMsg.c_str(), (int)acceptMsg.size(), 0,
-                                   (sockaddr*)&senderAddr, addrLen);
-
-                            // Reset per-connection diagnostic counters
-                            dtlsRecvCount_ = 0;
-                            dtlsDecryptCount_ = 0;
-                            dtlsSendCount_ = 0;
-                            dtlsSendErrCount_ = 0;
-
-                            // Perform DTLS handshake
-                            printf("[NET] Starting DTLS handshake for new peer...\n");
-                            if (startDtlsHandshake(senderAddr, clientId)) {
-                                connected_ = true;
-                                paused_ = false;
-                                sequence_ = 0;
-                                streamStart_ = std::chrono::steady_clock::now();
-                                lastClientPacket_ = streamStart_;
-                                printf("[NET] DTLS connected to new peer %s\n", clientName.c_str());
-                                if (onConnect_) onConnect_(clientName);
-                            } else {
-                                printf("[NET] DTLS failed, falling back to unencrypted for new peer %s\n", clientName.c_str());
-                                connected_ = true;
-                                paused_ = false;
-                                sequence_ = 0;
-                                streamStart_ = std::chrono::steady_clock::now();
-                                lastClientPacket_ = streamStart_;
-                                if (onConnect_) onConnect_(clientName);
-                            }
-                        } else {
-                            // Rejected or timed out
-                            const char* reject = pendingPeer_.responded
-                                ? "AB_REJECT|Denied by server"
-                                : "AB_REJECT|Approval timed out";
-                            sendto(streamSocket_, reject, (int)strlen(reject), 0,
-                                   (sockaddr*)&senderAddr, addrLen);
-                            printf("[NET] Pair request %s for %s\n",
-                                   pendingPeer_.responded ? "denied" : "timed out",
-                                   clientName.c_str());
-                        }
-                    }
-                }
-                continue;
-            }
-
-            if (strcmp(buf, "AB_DISCONNECT") == 0) {
-                printf("[NET] AB_DISCONNECT received (plaintext)\n");
-                if (connected_) {
-                    {
-                        std::lock_guard<std::mutex> lock(dtlsMutex_);
-                        endDtlsSessionLocked();
-                    }
-                    connected_ = false;
-                    paused_ = false;
-                    if (onDisconnect_) onDisconnect_();
-                }
-                continue;
-            }
-
-            // Unencrypted binary packet from client (legacy mode, no DTLS)
-            if (connected_ && !dtlsActive_ && received >= 16) {
-                // Verify sender IP matches connected client (port may differ for mic socket)
-                bool sameClient;
-                {
-                    std::lock_guard<std::mutex> lock(clientMutex_);
-                    sameClient = (senderAddr.sin_addr.s_addr == clientAddr_.sin_addr.s_addr);
-                }
-                if (!sameClient) continue;
-
-                lastClientPacket_ = std::chrono::steady_clock::now();
-
-                uint8_t type = (uint8_t)buf[1];
-                if (type == PACKET_CONTROL && received >= 17) {
-                    uint8_t cmd = (uint8_t)buf[16];
-                    printf("[NET] Control command (legacy): 0x%02X\n", cmd);
-                    if (cmd == CTRL_PAUSE) {
-                        printf("[NET] -> PAUSE stream\n");
-                        paused_ = true;
-                        if (onPause_) onPause_(true);
-                    } else if (cmd == CTRL_RESUME) {
-                        printf("[NET] -> RESUME stream\n");
-                        paused_ = false;
-                        if (onPause_) onPause_(false);
-                    } else if (cmd == CTRL_DISCONNECT) {
-                        printf("[NET] -> Client requested DISCONNECT (legacy)\n");
-                        connected_ = false;
-                        paused_ = false;
-                        if (onDisconnect_) onDisconnect_();
-                    } else if (cmd >= CTRL_MEDIA_PLAY_PAUSE && cmd <= CTRL_MEDIA_PREV) {
-                        printf("[NET] -> Media command 0x%02X, callback=%s\n", cmd, onMediaCommand_ ? "YES" : "NO");
-                        if (onMediaCommand_) onMediaCommand_(cmd);
-                    } else if (cmd == CTRL_MEDIA_INFO_REQ) {
-                        printf("[NET] -> Media info request\n");
-                        if (onMediaInfoRequest_) onMediaInfoRequest_();
-                    } else {
-                        printf("[NET] -> Unknown control command 0x%02X\n", cmd);
-                    }
-                } else if (type == PACKET_CONTROL && received < 17) {
-                    printf("[NET] Control packet too short: %d bytes (need 17)\n", received);
-                } else if (type == PACKET_MIC_AUDIO && received >= 16) {
-                    uint16_t payloadLen;
-                    memcpy(&payloadLen, buf + 14, 2);
-                    if (payloadLen > 2000) {
-                        printf("[NET] WARN: MIC_AUDIO (legacy): payloadLen=%u is suspiciously large, dropping\n", payloadLen);
-                    } else if (received >= 16 + payloadLen && onMicAudio_) {
-                        onMicAudio_((const uint8_t*)(buf + 16), payloadLen);
-                    }
-                } else if (type == PACKET_KEEPALIVE) {
-                    // Just update lastClientPacket_ (already done above)
-                } else if (type == PACKET_PING) {
-                    // Respond with PONG immediately
-                    uint8_t pong[16];
-                    writeHeader(pong, PACKET_PONG, 0);
-                    // Copy the client's timestamp into pong so they can measure RTT
-                    memcpy(pong + 6, buf + 6, 8);
-                    sendPacket(pong, 16);
-                } else if (type == PACKET_PONG) {
-                    // Client responded to our ping — compute RTT
-                    if (pingPending_) {
-                        auto now = std::chrono::steady_clock::now();
-                        double rtt = std::chrono::duration<double, std::milli>(
-                            now - lastPingSent_).count();
-                        pingPending_ = false;
-                        // EWMA smoothing (alpha = 0.3)
-                        double prev = clientRttMs_.load();
-                        if (prev == 0.0) {
-                            clientRttMs_.store(rtt);
-                        } else {
-                            clientRttMs_.store(prev * 0.7 + rtt * 0.3);
-                        }
-                    }
-                }
+                // Plaintext audio, controls, keepalives and disconnects are discarded.
             }
         }
-
-check_timeout:
-        // Check for client timeout (5 seconds)
-        if (connected_) {
-            auto now = std::chrono::steady_clock::now();
-            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                now - lastClientPacket_).count();
-            if (elapsed > 5000) {
-                printf("[NET] Client timed out (no packets for %lldms)\n", (long long)elapsed);
-                {
-                    std::lock_guard<std::mutex> lock(dtlsMutex_);
-                    endDtlsSessionLocked();
-                }
-                connected_ = false;
-                paused_ = false;
-                printf("[NET] Client disconnected due to timeout\n");
-                if (onDisconnect_) onDisconnect_();
-            }
+        if (connected_ && std::chrono::steady_clock::now() - lastClientPacket_ > std::chrono::seconds(5)) {
+            endDtlsSession();
+            connected_ = false;
+            paused_ = false;
+            if (onDisconnect_) onDisconnect_();
         }
     }
-    printf("[NET] Stream thread exiting\n");
+}
+
+void Network::acceptSecureConnection(const sockaddr_in& peerAddr, const std::string& request) {
+    std::vector<std::string> fields;
+    std::istringstream input(request);
+    std::string field;
+    while (std::getline(input, field, '|')) fields.push_back(field);
+    if (fields.size() != 5 || !SecurePairing::validField(fields[1], 128) ||
+        !SecurePairing::validField(fields[2], 128) || !SecurePairing::validKey(fields[3]) ||
+        (fields[4] != "pair" && fields[4] != "resume")) return;
+    const auto& name = fields[1];
+    const auto& id = fields[2];
+    auto reply = [&](const std::string& text) {
+        sendto(streamSocket_, text.data(), static_cast<int>(text.size()), 0,
+               (const sockaddr*)&peerAddr, sizeof(peerAddr));
+    };
+    std::string key = getPeerPsk(id);
+    const bool pairing = fields[4] == "pair" || !isPeerApproved(id) || !SecurePairing::validStoredKey(key);
+    if (pairing) {
+        SecurePairing exchange;
+        if (!exchange.generate()) { reply("AB_REJECT|Key generation failed"); return; }
+        const std::string challenge = "AB_KEY2|" + exchange.publicKey();
+        reply(challenge);
+        // Retry the same challenge; never change a committed transcript on retry.
+        std::string reveal;
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        auto retry = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+        while (running_ && std::chrono::steady_clock::now() < deadline) {
+            char packet[512];
+            sockaddr_in from{};
+            int fromLen = sizeof(from);
+            int n = recvfrom(streamSocket_, packet, sizeof(packet), 0, (sockaddr*)&from, &fromLen);
+            if (n > 0 && from.sin_addr.s_addr == peerAddr.sin_addr.s_addr && from.sin_port == peerAddr.sin_port) {
+                std::string msg(packet, n);
+                if (msg.rfind("AB_KEY2|", 0) == 0) { reveal = msg.substr(8); break; }
+            }
+            if (std::chrono::steady_clock::now() >= retry) {
+                reply(challenge);
+                retry = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+            }
+        }
+        std::string code;
+        if (reveal.empty() || SecurePairing::commitment(name, id, reveal) != fields[3] ||
+            !exchange.derive(reveal, name, id, true, key, code)) {
+            reply("AB_REJECT|Pairing verification failed"); return;
+        }
+        const std::string approvalToken = id + ":" + exchange.publicKey();
+        {
+            std::lock_guard<std::mutex> lock(pendingMutex_);
+            pendingPeer_.clientId = approvalToken;
+            pendingPeer_.clientName = name;
+            pendingPeer_.responded = false;
+            pendingPeer_.approved = false;
+        }
+        if (onPairRequest_) onPairRequest_(approvalToken, name, code);
+        bool approved = false;
+        {
+            std::unique_lock<std::mutex> lock(pendingMutex_);
+            pendingCv_.wait_for(lock, std::chrono::seconds(30), [this] {
+                return pendingPeer_.responded || !running_;
+            });
+            approved = running_ && pendingPeer_.responded && pendingPeer_.approved;
+            pendingPeer_.clientId.clear(); // Ignore stale approval buttons.
+        }
+        if (onPairRequest_) onPairRequest_("", "", ""); // Dismiss expired/answered prompt.
+        if (!approved) { reply("AB_REJECT|Pairing denied or timed out"); return; }
+    }
+    reply("AB_ACCEPT2");
+    if (!startDtlsHandshake(peerAddr, id, key)) return;
+    // Do not persist a key or mark a peer connected until mutual authentication
+    // and the client's encrypted READY prove possession of the derived key.
+    touchPeer(id, name);
+    setPeerPsk(id, key);
+    {
+        std::lock_guard<std::mutex> lock(clientMutex_);
+        clientAddr_ = peerAddr;
+    }
+    attachVoiceQosFlow(peerAddr);
+    dtlsRecvCount_ = 0;
+    dtlsDecryptCount_ = 0;
+    dtlsSendCount_ = 0;
+    dtlsSendErrCount_ = 0;
+    paused_ = false;
+    sequence_ = 0;
+    streamStart_ = std::chrono::steady_clock::now();
+    lastClientPacket_ = streamStart_;
+    connected_ = true;
+    if (onConnect_) onConnect_(getPeerName(id));
 }
 
 void Network::writeHeader(uint8_t* buf, uint8_t type, uint16_t payloadLen) {
@@ -645,8 +395,7 @@ void Network::writeHeader(uint8_t* buf, uint8_t type, uint16_t payloadLen) {
 
 void Network::sendPacket(const uint8_t* data, size_t len) {
     // Acquires dtlsMutex_ to safely access DTLS state and send.
-    // For unencrypted sends, also reads clientAddr_ under this lock.
-    // Callers should NOT hold clientMutex_ — this method handles all locking.
+    // There is deliberately no plaintext fallback.
     std::lock_guard<std::mutex> lock(dtlsMutex_);
     if (dtlsActive_ && dtlsSession_) {
         dtlsSendCount_++;
@@ -666,18 +415,6 @@ void Network::sendPacket(const uint8_t* data, size_t len) {
                 paused_ = false;
             }
         }
-    } else if (!dtlsActive_) {
-        sockaddr_in addr;
-        {
-            std::lock_guard<std::mutex> cLock(clientMutex_);
-            addr = clientAddr_;
-        }
-        sendto(streamSocket_, (const char*)data, (int)len, 0,
-               (sockaddr*)&addr, sizeof(addr));
-    } else {
-        // dtlsActive_ is true but dtlsSession_ is null — should not happen
-        printf("[NET] BUG: dtlsActive_=true but dtlsSession_=null! Clearing dtlsActive_\n");
-        dtlsActive_ = false;
     }
 }
 
@@ -910,7 +647,7 @@ void Network::loadApprovedPeers() {
     while (std::getline(file, line)) {
         if (line.empty() || line[0] == '#') continue;
 
-        // Format: clientId|clientName|lastConnected(unix)|psk_hex
+        // Format: clientId|clientName|lastConnected(unix)|v2:psk_hex
         std::istringstream iss(line);
         std::string id, name, tsStr, pskHex;
         if (!std::getline(iss, id, '|')) continue;
@@ -918,6 +655,7 @@ void Network::loadApprovedPeers() {
         if (!std::getline(iss, tsStr, '|')) continue;
         std::getline(iss, pskHex, '|'); // Optional 4th field
 
+        if (!SecurePairing::validStoredKey(pskHex)) continue;
         int64_t ts = 0;
         try { ts = std::stoll(tsStr); } catch (...) { continue; }
 
@@ -1002,118 +740,48 @@ void Network::touchPeer(const std::string& clientId, const std::string& clientNa
 
 // --- DTLS ---
 
-bool Network::startDtlsHandshake(const sockaddr_in& clientAddr, const std::string& clientId) {
-    // Disabled temporarily for instant connection testing
-    return false;
-    {
-        std::lock_guard<std::mutex> lock(dtlsMutex_);
-        endDtlsSessionLocked(); // Clean up any existing session
-    }
-
-    auto newSession = std::make_unique<DtlsSession>();
-    connectedClientId_ = clientId;
-
-    auto lookupFn = [this](const std::string& identity, std::vector<uint8_t>& outPsk) -> bool {
-        return pskLookup(identity, outPsk);
-    };
-
-    if (!newSession->init((int)streamSocket_, clientAddr, lookupFn)) {
-        printf("[NET] DTLS init failed\n");
-        connectedClientId_.clear();
-        return false;
-    }
-
-    {
-        std::lock_guard<std::mutex> lock(dtlsMutex_);
-        dtlsSession_ = std::move(newSession);
-    }
-
-    printf("[NET] Waiting for DTLS handshake (timeout=3s)...\n");
-    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
-
-    while (running_) {
-        {
-            std::lock_guard<std::mutex> lock(dtlsMutex_);
-            if (!dtlsSession_) {
-                printf("[NET] DTLS session disappeared during handshake\n");
-                connectedClientId_.clear();
-                return false;
-            }
-            if (dtlsSession_->isEstablished()) {
-                break;
-            }
+bool Network::startDtlsHandshake(const sockaddr_in& peer, const std::string& id,
+                                 const std::string& storedKey) {
+    endDtlsSession();
+    if (!SecurePairing::validStoredKey(storedKey)) return false;
+    auto session = std::make_unique<DtlsSession>();
+    const auto key = DtlsSession::hexToBytes(storedKey.substr(3));
+    if (!session->init(streamSocket_, peer, [id, key](const std::string& identity, std::vector<uint8_t>& out) {
+        if (identity != id) return false;
+        out = key;
+        return true;
+    })) return false;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    auto retry = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+    while (running_ && std::chrono::steady_clock::now() < deadline) {
+        if (!session->isEstablished() && std::chrono::steady_clock::now() >= retry) {
+            sendto(streamSocket_, "AB_ACCEPT2", 10, 0, (const sockaddr*)&peer, sizeof(peer));
+            retry = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
         }
-
-        if (std::chrono::steady_clock::now() > deadline) {
-            printf("[NET] DTLS handshake timed out after 3s\n");
-            std::lock_guard<std::mutex> lock(dtlsMutex_);
-            if (dtlsSession_) {
-                dtlsSession_->teardown();
-                dtlsSession_.reset();
-            }
-            connectedClientId_.clear();
-            return false;
-        }
-
-        // Read a datagram from the socket
-        char buf[2048];
-        sockaddr_in sender{};
-        int slen = sizeof(sender);
-        int n = recvfrom(streamSocket_, buf, sizeof(buf), 0, (sockaddr*)&sender, &slen);
-        if (n <= 0) continue;
-
-        uint8_t firstByte = (uint8_t)buf[0];
-        if (firstByte >= 20 && firstByte <= 25) {
-            std::lock_guard<std::mutex> lock(dtlsMutex_);
-            if (!dtlsSession_) {
-                printf("[NET] DTLS session null during handshake recv\n");
-                connectedClientId_.clear();
-                return false;
-            }
-            // DTLS record — feed to session
-            dtlsSession_->pushReceivedData((const uint8_t*)buf, n);
-            int ret = dtlsSession_->continueHandshake();
-            if (ret == 0) {
-                // Handshake complete
+        if (!session->isEstablished()) {
+            int ret = session->continueHandshake();
+            if (ret != 0 && ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) return false;
+        } else {
+            uint8_t plain[64];
+            int n = session->recv(plain, sizeof(plain));
+            if (n == 9 && memcmp(plain, "AB_READY2", 9) == 0) {
+                if (session->send(plain, n) != n) return false;
+                std::lock_guard<std::mutex> lock(dtlsMutex_);
+                dtlsSession_ = std::move(session);
                 dtlsActive_ = true;
-                printf("[NET] DTLS handshake complete (cipher: negotiated)\n");
+                connectedClientId_ = id;
                 return true;
             }
-            if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
-                printf("[NET] DTLS handshake error: -0x%04X\n", -ret);
-                dtlsSession_->teardown();
-                dtlsSession_.reset();
-                connectedClientId_.clear();
-                return false;
-            }
-        } else if (firstByte == 0x01 && n >= 16 &&
-                   sender.sin_addr.s_addr == clientAddr.sin_addr.s_addr) {
-            printf("[NET] Client started plaintext v1 stream (type=0x%02X), skipping DTLS wait\n",
-                   (uint8_t)buf[1]);
-            std::lock_guard<std::mutex> lock(dtlsMutex_);
-            if (dtlsSession_) {
-                dtlsSession_->teardown();
-                dtlsSession_.reset();
-            }
-            connectedClientId_.clear();
-            return false;
-        } else {
-            printf("[NET] Non-DTLS packet during handshake: firstByte=0x%02X, len=%d, ignoring\n",
-                   firstByte, n);
+            if (n < 0) return false;
         }
-        // Ignore non-DTLS packets during handshake
+        uint8_t packet[4096];
+        sockaddr_in from{};
+        int fromLen = sizeof(from);
+        int n = recvfrom(streamSocket_, reinterpret_cast<char*>(packet), sizeof(packet), 0,
+                         (sockaddr*)&from, &fromLen);
+        if (n > 0 && from.sin_addr.s_addr == peer.sin_addr.s_addr && from.sin_port == peer.sin_port &&
+            packet[0] >= 20 && packet[0] <= 25) session->pushReceivedData(packet, n);
     }
-
-    // Check if handshake completed (loop exited due to isEstablished)
-    {
-        std::lock_guard<std::mutex> lock(dtlsMutex_);
-        if (dtlsSession_ && dtlsSession_->isEstablished()) {
-            dtlsActive_ = true;
-            printf("[NET] DTLS handshake complete\n");
-            return true;
-        }
-    }
-
     return false;
 }
 
@@ -1133,18 +801,6 @@ void Network::endDtlsSessionLocked() {
     }
     dtlsActive_ = false;
     connectedClientId_.clear();
-}
-
-bool Network::pskLookup(const std::string& identity, std::vector<uint8_t>& outPsk) {
-    std::lock_guard<std::mutex> lock(peersMutex_);
-    auto it = approvedPeers_.find(identity);
-    if (it == approvedPeers_.end() || it->second.pskHex.empty()) {
-        printf("[NET] PSK lookup FAILED for identity '%s'\n", identity.c_str());
-        return false;
-    }
-    outPsk = DtlsSession::hexToBytes(it->second.pskHex);
-    printf("[NET] PSK lookup OK for identity '%s' (%zu bytes)\n", identity.c_str(), outPsk.size());
-    return !outPsk.empty();
 }
 
 std::string Network::getPeerPsk(const std::string& clientId) const {

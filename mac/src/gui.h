@@ -31,6 +31,7 @@ struct ServerStats {
 struct PairRequest {
     std::string clientId;
     std::string clientName;
+    std::string code;
     bool pending = false;
 };
 
@@ -54,7 +55,7 @@ public:
     // Update data (thread-safe)
     void updateStats(const ServerStats& stats);
     void updateApprovedPeers(const std::map<std::string, ApprovedPeer>& peers);
-    void showPairRequest(const std::string& clientId, const std::string& name);
+    void showPairRequest(const std::string& clientId, const std::string& name, const std::string& code);
     void clearPairRequest();
     void addLogMessage(const std::string& msg);
     void updateDevices(const std::vector<std::pair<std::wstring, std::wstring>>& devices,

@@ -198,9 +198,10 @@ int main(int argc, char* argv[]) {
             int frames = decoder.decode(opusData, opusLen, pcmOutput, 960);
             if (frames > 0) render.pushAudio(pcmOutput, frames);
         },
-        [&](const std::string& clientId, const std::string& name) {
+        [&](const std::string& clientId, const std::string& name, const std::string& code) {
+            if (clientId.empty()) { gui.clearPairRequest(); return; }
             gui.addLogMessage("Pair request from: " + name + " (ID: " + clientId + ")");
-            gui.showPairRequest(clientId, name);
+            gui.showPairRequest(clientId, name, code);
         },
         [&](uint8_t cmd) {
             const char* cmdName = "";

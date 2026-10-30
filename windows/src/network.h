@@ -53,7 +53,7 @@ struct ApprovedPeer {
     std::string clientId;   // MAC address or UUID
     std::string clientName;
     int64_t lastConnected;  // unix timestamp (seconds)
-    std::string pskHex;     // 64-char hex string, empty for legacy peers
+    std::string pskHex;     // v2: plus 64 hex digits; old exposed keys are rejected
 };
 
 class Network {
@@ -64,7 +64,9 @@ public:
     using MicAudioCallback = std::function<void(const uint8_t* opusData, int opusLen)>;
     // Called when an unknown peer wants to pair. Return value ignored;
     // call approvePeer()/rejectPeer() from any thread.
-    using PairRequestCallback = std::function<void(const std::string& clientId, const std::string& clientName)>;
+    // First argument is an opaque approval token bound to this key exchange;
+    // pass it unchanged to approvePeer/rejectPeer. Empty token dismisses the prompt.
+    using PairRequestCallback = std::function<void(const std::string& clientId, const std::string& clientName, const std::string& code)>;
     using MediaCommandCallback = std::function<void(uint8_t cmd)>;
     using MediaInfoRequestCallback = std::function<void()>;
 
@@ -73,7 +75,8 @@ public:
     Network();
     ~Network();
 
-    bool initialize(const std::string& serverName);
+    bool initialize(const std::string& serverName, uint16_t discoveryPort = 4011, uint16_t streamPort = 4012);
+    uint16_t getStreamPort() const { return streamPort_; }
     void shutdown();
 
     void setCallbacks(ConnectCallback onConnect, DisconnectCallback onDisconnect,
@@ -138,10 +141,10 @@ private:
     static std::string getMacAddress();
 
     // DTLS
-    bool startDtlsHandshake(const sockaddr_in& clientAddr, const std::string& clientId);
+    void acceptSecureConnection(const sockaddr_in& peer, const std::string& request);
+    bool startDtlsHandshake(const sockaddr_in& clientAddr, const std::string& clientId, const std::string& storedKey);
     void endDtlsSession();
     void endDtlsSessionLocked(); // Must be called with dtlsMutex_ held
-    bool pskLookup(const std::string& identity, std::vector<uint8_t>& outPsk);
     std::string getPeerPsk(const std::string& clientId) const;
     void setPeerPsk(const std::string& clientId, const std::string& pskHex);
 
@@ -152,6 +155,7 @@ private:
     void touchPeer(const std::string& clientId, const std::string& clientName);
     std::string getPeersFilePath() const;
 
+    uint16_t streamPort_ = 4012;
     std::string serverName_;
     std::string macAddress_;
     SOCKET discoverySocket_ = INVALID_SOCKET;
@@ -209,7 +213,7 @@ private:
     // DTLS session (protected by dtlsMutex_)
     std::mutex dtlsMutex_;
     std::unique_ptr<DtlsSession> dtlsSession_;
-    bool dtlsActive_ = false;
+    std::atomic<bool> dtlsActive_{false};
     std::string connectedClientId_;
 
     // Per-connection diagnostic counters (reset on each new connection)

@@ -1,5 +1,9 @@
 # AudioBridge Virtual Speakers (`audiobridge_vad.sys`)
 
+For the app-lifetime **AudioBridge Microphone** capture driver, service, build,
+signing status, and validation steps, see [MICROPHONE.md](MICROPHONE.md).
+The speaker/tap driver documented below is independent.
+
 Custom Windows 10/11 **WaveRT Virtual Audio Speaker Driver** that replaces Voicemeeter / VB-Cable and eliminates Windows `audiodg.exe`'s hardcoded `10 ms` (`480`-frame) user-mode loopback APO tap.
 
 ## How It Cuts Capture Latency to 1.0–2.67 ms
