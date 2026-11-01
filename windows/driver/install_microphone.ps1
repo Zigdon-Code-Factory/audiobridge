@@ -1,10 +1,20 @@
 #Requires -RunAsAdministrator
 param(
     [string]$PackagePath = "$PSScriptRoot/build/microphone",
-    [string]$ServicePath = "$PSScriptRoot/../build/secure-release/audiobridge_mic_service.exe"
+    [string]$ServicePath = "",
+    # Accept a package signed by build_microphone.ps1 -TestSign. Requires test
+    # signing to be enabled (enable_test_signing.ps1) and trusts only the
+    # certificate exported next to the package, on this machine.
+    [switch]$TestSigned
 )
 $ErrorActionPreference = "Stop"
 $PackagePath = (Resolve-Path -LiteralPath $PackagePath).Path
+if (-not $ServicePath) {
+    $ServicePath = @("$PSScriptRoot/../build/secure-release/audiobridge_mic_service.exe",
+                     "$PSScriptRoot/../build/Release/audiobridge_mic_service.exe") |
+        Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+    if (-not $ServicePath) { throw "audiobridge_mic_service.exe not found. Build it or pass -ServicePath." }
+}
 $ServicePath = (Resolve-Path -LiteralPath $ServicePath).Path
 $inf = Join-Path $PackagePath "audiobridge_mic.inf"
 $sys = Join-Path $PackagePath "audiobridge_mic.sys"
@@ -15,9 +25,28 @@ foreach ($file in @($inf, $sys, $cat)) {
 $signTool = Get-ChildItem "${env:ProgramFiles(x86)}/Windows Kits/10/bin" -Recurse -Filter signtool.exe |
     Where-Object { $_.FullName -match 'x64' } | Sort-Object FullName -Descending | Select-Object -First 1
 if (-not $signTool) { throw "Windows SDK signtool is required to verify the kernel driver before installation." }
+if ($TestSigned) {
+    $bcd = (& bcdedit.exe /enum "{current}") -join "`n"
+    if ($bcd -notmatch '(?im)^testsigning\s+Yes') {
+        throw "Test signing is not enabled. Run .\enable_test_signing.ps1 and reboot first."
+    }
+    $cer = Join-Path $PackagePath "audiobridge_test.cer"
+    if (-not (Test-Path -LiteralPath $cer -PathType Leaf)) { throw "Missing $cer. Rebuild with build_microphone.ps1 -TestSign." }
+    $certificate = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2 $cer
+    if ($certificate.Subject -ne "CN=AudioBridge Local Test Driver") { throw "Unexpected test certificate: $($certificate.Subject)" }
+    # Root: chain trust for the self-signed cert. TrustedPublisher: no PnP prompt.
+    foreach ($store in @("Root", "TrustedPublisher")) {
+        Import-Certificate -FilePath $cer -CertStoreLocation "Cert:\LocalMachine\$store" | Out-Null
+    }
+    Write-Host "Trusted test certificate $($certificate.Thumbprint) on this machine."
+}
 foreach ($file in @($sys, $inf)) {
-    & $signTool.FullName verify /kp /c $cat $file
-    if ($LASTEXITCODE -ne 0) { throw "Kernel signing verification failed for $file. This installer does not enable test signing." }
+    # /kp = kernel-mode (Microsoft) policy; /pa = Authenticode chain to a trusted root.
+    $policy = if ($TestSigned) { "/pa" } else { "/kp" }
+    & $signTool.FullName verify $policy /c $cat $file
+    if ($LASTEXITCODE -ne 0) {
+        throw "Signature verification failed for $file." + $(if ($TestSigned) { "" } else { " For a self-signed build use -TestSigned." })
+    }
 }
 & pnputil.exe /add-driver $inf /install
 if ($LASTEXITCODE -notin @(0,3010)) { throw "Driver staging failed ($LASTEXITCODE)." }

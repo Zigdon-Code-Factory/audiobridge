@@ -22,6 +22,42 @@ Kernel-driver signing and the hardware validation below are required before
 calling this a working VB-CABLE replacement. No Secure Boot, test-signing,
 certificate-store, installed-driver, or service changes are made by the build.
 
+## Quick setup on your own PC (test-signed, replaces VB-CABLE)
+
+Windows will not load an unsigned kernel driver. Without a Microsoft attestation
+signature, the driver must be self-signed and loaded in Windows test mode.
+
+1. **Turn off Secure Boot.** Back up your BitLocker recovery key
+   (`manage-bde -protectors -get C:`), then run
+   `Suspend-BitLocker -MountPoint C: -RebootCount 1`. Reboot into UEFI firmware
+   settings and disable Secure Boot.
+2. **Enable test signing** (elevated PowerShell), then reboot:
+   ```powershell
+   ./windows/driver/enable_test_signing.ps1
+   ```
+3. **Build** the app, the service, and a test-signed driver. This does not need
+   elevation. The certificate is created in `Cert:\CurrentUser\My`, and its
+   public `.cer` is exported next to the package:
+   ```powershell
+   cmake --build windows/build --config Release --target audiobridge audiobridge_mic_service
+   ./windows/driver/build_microphone.ps1 -TestSign
+   ```
+4. **Install** (elevated). This trusts the exported certificate on this machine
+   only (LocalMachine Root and TrustedPublisher). It then stages the driver and
+   installs the service:
+   ```powershell
+   ./windows/driver/install_microphone.ps1 -TestSigned
+   ```
+5. Start AudioBridge. **AudioBridge Microphone** appears under Windows recording
+   devices while the app runs; select it in Discord, Zoom, or other apps. The app
+   routes phone mic audio to it automatically (the `native_mic=1` setting).
+
+Side effects while test signing is on: Windows shows a "Test Mode" watermark,
+and kernel anti-cheat (Vanguard, FACEIT, Ricochet) may refuse to run. To revert,
+run `./windows/driver/uninstall_microphone.ps1 -RemoveTestCertificate`, then
+`./windows/driver/enable_test_signing.ps1 -Disable`, reboot, and re-enable
+Secure Boot.
+
 ## Behavior
 
 1. AudioBridge opens a local pipe to `AudioBridgeMicService`. The client checks
