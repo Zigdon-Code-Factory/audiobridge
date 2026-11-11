@@ -1,5 +1,11 @@
 # Regression tests
 
+Windows phone microphone effects have a real-model test in the server build:
+`cmake --build windows/build --config Release --target voice_effects_test`, then
+`ctest --test-dir windows/build -C Release -R voice_ --output-on-failure`.
+With Node.js available, this includes the embedded UI's bridge and control-isolation test.
+See [voice effects](../windows/VOICE_EFFECTS.md) for routing and runtime dependencies.
+
 Run native PCM boundary tests with a C++17 compiler and CMake:
 
 ```sh

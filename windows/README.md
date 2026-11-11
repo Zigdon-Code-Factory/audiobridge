@@ -2,12 +2,18 @@
 
 Captures system audio via WASAPI loopback, encodes to Opus, and streams over UDP to an AudioBridge client (e.g., Android app).
 
+For phone microphone noise filtering, recording/playback comparison, and a
+wireless-headset setup using one VB-CABLE, see [Phone headset and voice effects](VOICE_EFFECTS.md).
+The native voice-effects pipeline adapts [Open Broadcast](https://github.com/Zigdon-Code-Factory/open-broadcast).
+
 ## Requirements
 
 - Windows 10 or later
 - CMake 3.20+
 - Visual Studio 2019+ (or Build Tools with MSVC)
 - Git (for FetchContent to download libopus)
+- Python 3 (build-time model downloads only)
+- Windows x64 (the bundled ONNX Runtime package)
 
 ## Build
 

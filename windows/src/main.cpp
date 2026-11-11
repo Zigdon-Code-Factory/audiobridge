@@ -14,6 +14,8 @@
 #include "audio_capture.h"
 #include "audio_render.h"
 #include "virtual_microphone.h"
+#include "voice_effects.h"
+#include <filesystem>
 #include "opus_encoder.h"
 #include "opus_decoder.h"
 #include "network.h"
@@ -86,6 +88,7 @@ static LONG WINAPI CrashHandler(EXCEPTION_POINTERS* ex) {
 // --- Settings persistence ---
 
 struct AppSettings {
+    VoiceSettings voice;
     int jitterBufferMs = 10;
     int frameSizeMs = 2;           // 2 => 2.5ms (120 samples), 5, 10, or 20 ms
     bool rawPcm = true;            // true = zero-lookahead 16-bit PCM, false = Opus
@@ -130,6 +133,7 @@ static AppSettings loadSettings() {
         else if (key == "input") { s.inputDeviceName = val; }
         else if (key == "output") { s.outputDeviceName = val; }
         else if (key == "native_mic") { s.preferNativeMic = (val != "0"); }
+        else if (key == "voice") { s.voice = VoiceSettings::parse(val); }
     }
     return s;
 }
@@ -145,6 +149,7 @@ static void saveSettings(const AppSettings& s) {
     file << "input=" << s.inputDeviceName << "\n";
     file << "output=" << s.outputDeviceName << "\n";
     file << "native_mic=" << (s.preferNativeMic ? "1" : "0") << "\n";
+    file << "voice=" << s.voice.serialize() << "\n";
 }
 
 
@@ -262,6 +267,21 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     virtualMic.start();
     std::atomic<bool> useVirtualMic{false};
     const std::wstring nativeMicId = L"audiobridge:microphone";
+    std::mutex micRouteMutex;
+    const auto voiceModelDir = (std::filesystem::path(getExeDir()) / "voice-models").wstring();
+    VoiceEffects voiceEffects(voiceModelDir, settings.voice, [&](const float* data, unsigned frames) {
+        std::unique_lock<std::mutex> routeLock(micRouteMutex, std::try_to_lock);
+        if (!routeLock.owns_lock()) return;
+        if (useVirtualMic.load()) virtualMic.pushAudio(data, frames);
+        else render.pushAudio(data, frames);
+    });
+    gui.setVoiceChangeCallback([&](const std::string& value) {
+        settings.voice = VoiceSettings::parse(value);
+        voiceEffects.setSettings(settings.voice);
+        saveSettings(settings);
+    });
+    gui.setVoiceRecordCallback([&](bool enabled) { voiceEffects.record(enabled); });
+    gui.setVoiceClipCallback([&](bool processed) { return voiceEffects.clipJson(processed); });
 
     Network network;
     std::atomic<uint64_t> packetsSent{0};
@@ -346,12 +366,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
             gui.addLogMessage(std::string("Stream ") + (paused ? "PAUSED" : "RESUMED"));
         },
         [&](const uint8_t* opusData, int opusLen) {
-            if (!opusData && opusLen == 0) { decoder.reset(); return; }
+            if (!opusData && opusLen == 0) { decoder.reset(); voiceEffects.reset(); return; }
             float pcmOutput[960];
             int frames = decoder.decode(opusData, opusLen, pcmOutput, 960);
             if (frames > 0) {
-                if (useVirtualMic.load()) virtualMic.pushAudio(pcmOutput, frames);
-                else render.pushAudio(pcmOutput, frames);
+                voiceEffects.push(pcmOutput, frames);
                 // Track mic peak level for UI meter
                 float peak = 0.0f;
                 for (int i = 0; i < frames; i++) {
@@ -542,6 +561,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     // Helper: reinitialize audio render with error recovery
     auto reinitOutAudio = [&](const std::wstring& deviceId) -> bool {
+        std::lock_guard<std::mutex> routeLock(micRouteMutex);
         useVirtualMic = deviceId == nativeMicId;
         render.stop();
         render.cleanup();
@@ -710,6 +730,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                 reinitOutAudio(L"");
             } else {
                 gui.addLogMessage("Receiving device disconnected. Select a new device.");
+                std::lock_guard<std::mutex> routeLock(micRouteMutex);
                 render.stop();
                 render.cleanup();
                 refreshOutDeviceList();
@@ -758,6 +779,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
         // Update GUI stats
         ServerStats stats;
+        stats.voiceJson = voiceEffects.stateJson();
         stats.connected = network.isConnected();
         stats.clientCount = static_cast<int>(network.getClientCount());
         stats.micOwner = network.getMicOwnerName();
@@ -873,9 +895,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     mediaThreadRunning = false;
     mediaWakeCv.notify_one();
     mediaInfoThread.join();
-    render.stop();
     capture.stop();
     network.shutdown();
+    voiceEffects.stop();
+    render.stop();
     virtualMic.stop();
     CoUninitialize();
     timeEndPeriod(1);

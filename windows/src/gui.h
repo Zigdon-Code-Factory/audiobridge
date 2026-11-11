@@ -35,6 +35,7 @@ struct ServerStats {
     std::string serverName;
     std::string serverMac;
     double clientRttMs = 0.0;
+    std::string voiceJson = "{}";
 };
 
 struct PairRequest {
@@ -55,6 +56,9 @@ public:
     using DeviceChangeCallback = std::function<void(const std::wstring& deviceId)>;
     using CaptureModeCallback = std::function<void(bool loopback)>;
     using TickCallback = std::function<void()>;
+    using VoiceChangeCallback = std::function<void(const std::string&)>;
+    using VoiceRecordCallback = std::function<void(bool)>;
+    using VoiceClipCallback = std::function<std::string(bool)>;
 
     ServerGui();
     ~ServerGui();
@@ -86,6 +90,9 @@ public:
     void setOutDeviceChangeCallback(DeviceChangeCallback cb) { onOutDeviceChange_ = cb; }
     void setCaptureModeCallback(CaptureModeCallback cb) { onCaptureMode_ = cb; }
     void setTickCallback(TickCallback cb) { onTick_ = cb; }
+    void setVoiceChangeCallback(VoiceChangeCallback cb) { onVoiceChange_ = cb; }
+    void setVoiceRecordCallback(VoiceRecordCallback cb) { onVoiceRecord_ = cb; }
+    void setVoiceClipCallback(VoiceClipCallback cb) { onVoiceClip_ = cb; }
     int getJitterBufferMs() const { return jitterBufferMs_; }
     void setJitterBufferMs(int ms) { jitterBufferMs_ = ms; }
     int getFrameSizeMs() const { return frameSizeMs_; }
@@ -136,4 +143,7 @@ private:
     DeviceChangeCallback onOutDeviceChange_;
     CaptureModeCallback onCaptureMode_;
     TickCallback onTick_;
+    VoiceChangeCallback onVoiceChange_;
+    VoiceRecordCallback onVoiceRecord_;
+    VoiceClipCallback onVoiceClip_;
 };

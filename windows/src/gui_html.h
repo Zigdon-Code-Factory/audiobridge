@@ -1,8 +1,9 @@
 #pragma once
+#include <string>
 
 namespace gui_html {
 
-inline const char* HTML_CONTENT = R"html(
+inline const std::string HTML_CONTENT = std::string(R"html(
 <!DOCTYPE html>
 <html>
 <head>
@@ -212,8 +213,8 @@ input[type=range]::-webkit-slider-thumb {
 .btn.approve:hover { filter: brightness(1.1); }
 .btn.deny { background: var(--red); color: #0f0f14; }
 .btn.deny:hover { filter: brightness(1.1); }
-.btn.frame-btn, .btn.codec-btn { background: #2a2a3a; color: var(--text); border: 1px solid #3a3a4a; padding: 6px 14px; }
-.btn.frame-btn:hover, .btn.codec-btn:hover { background: #3a3a4a; }
+.btn.frame-btn, .btn.codec-btn, .btn.voice-btn { background: #2a2a3a; color: var(--text); border: 1px solid #3a3a4a; padding: 6px 14px; }
+.btn.frame-btn:hover, .btn.codec-btn:hover, .btn.voice-btn:hover { background: #3a3a4a; }
 .btn.frame-btn.active, .btn.codec-btn.active { background: var(--accent); color: #0f0f14; border-color: var(--accent); }
 .peer-item {
     display: flex;
@@ -295,13 +296,60 @@ input[type=range]::-webkit-slider-thumb {
         </select>
     </div>
     <div class="device-row">
-        <label>Sending:</label>
+        <label>PC to phone:</label>
         <select id="deviceSelect"></select>
     </div>
     <div class="device-row">
-        <label>Receiving:</label>
+        <label>Phone mic to PC:</label>
         <select id="outDeviceSelect"></select>
     </div>
+    <details class="dim small" style="margin-top:10px">
+        <summary>Use your phone as a wireless headset</summary>
+        <p>Use Loopback and choose the PC playback device your games and calls use.
+        Enable the microphone in the phone app. Set Phone mic to PC to
+        <b>CABLE Input</b>, then select <b>CABLE Output</b> as the microphone in Discord/Zoom.
+        One VB-CABLE is enough: PC playback travels over Wi-Fi.</p>
+        <p>Keep CABLE Input dedicated to the phone microphone. Do not select it as the
+        sending device or route it back into itself in Voicemeeter. If using Voicemeeter,
+        send PC/game/call playback to a separate bus from the phone microphone.</p>
+        <p>AudioBridge Microphone is an alternative only when its driver and service are
+        installed and working. Extra cables are needed only for additional independent mixes.</p>
+    </details>
+</div>
+
+<div class="card" id="voiceCard">
+    <div class="card-header">PHONE MICROPHONE EFFECTS</div>
+    <div class="device-row">
+        <label><input id="voiceNoise" type="checkbox" checked> Noise removal</label>
+        <select id="voiceStrength" aria-label="Noise removal strength">
+            <option value="6">6 dB</option><option value="10">10 dB</option>
+            <option value="15">15 dB</option><option value="20">20 dB</option>
+            <option value="30">30 dB</option><option value="100" selected>Max</option>
+        </select>
+    </div>
+    <div class="device-row"><label><input id="voiceGate" type="checkbox" checked> Voice gate</label></div>
+    <details>
+)html") + std::string(R"html(        <summary class="dim small">Tune voice gate and rumble</summary>
+        <div class="device-row"><label for="voiceThreshold">Threshold</label>
+            <input id="voiceThreshold" type="range" min="10" max="90" value="50">
+            <span id="voiceThresholdValue">50%</span></div>
+        <div class="device-row"><label for="voiceHold">Hold</label>
+            <input id="voiceHold" type="range" min="100" max="1500" step="100" value="300">
+            <span id="voiceHoldValue">0.3 s</span></div>
+        <label class="dim small"><input id="voiceLowCut" type="checkbox"> Reduce low rumble (80 Hz)</label>
+    </details>
+    <div class="dim small" id="voiceStatus" role="status" style="margin-top:8px">Loading voice models...</div>
+    <div class="sep"></div>
+    <div class="device-row">
+        <button class="btn voice-btn" id="voiceRecord">Record</button>
+        <span class="dim small" id="voiceTime">Up to 10 seconds from the phone mic</span>
+        <select id="voiceSource" aria-label="Recording version">
+            <option value="1">Processed</option><option value="0">Original</option>
+        </select>
+    </div>
+    <audio id="voiceAudio" controls preload="metadata" style="width:100%;margin-top:8px"
+        aria-label="Phone microphone test playback"></audio>
+    <div class="dim small" id="voicePreviewStatus" role="status">Connect your phone, enable its mic, then record and compare.</div>
 </div>
 
 <!-- Streaming Codec Card -->
@@ -503,7 +551,7 @@ function updateStatusCard(s) {
         conn.style.display = 'none';
         disc.style.display = '';
         document.getElementById('serverInfo').textContent =
-            s.serverName + '  \u2022  ' + s.serverMac + (s.kernelTap ? '  \u2022  Kernel Tap Active' : '');
+)html") + std::string(R"html(            s.serverName + '  \u2022  ' + s.serverMac + (s.kernelTap ? '  \u2022  Kernel Tap Active' : '');
     }
 }
 
@@ -625,11 +673,91 @@ var lastJitterMs = -1;
 var lastFrameSizeMs = -1;
 var lastRawPcm = null;
 
+var voiceInitialized = false, voiceRecording = false, voiceRevision = -1;
+var voiceRequest = 0, voiceRenderTimer;
+function voiceLabels() {
+    document.getElementById('voiceThresholdValue').textContent = document.getElementById('voiceThreshold').value + '%';
+    document.getElementById('voiceHoldValue').textContent = (document.getElementById('voiceHold').value / 1000).toFixed(1) + ' s';
+    document.getElementById('voiceStrength').disabled = !document.getElementById('voiceNoise').checked;
+    document.getElementById('voiceThreshold').disabled = !document.getElementById('voiceGate').checked;
+    document.getElementById('voiceHold').disabled = !document.getElementById('voiceGate').checked;
+}
+function voiceChanged() {
+    voiceLabels();
+    clearTimeout(voiceRenderTimer);
+    voiceRenderTimer = setTimeout(function() {
+        var val = [document.getElementById('voiceNoise').checked ? 1 : 0,
+            document.getElementById('voiceStrength').value, document.getElementById('voiceGate').checked ? 1 : 0,
+            document.getElementById('voiceThreshold').value, document.getElementById('voiceHold').value,
+            document.getElementById('voiceLowCut').checked ? 1 : 0].join(' ');
+        window._voiceSettings(val).catch(console.error);
+    }, 250);
+}
+['voiceNoise','voiceStrength','voiceGate','voiceThreshold','voiceHold','voiceLowCut'].forEach(function(id) {
+    document.getElementById(id).addEventListener('input', voiceChanged);
+});
+async function voiceLoadClip() {
+    var request = ++voiceRequest;
+    var audio = document.getElementById('voiceAudio');
+    var position = audio.currentTime || 0, playing = !audio.paused;
+    var result = await window._voiceClip(Number(document.getElementById('voiceSource').value));
+    if (request !== voiceRequest) return;
+    var url = typeof result === 'string' && result.startsWith('data:') ? result :
+        (typeof result === 'string' ? JSON.parse(result) : result);
+    if (!url) { audio.pause(); audio.removeAttribute('src'); audio.load(); return; }
+    audio.src = url;
+    audio.onloadedmetadata = function() {
+        audio.currentTime = Math.min(position, audio.duration || 0);
+        if (playing) audio.play().catch(console.error);
+    };
+    audio.load();
+}
+document.getElementById('voiceSource').addEventListener('change', function() { voiceLoadClip().catch(console.error); });
+document.getElementById('voiceRecord').addEventListener('click', async function() {
+    var button = this;
+    button.disabled = true;
+    try {
+        document.getElementById('voiceAudio').pause();
+        await window._voiceRecord(voiceRecording ? 0 : 1);
+    } finally { button.disabled = false; }
+});
+function updateVoice(s) {
+    var v = s.voice;
+    if (!v || !v.settings) return;
+    if (!voiceInitialized) {
+        var fields = v.settings.split(' ').map(Number);
+        document.getElementById('voiceNoise').checked = !!fields[0];
+        document.getElementById('voiceStrength').value = fields[1];
+        document.getElementById('voiceGate').checked = !!fields[2];
+        document.getElementById('voiceThreshold').value = fields[3];
+        document.getElementById('voiceHold').value = fields[4];
+        document.getElementById('voiceLowCut').checked = !!fields[5];
+        voiceInitialized = true; voiceLabels();
+    }
+    voiceRecording = v.recording;
+    document.getElementById('voiceAudio').controls = !v.recording;
+    if (v.recording) document.getElementById('voiceAudio').pause();
+    document.getElementById('voiceRecord').textContent = v.recording ? 'Stop' : 'Record';
+    document.getElementById('voiceRecord').disabled = !v.recording && !s.connected;
+    document.getElementById('voiceSource').disabled = v.recording;
+    document.getElementById('voiceTime').textContent = v.duration.toFixed(1) + ' / 10 s';
+    document.getElementById('voiceStatus').textContent = v.error ? 'Effects unavailable; phone mic passes through. ' + v.error :
+        (v.ready ? 'DeepFilterNet + Silero. Noise removal adds 32 ms model delay plus buffering.' : 'Loading voice models...');
+    document.getElementById('voicePreviewStatus').textContent = v.previewError ? 'Could not process recording: ' + v.previewError :
+        (v.recording ? 'Recording phone mic. Speak normally with your usual background noise.' :
+        (v.rendering ? 'Applying effects...' : (v.duration > 0 ? 'Compare Original / Processed. Plays on your PC default output.' :
+        'Connect your phone, enable its mic, then record and compare.')));
+    if (voiceRevision !== v.revision && !v.recording) {
+        voiceRevision = v.revision;
+        voiceLoadClip().catch(console.error);
+    }
+}
 async function tick() {
     try {
         var result = await window._tick();
         var s = (typeof result === 'string') ? JSON.parse(result) : result;
         updateStatusCard(s);
+        updateVoice(s);
         updatePairRequest(s.pairRequest);
         updatePeers(s.peers);
         updateLogs(s.logs);
@@ -644,7 +772,7 @@ async function tick() {
             }
         }
         if (s.frameSizeMs !== undefined && s.frameSizeMs !== lastFrameSizeMs) {
-            lastFrameSizeMs = s.frameSizeMs;
+)html") + std::string(R"html(            lastFrameSizeMs = s.frameSizeMs;
             document.querySelectorAll('.frame-btn').forEach(function(b) {
                 b.classList.toggle('active', parseInt(b.getAttribute('data-ms')) === s.frameSizeMs);
             });
@@ -668,6 +796,6 @@ setInterval(tick, 50);
 
 </body>
 </html>
-)html";
+)html");
 
 } // namespace gui_html

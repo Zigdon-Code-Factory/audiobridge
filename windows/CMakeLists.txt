@@ -39,6 +39,8 @@ set(WEBVIEW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(WEBVIEW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(webview)
 
+include(voice_effects.cmake)
+
 add_executable(audiobridge WIN32
     src/main.cpp
     src/audio_capture.cpp
@@ -59,6 +61,7 @@ target_include_directories(audiobridge PRIVATE
 )
 
 target_link_libraries(audiobridge PRIVATE
+    audiobridge_voice
     opus
     webview::core
     ws2_32
@@ -72,6 +75,20 @@ target_link_libraries(audiobridge PRIVATE
     mbedcrypto
     mbedx509
 )
+
+copy_voice_runtime(audiobridge)
+
+enable_testing()
+add_executable(voice_effects_test ../tests/voice_effects_test.cpp)
+target_link_libraries(voice_effects_test PRIVATE audiobridge_voice)
+target_compile_options(voice_effects_test PRIVATE /UNDEBUG)
+copy_voice_runtime(voice_effects_test)
+add_test(NAME voice_effects COMMAND voice_effects_test "$<TARGET_FILE_DIR:voice_effects_test>/voice-models")
+set_tests_properties(voice_effects PROPERTIES TIMEOUT 60)
+find_program(NODE_EXECUTABLE node)
+if(NODE_EXECUTABLE)
+    add_test(NAME voice_ui COMMAND "${NODE_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/../tests/voice_ui_test.cjs")
+endif()
 
 add_executable(audiobridge_mic_service src/mic_service.cpp)
 target_compile_definitions(audiobridge_mic_service PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX _WIN32_WINNT=0x0A00)

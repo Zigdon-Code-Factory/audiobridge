@@ -137,6 +137,17 @@ void ServerGui::run() {
 // ---- Bindings ----
 
 void ServerGui::setupBindings() {
+    webview_->bind("_voiceSettings", [this](const std::string& args) -> std::string {
+        if (onVoiceChange_) onVoiceChange_(parseFirstString(args));
+        return "{}";
+    });
+    webview_->bind("_voiceRecord", [this](const std::string& args) -> std::string {
+        if (onVoiceRecord_) onVoiceRecord_(parseFirstInt(args) != 0);
+        return "{}";
+    });
+    webview_->bind("_voiceClip", [this](const std::string& args) -> std::string {
+        return onVoiceClip_ ? onVoiceClip_(parseFirstInt(args) != 0) : "null";
+    });
     // _tick: called every 50ms by JS setInterval
     webview_->bind("_tick", [this](const std::string& /*args*/) -> std::string {
         if (onTick_) onTick_();
@@ -275,6 +286,7 @@ std::string ServerGui::buildStateJson() {
     std::string s;
     s.reserve(2048);
     s += "{";
+    s += "\"voice\":" + stats_.voiceJson + ",";
     s += "\"connected\":" + std::string(stats_.connected ? "true" : "false") + ",";
     s += "\"micOwner\":\"" + escapeJson(stats_.micOwner) + "\",";
     s += "\"clientCount\":" + std::to_string(stats_.clientCount) + ",";
