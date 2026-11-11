@@ -104,6 +104,11 @@ bool Network::initialize(const std::string& serverName, uint16_t discoveryPort, 
     sessions_ = std::make_unique<SecureServer>(streamSocket_, [this](const std::string& id) {
         return isPeerApproved(id) ? getPeerPsk(id) : "";
     });
+    sessions_->enableControls([this](const std::string& id, const std::string& key) {
+        std::lock_guard<std::mutex> lock(peersMutex_);
+        const auto found = approvedPeers_.find(id);
+        return found != approvedPeers_.end() && found->second.pskHex == key && found->second.admin;
+    });
     running_ = true;
     discoveryThread_ = std::thread(&Network::discoveryThread, this);
     streamThread_ = std::thread(&Network::streamThread, this);
@@ -123,6 +128,10 @@ void Network::shutdown() {
     running_ = false;
     if (discoveryThread_.joinable()) discoveryThread_.join();
     if (streamThread_.joinable()) streamThread_.join();
+    {
+        std::lock_guard<std::mutex> lock(controlsMutex_);
+        controls_.clear();
+    }
     if (sessions_) sessions_->close();
     detachVoiceQosFlow();
     if (qosHandle_) {
@@ -237,6 +246,8 @@ void Network::loadApprovedPeers() {
         if (!std::getline(iss, name, '|')) continue;
         if (!std::getline(iss, tsStr, '|')) continue;
         std::getline(iss, pskHex, '|'); // Optional 4th field
+        std::string role;
+        std::getline(iss, role, '|');
 
         if (!SecurePairing::validStoredKey(pskHex)) continue;
         int64_t ts = 0;
@@ -253,6 +264,7 @@ void Network::loadApprovedPeers() {
         peer.clientName = name;
         peer.lastConnected = ts;
         peer.pskHex = pskHex;
+        peer.admin = RemoteControl::storedAdmin(role);
         approvedPeers_[id] = peer;
         loaded++;
     }
@@ -268,23 +280,28 @@ void Network::loadApprovedPeers() {
     }
 }
 
-void Network::saveApprovedPeers() {
+bool Network::saveApprovedPeers() {
     // Must be called with peersMutex_ held, OR hold it here
     // We'll try-lock to avoid deadlocks; callers that already hold it
     // will call the internal version
     std::string filePath = getPeersFilePath();
-    std::ofstream file(filePath, std::ios::trunc);
+    const std::string temporary = filePath + ".tmp";
+    std::ofstream file(temporary, std::ios::trunc);
     if (!file.is_open()) {
         printf("[NET] Warning: Could not write peers file: %s\n", filePath.c_str());
-        return;
+        return false;
     }
 
     file << "# AudioBridge approved peers\n";
-    file << "# Format: clientId|clientName|lastConnected(unix)|psk_hex\n";
+    file << "# Format: clientId|clientName|lastConnected(unix)|psk_hex|role (missing = read only)\n";
     for (const auto& [id, peer] : approvedPeers_) {
         file << peer.clientId << "|" << peer.clientName << "|" << peer.lastConnected
-             << "|" << peer.pskHex << "\n";
+             << "|" << peer.pskHex << "|" << (peer.admin ? "admin" : "reader") << "\n";
     }
+    file.flush();
+    const bool written = file.good();
+    file.close();
+    return written && MoveFileExA(temporary.c_str(), filePath.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
 }
 
 bool Network::isPeerApproved(const std::string& clientId) const {
@@ -334,6 +351,7 @@ void Network::setPeerPsk(const std::string& clientId, const std::string& pskHex)
     std::lock_guard<std::mutex> lock(peersMutex_);
     auto it = approvedPeers_.find(clientId);
     if (it != approvedPeers_.end()) {
+        if (it->second.pskHex != pskHex) it->second.admin = false;
         it->second.pskHex = pskHex;
         saveApprovedPeers();
     }
@@ -345,3 +363,27 @@ std::map<std::string, ApprovedPeer> Network::getApprovedPeers() const {
 }
 
 #include "network_sessions.inc"
+
+bool Network::setPeerAdmin(const std::string& id, bool admin) {
+    const auto persist = [&]() {
+        std::lock_guard<std::mutex> lock(peersMutex_);
+        auto found = approvedPeers_.find(id);
+        if (found == approvedPeers_.end() || !SecurePairing::validStoredKey(found->second.pskHex)) return false;
+        const bool previous = found->second.admin;
+        found->second.admin = admin;
+        if (saveApprovedPeers()) return true;
+        found->second.admin = previous;
+        return false;
+    };
+    return sessions_ ? sessions_->changePermissions(id, persist) : persist();
+}
+
+void Network::processControls(const std::function<std::string(const RemoteControl::Request&)>& apply) {
+    std::deque<SecureServer::Event> requests;
+    {
+        std::lock_guard<std::mutex> lock(controlsMutex_);
+        requests.swap(controls_);
+    }
+    for (const auto& event : requests)
+        if (sessions_) sessions_->applyControl(event, apply);
+}

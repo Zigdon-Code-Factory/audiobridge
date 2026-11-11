@@ -1155,6 +1155,17 @@ public:
         packet[16] = cmd;
         sendPacket(packet, 17);
     }
+    bool sendDesktopControl(uint32_t request, uint32_t revision, uint32_t command, int32_t value) {
+        if (!connected_) return false;
+        uint8_t packet[32]{};
+        writeHeader(packet, 0x0b, 16);
+        const uint32_t fields[] = {request, revision, command, static_cast<uint32_t>(value)};
+        for (size_t field = 0; field < 4; ++field)
+            for (size_t byte = 0; byte < 4; ++byte)
+                packet[16 + field * 4 + byte] = uint8_t(fields[field] >> (byte * 8));
+        sendPacket(packet, sizeof(packet));
+        return true;
+    }
 
     void sendKeepalive() {
         if (!connected_) return;
@@ -1345,6 +1356,17 @@ private:
                 }
                 break;
 
+            case 0x0b:
+            case 0x0c: {
+                uint16_t payloadLen;
+                memcpy(&payloadLen, data + 14, 2);
+                if (payloadLen > 0 && payloadLen <= 2032 && len == 16 + payloadLen) {
+                    const std::string json(reinterpret_cast<const char*>(data + 16), payloadLen);
+                    if (json.find('\0') == std::string::npos)
+                        notifyDart(data[1] == 0x0b ? "onDesktopState" : "onDesktopResult", json.c_str());
+                }
+                break;
+            }
             case PACKET_MEDIA_INFO: {
                 uint16_t payloadLen;
                 memcpy(&payloadLen, data + 14, 2);
@@ -1595,6 +1617,12 @@ JNIEXPORT void JNICALL
 Java_com_audiobridge_audiobridge_MainActivity_nativeSendControl(
         JNIEnv* env, jobject thiz, jint cmd) {
     g_connMgr.sendControl((uint8_t)cmd);
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_audiobridge_audiobridge_MainActivity_nativeSendDesktopControl(
+        JNIEnv*, jobject, jint request, jint revision, jint command, jint value) {
+    return g_connMgr.sendDesktopControl(uint32_t(request), uint32_t(revision), uint32_t(command), value);
 }
 
 JNIEXPORT void JNICALL

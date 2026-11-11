@@ -10,6 +10,7 @@
 #include <cmath>
 #include <string>
 #include <fstream>
+#include <future>
 
 #include "audio_capture.h"
 #include "audio_render.h"
@@ -28,6 +29,25 @@
 #include <winrt/Windows.Media.Control.h>
 
 using namespace winrt::Windows::Media::Control;
+
+static std::string applyRemoteMedia(int command) {
+    return std::async(std::launch::async, [command]() -> std::string {
+        const HRESULT initialized = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        std::string error;
+        try {
+            auto session = GlobalSystemMediaTransportControlsSessionManager::RequestAsync().get().GetCurrentSession();
+            bool applied = false;
+            if (session) {
+                if (command == CTRL_MEDIA_PLAY_PAUSE) applied = session.TryTogglePlayPauseAsync().get();
+                if (command == CTRL_MEDIA_NEXT) applied = session.TrySkipNextAsync().get();
+                if (command == CTRL_MEDIA_PREV) applied = session.TrySkipPreviousAsync().get();
+            }
+            if (!applied) error = "PC media action failed or no active media session";
+        } catch (...) { error = "PC media service unavailable"; }
+        if (SUCCEEDED(initialized)) CoUninitialize();
+        return error;
+    }).get();
+}
 
 static std::string getExeDir() {
     char exePath[MAX_PATH];
@@ -284,6 +304,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     gui.setVoiceClipCallback([&](bool processed) { return voiceEffects.clipJson(processed); });
 
     Network network;
+    std::atomic<bool> permissionStateDirty{true};
+    std::atomic<bool> clientSettingsDirty{false};
     std::atomic<uint64_t> packetsSent{0};
     std::atomic<uint64_t> bytesSent{0};
     std::atomic<float> peakLevel{0.0f};
@@ -344,9 +366,16 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     });
 
     gui.setRevokeCallback([&](const std::string& clientId) {
-        network.revokePeer(clientId);
-        gui.addLogMessage("Revoked peer: " + clientId);
+        const bool applied = network.revokePeer(clientId);
+        gui.addLogMessage((applied ? "Revoked peer: " : "Could not save pairing removal: ") + clientId);
         gui.updateApprovedPeers(network.getApprovedPeers());
+        return applied;
+    });
+    gui.setPeerRoleCallback([&](const std::string& clientId, bool admin) {
+        const bool applied = network.setPeerAdmin(clientId, admin);
+        gui.updateApprovedPeers(network.getApprovedPeers());
+        permissionStateDirty = true;
+        return applied;
     });
 
     network.setCallbacks(
@@ -357,7 +386,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                               (network.isVoiceQosActive() ? " [Wi-Fi AC_VO]" : ""));
             gui.updateApprovedPeers(network.getApprovedPeers());
             // Send current settings to client
-            syncClientSettings();
+            clientSettingsDirty = true;
         },
         [&]() {
             gui.addLogMessage("Connected phones: " + std::to_string(network.getClientCount()));
@@ -506,7 +535,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         for (const auto& d : devs) {
             devList.push_back({d.id, d.name});
         }
-        gui.updateDevices(devList, currentDeviceId);
+        gui.updateDevices(devList, currentDeviceId, AudioCapture::getDefaultDeviceName(loopbackMode));
     };
 
     auto refreshOutDeviceList = [&]() {
@@ -517,7 +546,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         for (const auto& d : devs) {
             devList.push_back({d.first, d.second});
         }
-        gui.updateOutDevices(devList, currentOutDeviceId);
+        gui.updateOutDevices(devList, currentOutDeviceId, AudioCapture::getDefaultDeviceName(true));
     };
 
     // Helper: reinitialize audio capture with error recovery
@@ -609,9 +638,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     // Wire GUI device change callbacks
     gui.setDeviceChangeCallback([&](const std::wstring& deviceId) {
+        const auto previous = currentDeviceId;
         currentDeviceId = deviceId;
         gui.addLogMessage("Switching sending device...");
-        reinitAudio(deviceId);
+        if (!reinitAudio(deviceId) || currentDeviceId != deviceId) {
+            currentDeviceId = previous;
+            reinitAudio(previous);
+            return false;
+        }
         settings.inputDeviceName.clear();
         for (const auto& d : AudioCapture::getDevices(loopbackMode)) {
             if (d.id == deviceId) {
@@ -620,13 +654,19 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
             }
         }
         saveSettings(settings);
+        return true;
     });
 
     gui.setOutDeviceChangeCallback([&](const std::wstring& deviceId) {
+        const auto previous = currentOutDeviceId;
         currentOutDeviceId = deviceId;
-        settings.preferNativeMic = deviceId == nativeMicId;
         gui.addLogMessage("Switching receiving device...");
-        reinitOutAudio(deviceId);
+        if (!reinitOutAudio(deviceId) || currentOutDeviceId != deviceId) {
+            currentOutDeviceId = previous;
+            reinitOutAudio(previous);
+            return false;
+        }
+        settings.preferNativeMic = deviceId == nativeMicId;
         if (deviceId != nativeMicId) settings.outputDeviceName.clear();
         for (const auto& [devId, devName] : AudioRender::getDevices()) {
             if (devId == deviceId) {
@@ -635,19 +675,30 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
             }
         }
         saveSettings(settings);
+        return true;
     });
 
     gui.setCaptureModeCallback([&](bool loopback) {
         logPrintf("[MODE] Switching capture mode to %s\n", loopback ? "loopback" : "recording");
+        const bool previousMode = loopbackMode;
+        const std::wstring previousDeviceId = currentDeviceId;
         loopbackMode = loopback;
         currentDeviceId = L"";
+        logPrintf("[MODE] Calling reinitAudio...\n");
+        bool ok = reinitAudio(L"");
+        logPrintf("[MODE] reinitAudio returned %s\n", ok ? "true" : "false");
+        if (!ok) {
+            loopbackMode = previousMode;
+            currentDeviceId = previousDeviceId;
+            gui.addLogMessage("Capture mode change failed. Restoring the previous source...");
+            reinitAudio(previousDeviceId);
+            return false;
+        }
         settings.loopbackMode = loopback;
         settings.inputDeviceName.clear();
         saveSettings(settings);
         gui.addLogMessage(loopback ? "Switched to loopback mode" : "Switched to recording device mode");
-        logPrintf("[MODE] Calling reinitAudio...\n");
-        bool ok = reinitAudio(L"");
-        logPrintf("[MODE] reinitAudio returned %s\n", ok ? "true" : "false");
+        return true;
     });
 
     // Apply saved jitter buffer
@@ -690,10 +741,58 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     uint64_t lastRateBytes = 0;
     double rollingKbps = 0.0;
     auto lastMicStatus = VirtualMicrophone::Status::Starting;
+    uint32_t controlRevision = 0;
+    std::string previousControlState;
+    auto lastControlState = startTime - std::chrono::seconds(1);
+    auto controlSnapshot = [&]() {
+        const auto& voice = settings.voice;
+        const bool voiceReady = voiceEffects.stateJson().find("\"ready\":true") != std::string::npos;
+        const std::string state = "{\"jitter\":" + std::to_string(settings.jitterBufferMs) +
+            ",\"frame\":" + std::to_string(settings.frameSizeMs) + ",\"pcm\":" + (settings.rawPcm ? "true" : "false") +
+            ",\"loopback\":" + (loopbackMode ? "true" : "false") + ",\"captureReady\":" + (capture.isRunning() ? "true" : "false") +
+            ",\"outputReady\":" + ((useVirtualMic.load() ? virtualMic.status() == VirtualMicrophone::Status::Ready : render.isRunning()) ? "true" : "false") +
+            ",\"voiceReady\":" + (voiceReady ? "true" : "false") +
+            ",\"noise\":" + std::to_string(voice.noise) + ",\"strength\":" + std::to_string(voice.strength) +
+            ",\"gate\":" + std::to_string(voice.gate) + ",\"threshold\":" + std::to_string(voice.threshold) +
+            ",\"hold\":" + std::to_string(voice.holdMs) + ",\"lowCut\":" + std::to_string(voice.lowCut) + "," +
+            gui.remoteDevicesJson();
+        if (state != previousControlState) { previousControlState = state; ++controlRevision; }
+        return state + ",\"revision\":" + std::to_string(controlRevision) + "}";
+    };
 
     // Tick callback: performs all periodic work previously in the main loop
     gui.setTickCallback([&]() {
         auto now = std::chrono::steady_clock::now();
+        if (clientSettingsDirty.exchange(false)) syncClientSettings();
+        controlSnapshot();
+        network.processControls([&](const RemoteControl::Request& request) -> std::string {
+            if (!request.command) { permissionStateDirty = true; return ""; }
+            if (request.revision && request.revision != controlRevision) return "Settings changed; refresh and retry";
+            if (request.command != 16 && !request.revision) return "A current settings revision is required";
+            std::string error;
+            if (request.command <= 6) error = gui.applyRemoteAudio(request.command, request.value);
+            else if (request.command == 16) error = applyRemoteMedia(request.value);
+            else {
+                if (voiceEffects.stateJson().find("\"ready\":true") == std::string::npos)
+                    return "Voice cleanup unavailable; check the desktop model status";
+                auto voice = settings.voice;
+                switch (request.command) {
+                case 7: voice.noise = request.value != 0; break;
+                case 8: voice.strength = request.value; break;
+                case 9: voice.gate = request.value != 0; break;
+                case 10: voice.threshold = request.value; break;
+                case 11: voice.holdMs = request.value; break;
+                case 12: voice.lowCut = request.value != 0; break;
+                default: return "Unsupported setting";
+                }
+                settings.voice = voice;
+                voiceEffects.setSettings(voice);
+                saveSettings(settings);
+            }
+            controlSnapshot();
+            permissionStateDirty = true;
+            return error;
+        });
 
         const auto micStatus = virtualMic.status();
         if (micStatus != lastMicStatus) {
@@ -795,6 +894,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         stats.rawPcm = gui.getRawPcm();
         stats.voiceQos = network.isVoiceQosActive();
         stats.kernelTap = capture.isUsingKernelTap();
+        stats.captureReady = capture.isRunning();
+        stats.outputReady = useVirtualMic.load() ? virtualMic.status() == VirtualMicrophone::Status::Ready : render.isRunning();
+        stats.captureLoopback = capture.isLoopback();
         stats.jitterBufferMs = gui.getJitterBufferMs();
         stats.frameSizeMs = gui.getFrameSizeMs();
         stats.sequenceNum = (uint32_t)packetsSent.load();
@@ -805,6 +907,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         stats.clientRttMs = network.getClientRtt();
 
         gui.updateStats(stats);
+        const auto snapshot = controlSnapshot();
+        if (permissionStateDirty.exchange(false) || now - lastControlState >= std::chrono::milliseconds(500)) {
+            network.sendControlState(snapshot);
+            lastControlState = now;
+        }
     });
 
     // Media info polling thread (must run on MTA thread, not GUI STA thread)

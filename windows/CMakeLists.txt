@@ -71,6 +71,7 @@ target_link_libraries(audiobridge PRIVATE
     iphlpapi
     windowsapp
     advapi32
+    shell32
     mbedtls
     mbedcrypto
     mbedx509

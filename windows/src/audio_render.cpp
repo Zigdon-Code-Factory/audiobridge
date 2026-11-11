@@ -377,5 +377,6 @@ void AudioRender::renderThread() {
         }
     }
 
+    running_.store(false);
     if (mmcssTask) AvRevertMmThreadCharacteristics(mmcssTask);
 }

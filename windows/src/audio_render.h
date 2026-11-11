@@ -23,6 +23,7 @@ public:
     void cleanup();
     bool start();
     void stop();
+    bool isRunning() const { return running_.load(); }
 
     // Push 48kHz mono float PCM data (from Opus decoder)
     void pushAudio(const float* data, uint32_t frameCount);

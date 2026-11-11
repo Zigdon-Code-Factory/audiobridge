@@ -1,6 +1,7 @@
 #pragma once
 #include "dtls_session.h"
 #include "secure_pairing.h"
+#include "remote_control.h"
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -21,14 +22,61 @@ class SecureServer {
         bool paused;
         double rtt;
     };
-    enum class Kind { Connected, Disconnected, Pair, Pause, Mic, Media, MediaInfo, MicReset };
+    enum class Kind { Connected, Disconnected, Pair, Pause, Mic, Media, MediaInfo, MicReset, Remote };
     struct Event {
         Kind kind;
         std::string id, name, key, code;
         std::vector<uint8_t> data;
+        uint64_t session = 0, permissionEpoch = 0;
     };
     using Lookup = std::function<std::string(const std::string &)>;
     SecureServer(DtlsSocket socket, Lookup lookup) : socket_(socket), lookup_(std::move(lookup)) {}
+    using RoleLookup = std::function<bool(const std::string&, const std::string&)>;
+    void enableControls(RoleLookup lookup) { roleLookup_ = std::move(lookup); }
+    bool changePermissions(const std::string& id, const std::function<bool()>& persist) {
+        std::lock_guard<std::mutex> applying(applyMutex_);
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!persist()) return false;
+        for (auto& item : peers_)
+            if (item.second->id == id) {
+                ++item.second->permissionEpoch;
+                sendControlState(*item.second);
+            }
+        return true;
+    }
+    void controlState(const std::string& settings) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!roleLookup_ || settings.size() > 1850) return;
+        controlState_ = settings;
+        for (auto& item : peers_) {
+            auto& peer = *item.second;
+            sendControlState(peer);
+        }
+    }
+    bool applyControl(const Event& event, const std::function<std::string(const RemoteControl::Request&)>& apply) {
+        std::lock_guard<std::mutex> applying(applyMutex_);
+        std::unique_lock<std::mutex> lock(mutex_);
+        for (auto& item : peers_) {
+            auto& peer = *item.second;
+            if (peer.dead || peer.phase != Phase::Active || peer.id != event.id ||
+                peer.key != event.key || peer.order != event.session) continue;
+            RemoteControl::Request request;
+            if (!RemoteControl::decode(event.data.data(), event.data.size(), request)) return false;
+            if (request.command && (!admin(peer) || peer.permissionEpoch != event.permissionEpoch)) {
+                result(peer, request.id, false, "Permission changed; desktop Admin approval required");
+                return false;
+            }
+            const auto endpointKey = item.first;
+            lock.unlock();
+            const std::string error = apply(request);
+            lock.lock();
+            const auto current = peers_.find(endpointKey);
+            if (current == peers_.end() || current->second->order != event.session) return false;
+            result(*current->second, request.id, error.empty(), error.empty() ? "Applied" : error);
+            return error.empty();
+        }
+        return false;
+    }
 
     std::vector<Event> poll(const sockaddr_in *from = nullptr, const uint8_t *bytes = nullptr,
                             size_t size = 0) {
@@ -87,6 +135,7 @@ class SecureServer {
         }
     }
     void revoke(const std::string &id, const std::function<void()> &persist = {}) {
+        std::lock_guard<std::mutex> applying(applyMutex_);
         std::lock_guard<std::mutex> lock(mutex_);
         for (auto &item : peers_)
             if (item.second->id == id) {
@@ -188,6 +237,9 @@ class SecureServer {
         bool dead = false, paused = false, pingPending = false;
         uint32_t sequence = 0;
         uint64_t order = 0, pingStamp = 0;
+        uint64_t permissionEpoch = 0;
+        Clock::time_point controlWindow{};
+        unsigned controls = 0;
         double rtt = 0;
         int sendErrors = 0;
     };
@@ -195,6 +247,41 @@ class SecureServer {
         char ip[INET_ADDRSTRLEN]{};
         inet_ntop(AF_INET, &peer.sin_addr, ip, sizeof(ip));
         return std::string(ip) + ":" + std::to_string(ntohs(peer.sin_port));
+    }
+    bool admin(const Peer& peer) const {
+        return roleLookup_ && roleLookup_(peer.id, peer.key);
+    }
+    void sendControlState(Peer& peer) {
+        if (peer.dead || peer.phase != Phase::Active || controlState_.empty()) return;
+        const std::string json = std::string("{\"version\":1,\"admin\":") +
+            (admin(peer) ? "true" : "false") + ",\"settings\":" + controlState_ + "}";
+        send(peer, RemoteControl::stateType, reinterpret_cast<const uint8_t*>(json.data()), json.size());
+    }
+    void result(Peer& peer, uint32_t id, bool ok, const std::string& message) {
+        const std::string json = "{\"request\":" + std::to_string(id) + ",\"ok\":" +
+            (ok ? "true" : "false") + ",\"message\":\"" + message + "\"}";
+        send(peer, RemoteControl::resultType, reinterpret_cast<const uint8_t*>(json.data()), json.size());
+    }
+    void remote(Peer& peer, const uint8_t* bytes, size_t size) {
+        RemoteControl::Request request;
+        const auto now = Clock::now();
+        if (now - peer.controlWindow >= std::chrono::seconds(1)) {
+            peer.controlWindow = now;
+            peer.controls = 0;
+        }
+        if (++peer.controls > 10) return;
+        if (!RemoteControl::decode(bytes, size, request)) {
+            result(peer, 0, false, "Invalid request size");
+            return;
+        }
+        if (!roleLookup_) { result(peer, request.id, false, "Desktop controls unsupported"); return; }
+        if (!RemoteControl::valid(request)) { result(peer, request.id, false, "Invalid command or value"); return; }
+        if (request.command && !admin(peer)) {
+            result(peer, request.id, false, "Read only; ask the desktop owner for Admin");
+            return;
+        }
+        events_.push_back({Kind::Remote, peer.id, peer.name, peer.key, "",
+            std::vector<uint8_t>(bytes, bytes + size), peer.order, peer.permissionEpoch});
     }
     void text(const sockaddr_in &peer, const std::string &msg) {
         sendto(socket_, msg.data(), static_cast<int>(msg.size()), 0, (const sockaddr *)&peer, sizeof(peer));
@@ -395,10 +482,16 @@ class SecureServer {
                     events_.push_back({Kind::Pause});
                 } else if (cmd == 3)
                     p.dead = true;
-                else if (cmd >= 0x10 && cmd <= 0x12)
-                    events_.push_back({Kind::Media, "", "", "", "", {cmd}});
+                else if (cmd >= 0x10 && cmd <= 0x12) {
+                    uint8_t request[16]{};
+                    request[8] = 16;
+                    request[12] = cmd;
+                    remote(p, request, sizeof(request));
+                }
                 else if (cmd == 0x13)
                     events_.push_back({Kind::MediaInfo});
+            } else if (type == RemoteControl::requestType) {
+                remote(p, plain + 16, len);
             } else if (type == 4 && len && len <= 2000 && micOwner_ == p.endpoint) {
                 events_.push_back({Kind::Mic, "", "", "", "", std::vector<uint8_t>(plain + 16, plain + n)});
             } else if (type == 6 && len == 0) {
@@ -466,7 +559,10 @@ class SecureServer {
     }
     DtlsSocket socket_;
     Lookup lookup_;
+    RoleLookup roleLookup_;
+    std::string controlState_;
     mutable std::mutex mutex_;
+    std::mutex applyMutex_;
     std::map<std::string, std::unique_ptr<Peer>> peers_;
     std::vector<Event> events_;
     std::string prompt_, micOwner_;

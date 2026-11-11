@@ -13,6 +13,7 @@
 #include <map>
 #include <memory>
 #include <condition_variable>
+#include <deque>
 #include "secure_server.h"
 
 #pragma comment(lib, "ws2_32.lib")
@@ -54,6 +55,7 @@ struct ApprovedPeer {
     std::string clientName;
     int64_t lastConnected;  // unix timestamp (seconds)
     std::string pskHex;     // v2: plus 64 hex digits; old exposed keys are rejected
+    bool admin = false;
 };
 
 class Network {
@@ -100,7 +102,10 @@ public:
 
     // Peer management
     std::map<std::string, ApprovedPeer> getApprovedPeers() const;
-    void revokePeer(const std::string& clientId);
+    bool revokePeer(const std::string& clientId);
+    bool setPeerAdmin(const std::string& clientId, bool admin);
+    void processControls(const std::function<std::string(const RemoteControl::Request&)>& apply);
+    void sendControlState(const std::string& json) { if (sessions_) sessions_->controlState(json); }
     std::string getPeerName(const std::string& clientId) const;
 
     bool isConnected() const { return getClientCount() > 0; }
@@ -142,7 +147,7 @@ private:
     std::string getPeerPsk(const std::string& clientId) const;
     void setPeerPsk(const std::string& clientId, const std::string& pskHex);
     void loadApprovedPeers();
-    void saveApprovedPeers(); // Caller holds peersMutex_.
+    bool saveApprovedPeers();
     bool isPeerApproved(const std::string& clientId) const;
     void touchPeer(const std::string& clientId, const std::string& clientName);
     std::string getPeersFilePath() const;
@@ -171,4 +176,6 @@ private:
     MediaInfoRequestCallback onMediaInfoRequest_;
     std::map<std::string, ApprovedPeer> approvedPeers_;
     mutable std::mutex peersMutex_;
+    std::mutex controlsMutex_;
+    std::deque<SecureServer::Event> controls_;
 };

@@ -56,6 +56,17 @@ void Network::streamThread() {
                 if (onMediaInfoRequest_)
                     onMediaInfoRequest_();
                 break;
+            case SecureServer::Kind::Remote:
+#ifdef _WIN32
+                {
+                    std::lock_guard<std::mutex> lock(controlsMutex_);
+                    if (controls_.size() < 32) controls_.push_back(event);
+                    else sessions_->applyControl(event, [](const RemoteControl::Request&) {
+                        return "Desktop control queue is busy; retry after refreshing";
+                    });
+                }
+#endif
+                break;
             }
         }
     }
@@ -136,16 +147,33 @@ void Network::rejectPeer(const std::string &token) {
     if (sessions_)
         sessions_->approve(token, false);
 }
+#ifdef _WIN32
+bool Network::revokePeer(const std::string &id) {
+    bool saved = true;
+#else
 void Network::revokePeer(const std::string &id) {
+#endif
     const auto persist = [&] {
         std::lock_guard<std::mutex> lock(peersMutex_);
+#ifdef _WIN32
+        const auto found = approvedPeers_.find(id);
+        if (found == approvedPeers_.end()) return;
+        const auto previous = found->second;
+        approvedPeers_.erase(found);
+        saved = saveApprovedPeers();
+        if (!saved) approvedPeers_[id] = previous;
+#else
         approvedPeers_.erase(id);
         saveApprovedPeers();
+#endif
     };
     if (sessions_)
         sessions_->revoke(id, persist);
     else
         persist();
+#ifdef _WIN32
+    return saved;
+#endif
 }
 #ifdef _WIN32
 void Network::refreshVoiceQos() {

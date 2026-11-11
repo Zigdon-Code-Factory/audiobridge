@@ -95,11 +95,8 @@ void main() {
       );
       await tester.enterText(find.byType(TextField), '   ');
       await tap(find.text('Save'));
-      await tap(key('editDeviceName'));
-      expect(
-        tester.widget<TextField>(find.byType(TextField)).controller!.text,
-        originalName,
-      );
+      expect(find.text('Enter a device name.'), findsOneWidget);
+      expect(find.byType(AlertDialog), findsOneWidget);
       await tester.enterText(
         find.byType(TextField),
         'AudioBridge control test',
@@ -157,6 +154,7 @@ void main() {
           TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
       messenger.setMockMethodCallHandler(channel, (call) async {
         if (call.method == 'startRecording') return false;
+        if (call.method == 'getAudioState') return {'recording': false};
         if (call.method == 'isConnected' || call.method == 'isDtlsActive') {
           return true;
         }
@@ -165,7 +163,10 @@ void main() {
       try {
         await tap(find.text('Mic Off'));
         expect(find.text('Mic Off'), findsOneWidget);
-        expect(find.textContaining('Failed to start mic'), findsOneWidget);
+        expect(
+          find.textContaining('Could not start phone microphone'),
+          findsOneWidget,
+        );
       } finally {
         messenger.setMockMethodCallHandler(channel, null);
       }
@@ -223,9 +224,9 @@ void main() {
         'PASS Phone/Bluetooth/Auto source controls (physical Bluetooth routing needs a headset)',
       );
 
-      await tap(find.text('Next'));
+      await tap(find.byTooltip('Next track on PC'));
       await tester.pump(const Duration(seconds: 1));
-      await tap(find.text('Prev'));
+      await tap(find.byTooltip('Previous track on PC'));
       await tester.pump(const Duration(seconds: 1));
       await tap(key('mediaPlayPause'));
       await tester.pump(const Duration(seconds: 2));

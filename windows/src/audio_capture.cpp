@@ -122,6 +122,27 @@ std::vector<AudioDeviceInfo> AudioCapture::getDevices(bool loopback) {
     return devices;
 }
 
+std::wstring AudioCapture::getDefaultDeviceName(bool loopback) {
+    IMMDeviceEnumerator* enumerator = nullptr;
+    if (FAILED(CoCreateInstance(CLSID_MMDeviceEnumerator, nullptr, CLSCTX_ALL,
+                                IID_IMMDeviceEnumerator, (void**)&enumerator))) return L"";
+    IMMDevice* device = nullptr;
+    std::wstring name;
+    if (SUCCEEDED(enumerator->GetDefaultAudioEndpoint(loopback ? eRender : eCapture, eConsole, &device))) {
+        IPropertyStore* properties = nullptr;
+        if (SUCCEEDED(device->OpenPropertyStore(STGM_READ, &properties))) {
+            PROPVARIANT value;
+            PropVariantInit(&value);
+            if (SUCCEEDED(properties->GetValue(PKEY_Device_FriendlyName, &value)) && value.vt == VT_LPWSTR) name = value.pwszVal;
+            PropVariantClear(&value);
+            properties->Release();
+        }
+        device->Release();
+    }
+    enumerator->Release();
+    return name;
+}
+
 bool AudioCapture::tryInitializeKernelTap() {
     if (!loopback_ || !device_) return false;
     if (deviceFriendlyName_.find(L"AudioBridge Virtual Speakers") == std::wstring::npos) {

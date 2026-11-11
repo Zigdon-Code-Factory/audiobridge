@@ -25,6 +25,7 @@ public:
     ~AudioCapture();
 
     static std::vector<AudioDeviceInfo> getDevices(bool loopback = true);
+    static std::wstring getDefaultDeviceName(bool loopback = true);
 
     bool initialize(const std::wstring& deviceId = L"", bool loopback = true);
     void cleanup();
@@ -42,6 +43,8 @@ public:
     uint32_t getSampleRate() const { return sampleRate_; }
     uint32_t getChannels() const { return channels_; }
     bool isUsingKernelTap() const { return usingKernelTap_; }
+    bool isRunning() const { return running_.load(); }
+    bool isLoopback() const { return loopback_; }
     const std::wstring& getDeviceFriendlyName() const { return deviceFriendlyName_; }
 
 private:

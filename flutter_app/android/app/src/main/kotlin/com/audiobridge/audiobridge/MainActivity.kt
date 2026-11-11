@@ -71,6 +71,7 @@ class MainActivity : FlutterActivity() {
                                        pskHex: String): String
     private external fun nativeDisconnect()
     private external fun nativeSendControl(cmd: Int)
+    private external fun nativeSendDesktopControl(request: Int, revision: Int, command: Int, value: Int): Boolean
     private external fun nativeSendKeepalive()
     private external fun nativeSendPing()
     private external fun nativeGetRtt(): Double
@@ -382,6 +383,18 @@ class MainActivity : FlutterActivity() {
                     val cmd = call.arguments as? Int ?: 0
                     nativeSendControl(cmd)
                     result.success(null)
+                }
+                "sendDesktopControl" -> {
+                    val args = call.arguments as? Map<*, *>
+                    val request = args?.get("request") as? Int
+                    val revision = args?.get("revision") as? Int
+                    val command = args?.get("command") as? Int
+                    val value = args?.get("value") as? Int
+                    if (request == null || revision == null || command == null || value == null) {
+                        result.error("invalid_control", "Invalid desktop control request", null)
+                    } else {
+                        result.success(nativeSendDesktopControl(request, revision, command, value))
+                    }
                 }
                 "sendKeepalive" -> {
                     nativeSendKeepalive()

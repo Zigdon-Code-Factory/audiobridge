@@ -28,6 +28,9 @@ struct ServerStats {
     bool rawPcm = true;
     bool voiceQos = false;
     bool kernelTap = false;
+    bool captureReady = false;
+    bool outputReady = false;
+    bool captureLoopback = true;
     int jitterBufferMs = 10;
     int frameSizeMs = 2; // 2 => 2.5ms (120 samples), 5, 10, 20
     uint32_t sequenceNum = 0;
@@ -52,9 +55,10 @@ public:
     using CodecChangeCallback = std::function<void(bool rawPcm)>;
     using PairApproveCallback = std::function<void(const std::string& clientId)>;
     using PairDenyCallback = std::function<void(const std::string& clientId)>;
-    using RevokeCallback = std::function<void(const std::string& clientId)>;
-    using DeviceChangeCallback = std::function<void(const std::wstring& deviceId)>;
-    using CaptureModeCallback = std::function<void(bool loopback)>;
+    using RevokeCallback = std::function<bool(const std::string& clientId)>;
+    using DeviceChangeCallback = std::function<bool(const std::wstring& deviceId)>;
+    using PeerRoleCallback = std::function<bool(const std::string&, bool)>;
+    using CaptureModeCallback = std::function<bool(bool loopback)>;
     using TickCallback = std::function<void()>;
     using VoiceChangeCallback = std::function<void(const std::string&)>;
     using VoiceRecordCallback = std::function<void(bool)>;
@@ -75,9 +79,9 @@ public:
     void clearPairRequest();
     void addLogMessage(const std::string& msg);
     void updateDevices(const std::vector<std::pair<std::wstring, std::wstring>>& devices,
-                       const std::wstring& currentId);
+                       const std::wstring& currentId, const std::wstring& defaultName);
     void updateOutDevices(const std::vector<std::pair<std::wstring, std::wstring>>& devices,
-                       const std::wstring& currentId);
+                       const std::wstring& currentId, const std::wstring& defaultName);
 
     // Set callbacks
     void setJitterChangeCallback(JitterChangeCallback cb) { onJitterChange_ = cb; }
@@ -86,6 +90,9 @@ public:
     void setPairApproveCallback(PairApproveCallback cb) { onPairApprove_ = cb; }
     void setPairDenyCallback(PairDenyCallback cb) { onPairDeny_ = cb; }
     void setRevokeCallback(RevokeCallback cb) { onRevoke_ = cb; }
+    void setPeerRoleCallback(PeerRoleCallback cb) { onPeerRole_ = cb; }
+    std::string remoteDevicesJson() const;
+    std::string applyRemoteAudio(uint32_t command, int value);
     void setDeviceChangeCallback(DeviceChangeCallback cb) { onDeviceChange_ = cb; }
     void setOutDeviceChangeCallback(DeviceChangeCallback cb) { onOutDeviceChange_ = cb; }
     void setCaptureModeCallback(CaptureModeCallback cb) { onCaptureMode_ = cb; }
@@ -119,6 +126,7 @@ private:
     ServerStats stats_;
     std::vector<std::pair<std::string, std::string>> approvedPeers_;  // id, name
     std::vector<int64_t> peerTimestamps_;
+    std::vector<bool> peerAdmins_;
     PairRequest pairRequest_;
     std::vector<std::string> logMessages_;
     static constexpr int MAX_LOG_MESSAGES = 50;
@@ -129,8 +137,11 @@ private:
     std::wstring currentDeviceId_;
     std::vector<DeviceEntry> outAudioDevices_;
     std::wstring currentOutDeviceId_;
+    std::string defaultDeviceName_;
+    std::string defaultOutDeviceName_;
     bool devicesChanged_ = true;
     bool outDevicesChanged_ = true;
+    uint64_t remoteDeviceGeneration_ = 0;
 
     // Callbacks
     JitterChangeCallback onJitterChange_;
@@ -139,6 +150,7 @@ private:
     PairApproveCallback onPairApprove_;
     PairDenyCallback onPairDeny_;
     RevokeCallback onRevoke_;
+    PeerRoleCallback onPeerRole_;
     DeviceChangeCallback onDeviceChange_;
     DeviceChangeCallback onOutDeviceChange_;
     CaptureModeCallback onCaptureMode_;

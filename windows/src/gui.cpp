@@ -9,6 +9,7 @@
 
 #ifdef _WIN32
 #include <Windows.h>
+#include <shellapi.h>
 #endif
 
 // ---- Helpers ----
@@ -120,7 +121,8 @@ bool ServerGui::initialize(const std::string& title) {
     }
 
     webview_->set_title("AudioBridge -- " + title);
-    webview_->set_size(720, 900, WEBVIEW_HINT_NONE);
+    webview_->set_size(1120, 860, WEBVIEW_HINT_NONE);
+    webview_->set_size(640, 600, WEBVIEW_HINT_MIN);
 
     setupBindings();
     webview_->set_html(gui_html::HTML_CONTENT);
@@ -137,6 +139,12 @@ void ServerGui::run() {
 // ---- Bindings ----
 
 void ServerGui::setupBindings() {
+    webview_->bind("_setPeerRole", [this](const std::string& args) -> std::string {
+        const auto input = parseFirstString(args);
+        if (input.size() < 3 || (input[0] != '0' && input[0] != '1') || input[1] != ':') return "{\"applied\":false}";
+        const bool ok = onPeerRole_ && onPeerRole_(input.substr(2), input[0] == '1');
+        return ok ? "{\"applied\":true}" : "{\"applied\":false}";
+    });
     webview_->bind("_voiceSettings", [this](const std::string& args) -> std::string {
         if (onVoiceChange_) onVoiceChange_(parseFirstString(args));
         return "{}";
@@ -205,18 +213,21 @@ void ServerGui::setupBindings() {
     // _revokePeer: user clicked revoke on a paired device
     webview_->bind("_revokePeer", [this](const std::string& args) -> std::string {
         std::string clientId = parseFirstString(args);
-        if (!clientId.empty() && onRevoke_) {
-            onRevoke_(clientId);
-        }
-        return "{}";
+        const bool applied = !clientId.empty() && onRevoke_ && onRevoke_(clientId);
+        return applied ? "{\"applied\":true}" : "{\"applied\":false}";
     });
 
     // _setCaptureMode: user changed capture mode dropdown
     webview_->bind("_setCaptureMode", [this](const std::string& args) -> std::string {
         std::string mode = parseFirstString(args);
         bool loopback = (mode != "recording");
-        if (onCaptureMode_) onCaptureMode_(loopback);
-        return "{}";
+        const bool applied = onCaptureMode_ && onCaptureMode_(loopback);
+        return applied ? "{\"applied\":true}" : "{\"applied\":false}";
+    });
+
+    webview_->bind("_openCableSetup", [](const std::string&) -> std::string {
+        const auto result = ShellExecuteW(nullptr, L"open", L"https://vb-audio.com/Cable/", nullptr, nullptr, SW_SHOWNORMAL);
+        return reinterpret_cast<INT_PTR>(result) > 32 ? "{\"applied\":true}" : "{\"applied\":false}";
     });
 
     // _selectDevice: user changed sending device dropdown
@@ -302,6 +313,9 @@ std::string ServerGui::buildStateJson() {
     s += "\"rawPcm\":" + std::string(stats_.rawPcm ? "true" : "false") + ",";
     s += "\"voiceQos\":" + std::string(stats_.voiceQos ? "true" : "false") + ",";
     s += "\"kernelTap\":" + std::string(stats_.kernelTap ? "true" : "false") + ",";
+    s += "\"captureReady\":" + std::string(stats_.captureReady ? "true" : "false") + ",";
+    s += "\"outputReady\":" + std::string(stats_.outputReady ? "true" : "false") + ",";
+    s += "\"captureMode\":\"" + std::string(stats_.captureLoopback ? "loopback" : "recording") + "\",";
     s += "\"jitterBufferMs\":" + std::to_string(stats_.jitterBufferMs) + ",";
     s += "\"frameSizeMs\":" + std::to_string(stats_.frameSizeMs) + ",";
     s += "\"sequenceNum\":" + std::to_string(stats_.sequenceNum) + ",";
@@ -325,7 +339,8 @@ std::string ServerGui::buildStateJson() {
         int64_t ts = (i < peerTimestamps_.size()) ? peerTimestamps_[i] : 0;
         s += "{\"id\":\"" + escapeJson(approvedPeers_[i].first) + "\",";
         s += "\"name\":\"" + escapeJson(approvedPeers_[i].second) + "\",";
-        s += "\"lastConnected\":" + std::to_string(ts) + "}";
+        s += "\"lastConnected\":" + std::to_string(ts) + ",\"role\":\"" +
+            (peerAdmins_[i] ? "admin" : "reader") + "\"}";
     }
     s += "],";
 
@@ -341,6 +356,8 @@ std::string ServerGui::buildStateJson() {
     bool devChanged = devicesChanged_;
     if (devicesChanged_) devicesChanged_ = false;
     s += "\"devicesChanged\":" + std::string(devChanged ? "true" : "false") + ",";
+    s += "\"defaultDeviceName\":\"" + escapeJson(defaultDeviceName_) + "\",";
+    s += "\"defaultOutDeviceName\":\"" + escapeJson(defaultOutDeviceName_) + "\",";
     s += "\"devices\":[";
     for (size_t i = 0; i < audioDevices_.size(); i++) {
         if (i > 0) s += ",";
@@ -373,10 +390,68 @@ void ServerGui::updateApprovedPeers(const std::map<std::string, ApprovedPeer>& p
     std::lock_guard<std::mutex> lock(dataMutex_);
     approvedPeers_.clear();
     peerTimestamps_.clear();
+    peerAdmins_.clear();
     for (const auto& [id, peer] : peers) {
         approvedPeers_.push_back({peer.clientId, peer.clientName});
         peerTimestamps_.push_back(peer.lastConnected);
+        peerAdmins_.push_back(peer.admin);
     }
+}
+
+std::string ServerGui::remoteDevicesJson() const {
+    std::lock_guard<std::mutex> lock(dataMutex_);
+    auto names = [&](const std::vector<DeviceEntry>& devices) {
+        std::string json = "[\"System default\"";
+        for (size_t index = 0; index < devices.size() && index < 8; ++index) {
+            std::string name;
+            for (unsigned char character : devices[index].name) {
+                if (name.size() >= 36) break;
+                if (character >= 32 && character < 127) name += static_cast<char>(character);
+            }
+            json += ",\"" + escapeJson(name) + "\"";
+        }
+        return json + "]";
+    };
+    auto selectedName = [&](const std::vector<DeviceEntry>& devices, const std::wstring& selected, const std::string& defaultName) {
+        std::string source = defaultName;
+        if (!selected.empty()) {
+            source = "Unavailable selected endpoint";
+            for (const auto& entry : devices) {
+                if (entry.id == selected) { source = entry.name; break; }
+            }
+        }
+        std::string name;
+        for (unsigned char character : source) {
+            if (name.size() >= 36) break;
+            if (character >= 32 && character < 127) name += static_cast<char>(character);
+        }
+        return escapeJson(name.empty() ? "Windows default unavailable" : name);
+    };
+    return "\"inputs\":" + names(audioDevices_) + ",\"outputs\":" + names(outAudioDevices_) +
+        ",\"inputName\":\"" + selectedName(audioDevices_, currentDeviceId_, defaultDeviceName_) + "\"" +
+        ",\"outputName\":\"" + selectedName(outAudioDevices_, currentOutDeviceId_, defaultOutDeviceName_) + "\"" +
+        ",\"deviceGeneration\":" + std::to_string(remoteDeviceGeneration_) +
+        ",\"input\":" + std::to_string(getCurrentDeviceIndex()) +
+        ",\"output\":" + std::to_string(getCurrentOutDeviceIndex());
+}
+
+std::string ServerGui::applyRemoteAudio(uint32_t command, int value) {
+    if (command == 1 && onJitterChange_) { jitterBufferMs_ = value; onJitterChange_(value); return ""; }
+    if (command == 2 && onFrameSizeChange_) { frameSizeMs_ = value; onFrameSizeChange_(value); return ""; }
+    if (command == 3 && onCodecChange_) { rawPcm_ = value != 0; onCodecChange_(rawPcm_); return ""; }
+    if (command == 4 && onCaptureMode_) return onCaptureMode_(value != 0) ? "" : "Capture mode failed; previous route restored";
+    if (command == 5 || command == 6) {
+        std::wstring device;
+        {
+            std::lock_guard<std::mutex> lock(dataMutex_);
+            const auto& devices = command == 5 ? audioDevices_ : outAudioDevices_;
+            if (value < 0 || value > 8 || value > static_cast<int>(devices.size())) return "Device no longer available";
+            if (value) device = devices[value - 1].id;
+        }
+        const auto& callback = command == 5 ? onDeviceChange_ : onOutDeviceChange_;
+        return callback && callback(device) ? "" : "Device change failed; check the desktop route";
+    }
+    return "Unsupported setting";
 }
 
 void ServerGui::showPairRequest(const std::string& clientId, const std::string& name, const std::string& code) {
@@ -417,23 +492,37 @@ void ServerGui::addLogMessage(const std::string& msg) {
 }
 
 void ServerGui::updateDevices(const std::vector<std::pair<std::wstring, std::wstring>>& devices,
-                              const std::wstring& currentId) {
+                              const std::wstring& currentId, const std::wstring& defaultName) {
     std::lock_guard<std::mutex> lock(dataMutex_);
     audioDevices_.clear();
     for (const auto& [id, name] : devices) {
         audioDevices_.push_back({id, wideToUtf8(name)});
     }
     currentDeviceId_ = currentId;
+    defaultDeviceName_ = wideToUtf8(defaultName);
     devicesChanged_ = true;
+    ++remoteDeviceGeneration_;
 }
 
 void ServerGui::updateOutDevices(const std::vector<std::pair<std::wstring, std::wstring>>& devices,
-                               const std::wstring& currentId) {
+                               const std::wstring& currentId, const std::wstring& defaultName) {
     std::lock_guard<std::mutex> lock(dataMutex_);
+    std::string retainedName = "Selected microphone destination";
+    for (const auto& entry : outAudioDevices_) {
+        if (entry.id == currentId) retainedName = entry.name;
+    }
     outAudioDevices_.clear();
+    bool selectionFound = currentId.empty();
     for (const auto& [id, name] : devices) {
         outAudioDevices_.push_back({id, wideToUtf8(name)});
+        if (id == currentId) selectionFound = true;
+    }
+    if (!selectionFound) {
+        if (retainedName.find(" (unavailable)") == std::string::npos) retainedName += " (unavailable)";
+        outAudioDevices_.push_back({currentId, retainedName});
     }
     currentOutDeviceId_ = currentId;
+    defaultOutDeviceName_ = wideToUtf8(defaultName);
     outDevicesChanged_ = true;
+    ++remoteDeviceGeneration_;
 }
