@@ -1,7 +1,7 @@
 param(
-    [string]$Version = '0.2.0',
-    [string]$BuildDirectory = (Join-Path $PSScriptRoot 'build/release-0.2.0'),
-    [string]$OutputDirectory = (Join-Path $PSScriptRoot 'build/release-artifacts/v0.2.0'),
+    [string]$Version = '0.2.1',
+    [string]$BuildDirectory = (Join-Path $PSScriptRoot 'build/release-0.2.1'),
+    [string]$OutputDirectory = (Join-Path $PSScriptRoot 'build/release-artifacts/v0.2.1'),
     [string]$VisualStudioDirectory = ''
 )
 $ErrorActionPreference = 'Stop'
@@ -68,4 +68,14 @@ $checksums = foreach ($file in @($archive, $apk)) {
     "$hash  $([IO.Path]::GetFileName($file))"
 }
 [IO.File]::WriteAllLines((Join-Path $output 'SHA256SUMS.txt'), $checksums, [Text.Encoding]::ASCII)
+$allArchive = Join-Path $output "AudioBridge-$Version-All.zip"
+$allZip = [IO.Compression.ZipFile]::Open($allArchive, [IO.Compression.ZipArchiveMode]::Create)
+try {
+    foreach ($file in @($archive, $apk, (Join-Path $output 'SHA256SUMS.txt'))) {
+        [IO.Compression.ZipFileExtensions]::CreateEntryFromFile($allZip, $file, [IO.Path]::GetFileName($file), [IO.Compression.CompressionLevel]::NoCompression) | Out-Null
+    }
+    [IO.Compression.ZipFileExtensions]::CreateEntryFromFile($allZip, (Join-Path $repository 'RELEASE_NOTES.md'), 'README.md', [IO.Compression.CompressionLevel]::Optimal) | Out-Null
+} finally { $allZip.Dispose() }
+$allHash = (Get-FileHash -LiteralPath $allArchive -Algorithm SHA256).Hash.ToLowerInvariant()
+[IO.File]::AppendAllText((Join-Path $output 'SHA256SUMS.txt'), "$allHash  $([IO.Path]::GetFileName($allArchive))" + [Environment]::NewLine, [Text.Encoding]::ASCII)
 Write-Output "AudioBridge $Version release artifacts: $output"

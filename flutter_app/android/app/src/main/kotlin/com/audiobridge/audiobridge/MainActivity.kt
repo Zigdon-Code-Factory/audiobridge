@@ -448,8 +448,4 @@ class MainActivity : FlutterActivity() {
         appUpdater?.onResume()
     }
 
-    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
-        super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode == AppUpdater.INSTALL_REQUEST) appUpdater?.onInstallResult()
-    }
 }

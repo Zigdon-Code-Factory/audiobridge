@@ -1,7 +1,18 @@
-# AudioBridge 0.2.0
+# AudioBridge 0.2.1
 
-A major Windows and Android usability overhaul, with device-specific access
-control and in-app updates.
+Session-based Android self-updates, built on the 0.2.0 overhaul.
+
+## New in 0.2.1
+
+- Android updates use PackageInstaller sessions and request installation without
+  another prompt on supported, eligible self-updates. Android can still require
+  source permission or its system confirmation; these checks are not bypassed.
+- Durable installation status, authenticated session callbacks, explicit
+  cancellation, and recovery after activity/process replacement.
+- Verified cached downloads can be reused, and an update-complete notification
+  can reopen AudioBridge when notifications are permitted.
+- Windows and Android both report version 0.2.1. Android build 7 upgrades build 6
+  without uninstalling or clearing app data.
 
 ## Highlights
 
@@ -22,7 +33,7 @@ control and in-app updates.
   user-writable folder and run `audiobridge.exe`. Keep its updater, runtime DLLs
   and `voice-models` folder together. WebView2 is required.
 - **Android:** install `AudioBridge-Android.apk` over the existing app; no uninstall
-  is needed. The display version is 0.2.0; Android build 6 upgrades local build 5.
+  is needed. The display version is 0.2.1; Android build 7 upgrades build 6.
   This sideload build retains the existing signing identity.
 - For older builds, install this release once manually to get the update buttons.
   Future phone and Windows updates remain separate.

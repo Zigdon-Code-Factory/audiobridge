@@ -18,13 +18,23 @@ class _AppUpdateDialogState extends State<AppUpdateDialog> {
   bool _acting = false;
   bool _confirming = false;
   bool _installWhenReady = false;
+  bool _awaitingConfirmation = false;
   String _error = '';
   final _actionFocus = FocusNode();
   final _statusFocus = FocusNode(debugLabel: 'Update status');
 
   String get _phase => _state['phase'] as String? ?? 'idle';
   bool get _busy =>
-      _acting || _confirming || _phase == 'checking' || _phase == 'downloading';
+      _acting ||
+      _confirming ||
+      [
+        'checking',
+        'downloading',
+        'preparing',
+        'installing',
+        'permission',
+      ].contains(_phase) ||
+      (_state['canCancel'] == true && _phase != 'confirmation');
 
   @override
   void initState() {
@@ -52,14 +62,33 @@ class _AppUpdateDialogState extends State<AppUpdateDialog> {
           .invokeMapMethod<String, dynamic>('getUpdateState')
           .timeout(const Duration(seconds: 5));
       if (!mounted) return;
-      setState(() => _state = state ?? {});
+      setState(() {
+        if (state?['installRevision'] != null &&
+            state?['installRevision'] != _state['installRevision']) {
+          _error = '';
+        }
+        _state = state ?? {};
+      });
       if (_actionFocus.hasFocus &&
-          ['checking', 'downloading'].contains(_phase)) {
+          [
+            'checking',
+            'downloading',
+            'preparing',
+            'installing',
+            'permission',
+          ].contains(_phase)) {
         _statusFocus.requestFocus();
       }
       if (_phase == 'ready' && _installWhenReady && !_acting) {
         _installWhenReady = false;
         await _launchInstaller();
+      }
+      if (_phase == 'confirmation' && _awaitingConfirmation && !_acting) {
+        _awaitingConfirmation = false;
+        await _command('confirmInstallation');
+      }
+      if (_phase == 'error' || _phase == 'complete') {
+        _awaitingConfirmation = false;
       }
     } catch (_) {
       if (mounted) {
@@ -128,6 +157,7 @@ class _AppUpdateDialogState extends State<AppUpdateDialog> {
         return;
       }
       if (!mounted) return;
+      _awaitingConfirmation = true;
       await _channel
           .invokeMethod<void>('launchInstaller')
           .timeout(const Duration(seconds: 5));
@@ -136,15 +166,18 @@ class _AppUpdateDialogState extends State<AppUpdateDialog> {
         setState(
           () =>
               _error =
-                  'Could not open the Android installer. Retry installation; your current app is unchanged.',
+                  'The Android installation request could not be confirmed. Check its status before retrying.',
         );
       }
     } finally {
       if (mounted) {
         setState(() => _acting = false);
         final focus = FocusManager.instance.primaryFocus;
-        if (restoreFocus && (focus == null || focus is FocusScopeNode)) {
-          _actionFocus.requestFocus();
+        if (restoreFocus &&
+            (focus == null ||
+                focus is FocusScopeNode ||
+                focus == _actionFocus)) {
+          (_busy ? _statusFocus : _actionFocus).requestFocus();
         }
       }
     }
@@ -152,6 +185,11 @@ class _AppUpdateDialogState extends State<AppUpdateDialog> {
 
   Future<void> _update() async {
     if (_busy) return;
+    if (_phase == 'confirmation') {
+      _awaitingConfirmation = false;
+      await _command('confirmInstallation');
+      return;
+    }
     if (_phase == 'ready') {
       await _launchInstaller();
       return;
@@ -168,7 +206,7 @@ class _AppUpdateDialogState extends State<AppUpdateDialog> {
               vertical: 24,
             ),
             content: const Text(
-              'The update comes from the official AudioBridge GitHub release and is verified before installation. Audio will disconnect before the Android installer opens. Your pairings and settings are kept. Android may ask you to allow updates from this app, then confirm installation.',
+              'The update comes from the official AudioBridge GitHub release and is verified before installation. Audio will disconnect first. Your pairings and settings are kept. On supported Android versions, eligible self-updates install without an extra prompt. Android may still require permission or installation approval.',
             ),
             actions: [
               TextButton(
@@ -194,7 +232,7 @@ class _AppUpdateDialogState extends State<AppUpdateDialog> {
       0.0,
       1.0,
     );
-    final available = _phase == 'available' || _phase == 'ready';
+    final available = ['available', 'ready', 'confirmation'].contains(_phase);
     return AlertDialog(
       title: const Text('App updates'),
       scrollable: true,
@@ -205,7 +243,7 @@ class _AppUpdateDialogState extends State<AppUpdateDialog> {
           crossAxisAlignment: CrossAxisAlignment.stretch,
           mainAxisSize: MainAxisSize.min,
           children: [
-            Text('Installed: ${_state['currentVersion'] ?? '0.2.0'}'),
+            Text('Installed: ${_state['currentVersion'] ?? '0.2.1'}'),
             if (_state['version'] != null)
               Text('Latest release: ${_state['version']}'),
             const SizedBox(height: 12),
@@ -230,6 +268,13 @@ class _AppUpdateDialogState extends State<AppUpdateDialog> {
                   semanticsLabel: 'Checking for updates',
                 ),
               ),
+            if (['preparing', 'installing'].contains(_phase))
+              const Padding(
+                padding: EdgeInsets.symmetric(vertical: 12),
+                child: LinearProgressIndicator(
+                  semanticsLabel: 'Android installation in progress',
+                ),
+              ),
             if (_phase == 'downloading')
               Padding(
                 padding: const EdgeInsets.symmetric(vertical: 12),
@@ -252,6 +297,18 @@ class _AppUpdateDialogState extends State<AppUpdateDialog> {
           onPressed: () => Navigator.pop(context),
           child: const Text('Close'),
         ),
+        if (_state['canCancel'] == true)
+          TextButton(
+            onPressed:
+                _acting
+                    ? null
+                    : () {
+                      _awaitingConfirmation = false;
+                      _installWhenReady = false;
+                      _command('cancelInstallation');
+                    },
+            child: const Text('Cancel installation'),
+          ),
         FilledButton(
           key: const ValueKey('updateAction'),
           focusNode: _actionFocus,
@@ -263,7 +320,9 @@ class _AppUpdateDialogState extends State<AppUpdateDialog> {
                   : () => _command('checkForUpdates'),
           child: Text(
             available
-                ? _phase == 'ready'
+                ? _phase == 'confirmation'
+                    ? 'Confirm installation'
+                    : _phase == 'ready'
                     ? 'Continue installation'
                     : 'Update now'
                 : 'Check for updates',

@@ -6,7 +6,6 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.provider.Settings
-import androidx.core.content.FileProvider
 import io.flutter.plugin.common.MethodChannel
 import org.json.JSONObject
 import java.io.File
@@ -18,7 +17,6 @@ import javax.net.ssl.HttpsURLConnection
 
 class AppUpdater(private val activity: Activity, channel: MethodChannel) {
     companion object {
-        const val INSTALL_REQUEST = 8702
         private const val REPOSITORY = "Zigdon-Code-Factory/audiobridge"
         private const val ASSET = "AudioBridge-Android.apk"
         private const val MAX_BYTES = 300L * 1024 * 1024
@@ -28,9 +26,13 @@ class AppUpdater(private val activity: Activity, channel: MethodChannel) {
     private val executor = Executors.newSingleThreadExecutor()
     private val lock = Any()
     private val installed = activity.packageManager.getPackageInfo(activity.packageName, 0)
-    private val currentVersion = installed.versionName ?: "0.2.0"
+    private val currentVersion = installed.versionName ?: "0.2.1"
     private val updateDirectory = File(activity.cacheDir, "updates")
     private val apk = File(updateDirectory, "AudioBridge.apk")
+    private val cachedRelease = File(updateDirectory, "verified-release.json")
+    private val installer = UpdateInstaller(activity.applicationContext)
+    private var lastInstallRevision = -1L
+    private var canCancel = false
     private var release: Release? = null
     private var phase = "idle"
     private var message = "Check the official GitHub release for a newer version."
@@ -46,19 +48,79 @@ class AppUpdater(private val activity: Activity, channel: MethodChannel) {
                     "checkForUpdates" -> { check(); result.success(null) }
                     "installUpdate" -> { download(); result.success(null) }
                     "launchInstaller" -> { launchInstaller(); result.success(null) }
+                    "confirmInstallation" -> { installer.confirm(activity); refreshInstallation(); result.success(null) }
+                    "cancelInstallation" -> { installer.cancel(); refreshInstallation(); result.success(null) }
                     else -> result.notImplemented()
                 }
             } catch (error: Exception) {
                 result.error("update_error", error.message ?: "Update request failed", null)
             }
         }
+        restoreDownload()
+        refreshInstallation()
     }
 
-    private fun snapshot(): Map<String, Any> = synchronized(lock) {
-        mutableMapOf<String, Any>("currentVersion" to currentVersion, "phase" to phase,
-            "message" to message, "progress" to progress).also { state ->
-            release?.let { state["version"] = it.version }
+    private fun snapshot(): Map<String, Any> {
+        refreshInstallation()
+        return synchronized(lock) {
+            mutableMapOf<String, Any>("currentVersion" to currentVersion, "phase" to phase,
+                "message" to message, "progress" to progress, "canCancel" to canCancel, "installRevision" to lastInstallRevision).also { state ->
+                release?.let { state["version"] = it.version }
+            }
         }
+    }
+
+    private fun refreshInstallation() {
+        try {
+        val receipt = InstallSessionStore.refresh(activity) ?: return
+        val active = InstallSessionStore.active(activity, receipt)
+        synchronized(lock) {
+            canCancel = active
+            if (receipt.revision != lastInstallRevision) {
+                lastInstallRevision = receipt.revision
+                phase = receipt.phase.name.lowercase()
+                message = receipt.message
+                progress = 0.0
+            }
+        }
+        } catch (_: Exception) {
+            setState("error", "Installation recovery status could not be read. Close and reopen AudioBridge before retrying.")
+        }
+    }
+
+    private fun restoreDownload() {
+        try {
+            if (!cachedRelease.isFile || cachedRelease.length() > 8192) return
+            val json = JSONObject(cachedRelease.readText())
+            val selected = Release(json.getString("version"), json.getString("url"), json.getLong("size"), json.getString("sha256"))
+            version(selected.version)
+            require(selected.url == "https://github.com/$REPOSITORY/releases/download/v${selected.version}/$ASSET" &&
+                selected.size in 1..MAX_BYTES && Regex("[0-9a-f]{64}").matches(selected.sha256))
+            if (newer(selected.version) && apk.isFile && apk.length() == selected.size) {
+                release = selected
+                setState("ready", "A downloaded update is available. It will be verified again before installation.")
+            }
+        } catch (_: Exception) {
+            setState("error", "The previous download could not be restored. Check for updates to download it again.")
+        }
+    }
+
+    private fun saveDownload(selected: Release) {
+        cachedRelease.writeText(JSONObject().put("version", selected.version).put("url", selected.url)
+            .put("size", selected.size).put("sha256", selected.sha256).toString())
+    }
+
+    private fun fileHash(file: File): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+        file.inputStream().use { input ->
+            val buffer = ByteArray(64 * 1024)
+            while (true) {
+                val count = input.read(buffer)
+                if (count < 0) break
+                digest.update(buffer, 0, count)
+            }
+        }
+        return digest.digest().joinToString("") { "%02x".format(it) }
     }
 
     private fun setState(next: String, text: String, fraction: Double = 0.0) = synchronized(lock) {
@@ -107,8 +169,9 @@ class AppUpdater(private val activity: Activity, channel: MethodChannel) {
     }
 
     private fun check() {
+        refreshInstallation()
         synchronized(lock) {
-            if (phase == "checking" || phase == "downloading" || phase == "installing" || phase == "permission") return
+            if (canCancel || phase in listOf("checking", "downloading", "preparing", "installing", "permission")) return
             release = null
             setState("checking", "Checking the official GitHub release...")
         }
@@ -157,17 +220,18 @@ class AppUpdater(private val activity: Activity, channel: MethodChannel) {
         }
     }
 
-    private fun verifyApk(file: File) {
-        val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) PackageManager.GET_SIGNING_CERTIFICATES else PackageManager.GET_SIGNATURES
+    private fun verifyApk(file: File, selected: Release): Long {
+        val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) PackageManager.GET_SIGNING_CERTIFICATES or PackageManager.GET_SIGNATURES else PackageManager.GET_SIGNATURES
         val archive = activity.packageManager.getPackageArchiveInfo(file.absolutePath, flags) ?: error("The download is not an Android package")
         val installed = activity.packageManager.getPackageInfo(activity.packageName, flags)
         require(archive.packageName == activity.packageName) { "Package identity does not match AudioBridge" }
         val archiveCode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) archive.longVersionCode else archive.versionCode.toLong()
         val installedCode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) installed.longVersionCode else installed.versionCode.toLong()
-        require(archiveCode > installedCode && archive.versionName == release?.version) { "The package is not a newer build of this release" }
-        val proposed = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) archive.signingInfo?.apkContentsSigners else archive.signatures
-        val current = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) installed.signingInfo?.apkContentsSigners else installed.signatures
+        require(archiveCode > installedCode && archive.versionName == selected.version) { "The package is not a newer build of this release" }
+        val proposed = (if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) archive.signingInfo?.apkContentsSigners else null) ?: archive.signatures
+        val current = (if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) installed.signingInfo?.apkContentsSigners else null) ?: installed.signatures
         require(!proposed.isNullOrEmpty() && !current.isNullOrEmpty() && proposed.toSet() == current.toSet()) { "Update signing identity does not match this installation" }
+        return archiveCode
     }
 
     private fun download() {
@@ -180,6 +244,12 @@ class AppUpdater(private val activity: Activity, channel: MethodChannel) {
             val partial = File(updateDirectory, "download.apk")
             try {
                 require(updateDirectory.isDirectory || updateDirectory.mkdirs()) { "Cannot create update cache" }
+                if (apk.isFile && apk.length() == selected.size && fileHash(apk) == selected.sha256) {
+                    verifyApk(apk, selected)
+                    saveDownload(selected)
+                    setState("ready", "Cached download verified. Ready to install the update.")
+                    return@execute
+                }
                 val digest = MessageDigest.getInstance("SHA-256")
                 val connection = connection(selected.url)
                 var count = 0L
@@ -201,10 +271,11 @@ class AppUpdater(private val activity: Activity, channel: MethodChannel) {
                 } finally { connection.disconnect() }
                 val actual = digest.digest().joinToString("") { "%02x".format(it) }
                 require(count == selected.size && actual == selected.sha256) { "Download verification failed; retry the update" }
-                verifyApk(partial)
+                verifyApk(partial, selected)
                 if (apk.exists()) require(apk.delete()) { "Cannot replace cached update" }
                 require(partial.renameTo(apk)) { "Cannot prepare the verified update" }
-                setState("ready", "Download verified. Ready for Android installation confirmation.")
+                saveDownload(selected)
+                setState("ready", "Download verified. Ready for Android installation.")
             } catch (error: Exception) {
                 partial.delete()
                 setState("error", "Could not download the update: ${error.message}. Your installed app is unchanged. Check again to retry.")
@@ -213,22 +284,36 @@ class AppUpdater(private val activity: Activity, channel: MethodChannel) {
     }
 
     private fun launchInstaller() {
-        require(synchronized(lock) { phase == "ready" }) { "No verified update is ready" }
-        verifyApk(apk)
+        refreshInstallation()
+        val selected = synchronized(lock) {
+            require(phase == "ready" && !canCancel) { "No verified update is ready, or an installation is already active" }
+            release ?: error("Check for updates to restore this download")
+        }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && !activity.packageManager.canRequestPackageInstalls()) {
             awaitingPermission = true
-            setState("permission", "Allow AudioBridge to install its update, then return here. Android will still ask you to confirm installation.")
+            setState("permission", "Allow AudioBridge to install its updates, then return here. Android may still require confirmation.")
             activity.startActivity(Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:${activity.packageName}")))
             return
         }
-        val uri = FileProvider.getUriForFile(activity, "${activity.packageName}.updates", apk)
-        val intent = Intent(Intent.ACTION_INSTALL_PACKAGE).setDataAndType(uri, "application/vnd.android.package-archive")
-            .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION).putExtra(Intent.EXTRA_RETURN_RESULT, true)
-        activity.startActivityForResult(intent, INSTALL_REQUEST)
-        setState("installing", "Confirm installation in Android. If you cancel, your current version stays installed.")
+        setState("preparing", "Verifying the download and preparing Android installation...")
+        executor.execute {
+            try {
+                require(apk.length() == selected.size && fileHash(apk) == selected.sha256) { "Cached download verification failed" }
+                val code = verifyApk(apk, selected)
+                check(!closed) { "Update canceled while closing the app" }
+                installer.install(apk, selected.version, code)
+                refreshInstallation()
+            } catch (error: Exception) {
+                refreshInstallation()
+                if (synchronized(lock) { phase != "complete" }) {
+                    setState("error", "Could not prepare installation: ${error.message}. Check for updates to retry.")
+                }
+            }
+        }
     }
 
     fun onResume() {
+        refreshInstallation()
         if (!awaitingPermission) return
         awaitingPermission = false
         setState("ready", "Installation permission was not granted. Continue installation to retry, or keep your current version.")
@@ -237,6 +322,5 @@ class AppUpdater(private val activity: Activity, channel: MethodChannel) {
         }
     }
 
-    fun onInstallResult() { setState("ready", "Installation did not finish. Continue installation to retry, or close to keep this version.") }
     fun close() { closed = true; executor.shutdownNow() }
 }

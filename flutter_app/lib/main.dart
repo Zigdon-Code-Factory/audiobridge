@@ -1277,7 +1277,7 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
     return Scaffold(
       backgroundColor: cs.surface,
       appBar: AppBar(
-        title: const Text('AudioBridge · 0.2.0'),
+        title: const Text('AudioBridge · 0.2.1'),
         actions: [IconButton(
           tooltip: 'App updates',
           icon: const Icon(Icons.system_update_rounded),

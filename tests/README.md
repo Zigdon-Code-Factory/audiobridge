@@ -2,6 +2,12 @@
 
 ## In-app updates and releases
 
+From `flutter_app/android`, run `gradlew.bat :app:testReleaseUnitTest` for
+the native Android session policy tests: callback identity, stale sessions,
+confirmation fallback, cancellation, and installed-version reconciliation.
+The Flutter update tests also cover automatic/explicit approval handoff, active
+session cancellation, stale-error reconciliation and large-text session controls.
+
 Build `audiobridge` and `updater_test` in the Windows build, then run
 `ctest --test-dir windows/build -C Release -R updater --output-on-failure`.
 The updater regression covers version comparison, fixed repository/HTTPS policy,

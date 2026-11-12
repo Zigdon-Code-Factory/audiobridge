@@ -80,7 +80,8 @@ void main() {
       ),
     );
     await tester.tap(find.text('Updates'));
-    await tester.pumpAndSettle();
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 350));
   }
 
   Future<void> available(WidgetTester tester) async {
@@ -211,4 +212,114 @@ void main() {
     expect(FocusManager.instance.primaryFocus?.debugLabel, 'Update status');
     await close(tester);
   });
+  testWidgets('a requested session opens required system confirmation once', (
+    tester,
+  ) async {
+    await available(tester);
+    await approve(tester);
+    state = {...state, 'phase': 'ready'};
+    await tester.pump(const Duration(milliseconds: 600));
+    await tester.pump();
+    state = {
+      ...state,
+      'phase': 'confirmation',
+      'canCancel': true,
+      'installRevision': 2,
+    };
+    await tester.pump(const Duration(milliseconds: 600));
+    await tester.pump();
+    expect(calls.where((call) => call == 'confirmInstallation').length, 1);
+    await tester.pump(const Duration(seconds: 1));
+    expect(calls.where((call) => call == 'confirmInstallation').length, 1);
+    await close(tester);
+  });
+  testWidgets(
+    'reopened confirmation is explicit and does not resubmit the APK',
+    (tester) async {
+      state = {
+        ...state,
+        'phase': 'confirmation',
+        'canCancel': true,
+        'message': 'Android requires approval.',
+      };
+      await open(tester);
+      expect(calls.contains('confirmInstallation'), isFalse);
+      await tester.tap(find.text('Confirm installation'));
+      await tester.pump();
+      expect(calls.where((call) => call == 'confirmInstallation').length, 1);
+      expect(calls.contains('launchInstaller'), isFalse);
+      expect(calls.contains('installUpdate'), isFalse);
+      await close(tester);
+    },
+  );
+  testWidgets(
+    'active installation blocks duplicates and permits cancellation',
+    (tester) async {
+      state = {
+        ...state,
+        'phase': 'installing',
+        'canCancel': true,
+        'message': 'Android is installing...',
+      };
+      await open(tester);
+      expect(
+        tester
+            .widget<FilledButton>(find.byKey(const ValueKey('updateAction')))
+            .onPressed,
+        isNull,
+      );
+      await tester.tap(find.text('Cancel installation'));
+      await tester.pump();
+      expect(calls.where((call) => call == 'cancelInstallation').length, 1);
+      expect(calls.contains('installUpdate'), isFalse);
+      await close(tester);
+    },
+  );
+  testWidgets(
+    'authoritative session progress retires an obsolete request error',
+    (tester) async {
+      rejectRequest = true;
+      state = {
+        ...state,
+        'phase': 'confirmation',
+        'canCancel': true,
+        'installRevision': 1,
+      };
+      await open(tester);
+      await tester.tap(find.text('Confirm installation'));
+      await tester.pumpAndSettle();
+      expect(find.textContaining('could not be confirmed'), findsOneWidget);
+      state = {
+        ...state,
+        'phase': 'error',
+        'canCancel': false,
+        'installRevision': 2,
+        'message': 'Installation was canceled.',
+      };
+      await tester.pump(const Duration(milliseconds: 600));
+      expect(find.text('Installation was canceled.'), findsOneWidget);
+      expect(find.textContaining('could not be confirmed'), findsNothing);
+      await close(tester);
+    },
+  );
+  testWidgets(
+    'large-text confirmation and cancellation controls remain reachable',
+    (tester) async {
+      tester.view.physicalSize = const Size(320, 568);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+      state = {
+        ...state,
+        'phase': 'confirmation',
+        'canCancel': true,
+        'message':
+            'Android requires approval. Your installed app is unchanged.',
+      };
+      await open(tester, large: true);
+      await tester.ensureVisible(find.text('Confirm installation'));
+      expect(tester.takeException(), isNull);
+      await close(tester);
+    },
+  );
 }
