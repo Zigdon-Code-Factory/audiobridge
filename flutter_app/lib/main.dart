@@ -6,6 +6,7 @@ import 'dart:io';
 import 'dart:math';
 import 'desktop_controls.dart';
 import 'phone_controls.dart';
+import 'app_updates.dart';
 
 void main() {
   runApp(const AudioBridgeApp());
@@ -1275,6 +1276,19 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
 
     return Scaffold(
       backgroundColor: cs.surface,
+      appBar: AppBar(
+        title: const Text('AudioBridge · 0.2.0'),
+        actions: [IconButton(
+          tooltip: 'App updates',
+          icon: const Icon(Icons.system_update_rounded),
+          onPressed: () => showDialog<void>(context: context, builder: (context) => AppUpdateDialog(
+            beforeInstall: () async {
+              await _disconnect();
+              return mounted && _state == ConnectionState_.disconnected;
+            },
+          )),
+        )],
+      ),
       body: SafeArea(
         child: _state == ConnectionState_.disconnecting ||
                 _state == ConnectionState_.disconnectFailed

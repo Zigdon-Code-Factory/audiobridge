@@ -1,5 +1,23 @@
 # Regression tests
 
+## In-app updates and releases
+
+Build `audiobridge` and `updater_test` in the Windows build, then run
+`ctest --test-dir windows/build -C Release -R updater --output-on-failure`.
+The updater regression covers version comparison, fixed repository/HTTPS policy,
+asset SHA-256 metadata, hashing, ZIP traversal/duplicate rejection, required files,
+copy-failure rollback and pairing/preferences preservation. Run
+`updater_test.exe <release-zip>` to validate the actual packaged runtime, and
+`updater_test.exe --online` for an explicit live GitHub check without installation.
+
+`flutter test --no-pub test/app_updates_test.dart` covers explicit checks, consent,
+verified-download/installer ordering, blocked shutdown, persistent bridge failures,
+keyboard focus and 320-pixel/200%-text dialog reflow. The desktop fixture harness
+includes consent, progress, verification failure and bridge failure update states.
+These are not full native installer or hardware audio certification.
+
+See `UPDATING.md` for the release packaging and signing constraints.
+
 Windows phone microphone effects have a real-model test in the server build:
 `cmake --build windows/build --config Release --target voice_effects_test`, then
 `ctest --test-dir windows/build -C Release -R voice_ --output-on-failure`.

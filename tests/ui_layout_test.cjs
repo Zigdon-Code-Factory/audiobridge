@@ -674,10 +674,56 @@ const baseline = {
         await page.locator('#retrySample').click();
         await page.waitForFunction(() => sampleState === 'available' && !operationErrors.clip);
         await inspect('59-sample-decode-recovered');
+        await page.evaluate(async baseline => {
+            window.__state = structuredClone(baseline);
+            window.__state.update = {currentVersion:'0.2.0',phase:'idle',message:'Check for a newer version.',progress:0};
+            window._checkForUpdates = async () => {
+                if (window.__failUpdate) throw Error('fixture update service unavailable');
+                window.__state.update.phase = 'checking'; window.__state.update.message = 'Checking the official GitHub release...';
+            };
+            window._installUpdate = async () => {
+                window.__calls.push(['update']);
+                window.__state.update.phase = 'downloading'; window.__state.update.progress = 0.4;
+                window.__state.update.message = 'Downloading and verifying the update...';
+            };
+            await tick();
+        }, baseline);
+        await page.locator('#openAppUpdates').click();
+        await inspect('60-updates-idle');
+        await page.locator('#checkAppUpdates').click();
+        await page.waitForFunction(() => document.getElementById('checkAppUpdates').disabled);
+        await inspect('61-updates-checking');
+        await page.evaluate(async () => {
+            Object.assign(window.__state.update, {phase:'available',version:'0.2.1',message:'Version 0.2.1 is available.'});
+            await tick();
+        });
+        await page.locator('#installAppUpdate').click();
+        assert.equal(await page.evaluate(() => document.activeElement.id), 'cancelAppUpdate');
+        await inspect('62-updates-confirmation');
+        await page.locator('#cancelAppUpdate').click();
+        assert.equal(await page.evaluate(() => window.__calls.filter(call => call[0] === 'update').length), 0);
+        await page.locator('#installAppUpdate').click();
+        await page.locator('#confirmAppUpdate').click();
+        await page.waitForFunction(() => !document.getElementById('updateProgress').hidden);
+        await inspect('63-updates-download');
+        assert.equal(await page.evaluate(() => window.__calls.filter(call => call[0] === 'update').length), 1);
+        await page.evaluate(async () => {
+            Object.assign(window.__state.update, {phase:'error',message:'Download verification failed. Installed files are unchanged.'});
+            await tick();
+        });
+        await inspect('64-updates-verification-failure');
+        await page.evaluate(() => { window.__failUpdate = true; });
+        await page.locator('#checkAppUpdates').click();
+        await page.waitForFunction(() => document.getElementById('updateMessage').textContent.includes('not confirmed'));
+        await page.waitForTimeout(150);
+        assert.match(await page.locator('#updateMessage').textContent(), /not confirmed/);
+        await inspect('65-updates-bridge-failure');
+        await page.locator('#closeAppUpdates').click();
+        assert.equal(await page.evaluate(() => document.activeElement.id), 'openAppUpdates');
         assert.deepEqual(errors, [], 'browser errors');
         const failures = reports.filter(report => report.violations.length);
         fs.writeFileSync(path.join(outputDir, 'report.json'), JSON.stringify({ errors, reports }, null, 2));
         assert.deepEqual(failures, [], 'accessibility violations: ' + JSON.stringify(failures));
-        console.log('Desktop UI: 62 visual scenarios, compact tab order, minimum-window task access, persistent failure feedback, WCAG AA, keyboard flow, routing, tuning, recording, pairing, removal and per-device permissions passed.');
+        console.log('Desktop UI: 68 visual scenarios, update consent/progress/recovery, compact tab order, keyboard flow, routing, tuning, recording, pairing, removal and per-device permissions passed.');
     } finally { await browser.close(); }
 })().catch(error => { console.error(error); process.exitCode = 1; });

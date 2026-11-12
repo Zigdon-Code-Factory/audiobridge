@@ -1,6 +1,7 @@
 #include "gui.h"
 #include "gui_html.h"
 #include "network.h"
+#include "app_updater.h"
 
 #include <sstream>
 #include <ctime>
@@ -101,7 +102,7 @@ static std::string parseFirstString(const std::string& args) {
 // ---- Constructor / Destructor ----
 
 ServerGui::ServerGui() {}
-ServerGui::~ServerGui() {}
+ServerGui::~ServerGui() { updater_.reset(); }
 
 // ---- Initialize ----
 
@@ -124,6 +125,9 @@ bool ServerGui::initialize(const std::string& title) {
     webview_->set_size(1120, 860, WEBVIEW_HINT_NONE);
     webview_->set_size(640, 600, WEBVIEW_HINT_MIN);
 
+    updater_ = std::make_unique<AppUpdater>([this] {
+        webview_->dispatch([this] { webview_->terminate(); });
+    });
     setupBindings();
     webview_->set_html(gui_html::HTML_CONTENT);
 
@@ -139,6 +143,14 @@ void ServerGui::run() {
 // ---- Bindings ----
 
 void ServerGui::setupBindings() {
+    webview_->bind("_checkForUpdates", [this](const std::string&) -> std::string {
+        updater_->check();
+        return "{}";
+    });
+    webview_->bind("_installUpdate", [this](const std::string&) -> std::string {
+        updater_->install();
+        return "{}";
+    });
     webview_->bind("_setPeerRole", [this](const std::string& args) -> std::string {
         const auto input = parseFirstString(args);
         if (input.size() < 3 || (input[0] != '0' && input[0] != '1') || input[1] != ':') return "{\"applied\":false}";
@@ -297,6 +309,7 @@ std::string ServerGui::buildStateJson() {
     std::string s;
     s.reserve(2048);
     s += "{";
+    s += "\"update\":" + updater_->stateJson() + ",";
     s += "\"voice\":" + stats_.voiceJson + ",";
     s += "\"connected\":" + std::string(stats_.connected ? "true" : "false") + ",";
     s += "\"micOwner\":\"" + escapeJson(stats_.micOwner) + "\",";

@@ -27,6 +27,7 @@ class MainActivity : FlutterActivity() {
     private var nativeStarted = false
     private var bluetoothScoActive = false
     private var volumeReceiverRegistered = false
+    private var appUpdater: AppUpdater? = null
 
     private val volumeReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
@@ -212,6 +213,7 @@ class MainActivity : FlutterActivity() {
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
+        appUpdater = AppUpdater(this, MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "com.audiobridge/updates"))
         registerVolumeTracking()
         syncSystemVolume()
 
@@ -435,8 +437,19 @@ class MainActivity : FlutterActivity() {
     }
 
     override fun onDestroy() {
+        appUpdater?.close()
         unregisterVolumeTracking()
         methodChannel = null
         super.onDestroy()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        appUpdater?.onResume()
+    }
+
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == AppUpdater.INSTALL_REQUEST) appUpdater?.onInstallResult()
     }
 }

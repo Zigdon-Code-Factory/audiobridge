@@ -9,6 +9,7 @@
 
 // Forward declarations
 struct ApprovedPeer;
+class AppUpdater;
 
 #include "webview/webview.h"
 
@@ -117,6 +118,7 @@ private:
     static std::string wideToUtf8(const std::wstring& ws);
 
     std::unique_ptr<webview::webview> webview_;
+    std::unique_ptr<AppUpdater> updater_;
     int jitterBufferMs_ = 10;
     int frameSizeMs_ = 2;
     bool rawPcm_ = true;

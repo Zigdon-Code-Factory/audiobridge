@@ -369,7 +369,9 @@ std::string(R"html(lass="panel peers-panel"><summary id="pairedDevicesSummary"><
 <section class="panel voice-panel" id="voiceCard" aria-labelledby="voiceTitle"><div class="panel-body voice-heading"><div class="panel-title"><div><div class="eyebrow">Microphone studio</div><h2 id="voiceTitle">Voice cleanup</h2></div><svg class="icon" aria-hidden="true"><use href="#icon-wave"/></svg></div><p class="processing-availability" id="processingAvailability" role="status" hidden>Loading voice models · saved cleanup preferences are inactive.</p></div><div class="panel-body voice-controls"><div class="effects-unavailable" id="effectsUnavailable" role="status" hidden><strong id="effectsUnavailableTitle">Effects unavailable · preferences inactive</strong><p id="effectsUnavailableDescription">Saved preferences below are inactive. Unprocessed audio is used when the phone microphone is streaming.</p><details><summary>Restore voice processing</summary><ol><li>Keep <code>onnxruntime.dll</code> and the complete <code>voice-models</code> folder beside <code>audiobridge.exe</code>.</li><li>If files were moved or removed, restore them from the same desktop build.</li><li>Close and relaunch AudioBridge to load the models again. Your phone app does not need an update.</li></ol></details></div><p class="local-feedback" id="settingsFeedback" role="status" hidden></p><div class="quick-effects"><div><div class="effect"><div><label class="effect-name" for="voiceNoise">Noise removal</label><p class="effect-description" id="noiseHelp">Keep the voice. Cut the background.</p></div><input class="switch" id="voiceNoise" type="checkbox" role="switch" aria-describedby="noiseHelp" checked></div><div class="strength-row"><label for="voiceStrength">Strength</label><select id="voiceStrength"><option value="6">Gentle · 6 dB</option><option value="10">Light · 10 dB</option><option value="15">Medium · 15 dB</option><option value="20">Strong · 20 dB</option><option value="30">Intense · 30 dB</option><option value="100" selected>Maximum</option></select></div></div><div class="effect"><div><label class="effect-name" for="voiceGate">Voice gate</label><p class="effect-description" id="gateHelp">Quiet the mic when you're not speaking.</p></div><input class="switch" id="voiceGate" type="checkbox" role="switch" aria-describedby="gateHelp" checked></div></div></div><div class="preview"><div class="preview-heading"><h3>Test your microphone</h3><span id="voiceTime">10-second mic check</span></div><p class="mic-readiness" id="micReadiness"></p><div class="preview-actions"><button class="btn primary voice-btn" id="voiceRecord" aria-pressed="false" disabled>Record sample</button><div class="sample-version"><label for="voiceSource">Listen to</label><select id="voiceSource"><option value="1" id="processedOption">Processed</option><option value="0">Original</option></select></div></div><p class="local-feedback" id="recordingFeedback" role="status" hidden></p><p class="local-feedback" id="clipFeedback" role="status" hidden></p><p class="sample-availability" id="sampleAvailability" role="status" hidden></p><button class="btn" id="retrySample" hidden>Reload sample</button><audio id="voiceAudio" controls preload="auto" aria-label="Phone microphone sample playback" hidden></audio><p class="preview-status" id="voicePreviewStatus" role="status">Connect your phone and enable its mic, then record a sample to compare.</p></div><div class="panel-body voice-detail"><details class="tuning"><summary>Fine-tune your microphone</summary><div class="details-content"><div class="tuning-grid"><div><div class="control-heading"><label for="voiceThreshold">Speech threshold</label><span class="control-value" id="voiceThresholdValue">50%</span></div><input id="voiceThreshold" type="range" min="10" max="90" value="50"><p class="control-note">Higher requires clearer speech.</p></div><div><div class="control-heading"><label for="voiceHold">Gate hold</label><span class="control-value" id="voiceHoldValue">0.3 s</span></div><input id="voiceHold" type="range" min="100" max="1500" step="100" value="300"><p class="control-note">Wait before quieting the mic.</p></div></div><label class="lowcut-row"><input id="voiceLowCut" type="checkbox">Reduce low rumble <span class="dim">· 80 Hz</span></label></div></details><p class="processor-status" id="voiceStatus" role="status">Loading voice models…</p></div></section>
 </div></fieldset>
 <details class="diagnostics"><summary>Connection diagnostics <span class="summary-info">Activity &amp; transport</span></summary><div class="details-content"><div class="stats-row" id="statsRow1">No stream activity yet.</div><div class="stats-row" id="statsRow2"></div><div class="log-container" id="logContainer" tabindex="0" role="region" aria-label="Connection activity log"><div>Waiting for events…</div></div></div></details>
-<footer class="footer"><span>AudioBridge / Windows</span><span>Processed on your PC. Recordings stay in memory.</span></footer>
+)html") +
+std::string(R"html(<dialog id="appUpdatesDialog" aria-labelledby="appUpdatesTitle"><h2 id="appUpdatesTitle">App updates</h2><p id="installedVersion">Installed: 0.2.0</p><p id="updateMessage" role="status" tabindex="-1">Check the official GitHub release for a newer version.</p><progress id="updateProgress" max="1" value="0" aria-label="Update download progress" hidden></progress><p>Your pairings and settings are kept. This updates Windows only; your phone has its own update button.</p><div class="btn-row"><button class="btn" id="closeAppUpdates">Close</button><button class="btn primary" id="checkAppUpdates">Check for updates</button><button class="btn primary" id="installAppUpdate" hidden>Update now</button></div></dialog><dialog id="confirmAppUpdateDialog" aria-labelledby="confirmAppUpdateTitle"><h2 id="confirmAppUpdateTitle">Install AudioBridge update?</h2><p>The complete Windows release is downloaded from the official GitHub repository and verified before installation. Audio will stop and AudioBridge will restart. Your pairings, preferences and installed drivers are not removed.</p><div class="btn-row"><button class="btn" id="cancelAppUpdate" autofocus>Not now</button><button class="btn primary" id="confirmAppUpdate">Download and restart</button></div></dialog>)html") +
+std::string(R"html(<footer class="footer"><span>AudioBridge / Windows 0.2.0</span><button class="btn" id="openAppUpdates">App updates</button><span>Processed on your PC. Recordings stay in memory.</span></footer>
 </main><aside class="recording-strip" id="recordingStrip" aria-label="Recording controls" hidden><div><strong id="recordingStripTitle">Recording phone microphone</strong><p id="recordingStripStatus">Recording stops at 10 seconds.</p></div><button class="btn danger" id="persistentStop">Stop recording</button></aside>
 <dialog id="micSetupDialog" aria-labelledby="micSetupTitle"><h2 id="micSetupTitle">Set up your phone as a PC microphone</h2><p>For calling apps, install a virtual microphone on this PC. Playing to ordinary speakers is still possible without one.</p><ol><li>Get <strong>VB-CABLE</strong> from VB-Audio’s official download page. Follow its Windows installation instructions and restart if prompted.</li><li>Relaunch AudioBridge, then choose <strong>CABLE Input</strong> under Return phone microphone.</li><li>Choose <strong>CABLE Output</strong> as the microphone in your calling app. Enable your phone mic and check its level.</li></ol><p>Already have the AudioBridge microphone driver and service installed? Choose <strong>AudioBridge Microphone</strong> in both apps instead. An unavailable entry is not ready for use.</p><p class="local-feedback" id="setupOpenError" role="status" hidden></p><div class="btn-row"><button class="btn primary" id="openCableDownload">Open official VB-CABLE page</button><button class="btn" id="closeMicSetup" autofocus>Done</button></div></dialog><dialog id="removeDeviceDialog" aria-labelledby="removeDeviceTitle" aria-describedby="removeDeviceDescription"><h2 id="removeDeviceTitle">Remove paired device?</h2><p id="removeDeviceDescription"></p><p id="removeDeviceError" role="alert"></p><div class="btn-row"><button class="btn" id="cancelRemoveDevice" autofocus>Keep device</button><button class="btn danger" id="confirmRemoveDevice">Remove device</button></div></dialog>
 <script>
@@ -1214,6 +1216,7 @@ async function tick() {
         document.getElementById('sessionOverview').hidden = false;
         document.getElementById('streamSummary').textContent = (s.rawPcm ? 'PCM' : 'Opus') + ' · ' + frameLabel(s.frameSizeMs);
         reconcileOperationOutcomes(s);
+        renderAppUpdate(s.update);
         updateStatusCard(s);
         updateVoice(s);
         updatePairRequest(s.pairRequest);
@@ -1250,6 +1253,46 @@ std::string(R"html(        setText('routeMicStatus', 'Microphone status is unkno
     } finally { tickBusy = false; }
 }
 
+)html") +
+std::string(R"html(var appUpdateState = {};
+var appUpdateError = '';
+function renderAppUpdate(state) {
+    if (!state) return;
+    if (state.phase !== appUpdateState.phase) appUpdateError = '';
+    appUpdateState = state;
+    var busy = ['checking', 'downloading', 'restarting'].includes(state.phase);
+    setText('installedVersion', 'Installed: ' + state.currentVersion + (state.version ? ' · Latest release: ' + state.version : ''));
+    setText('updateMessage', appUpdateError || state.message);
+    document.getElementById('checkAppUpdates').disabled = busy;
+    var install = document.getElementById('installAppUpdate');
+    install.hidden = state.phase !== 'available';
+    install.disabled = busy;
+    var progress = document.getElementById('updateProgress');
+    progress.hidden = state.phase !== 'downloading';
+    progress.value = Math.min(1, Math.max(0, state.progress || 0));
+}
+function requestAppUpdate(action) {
+    appUpdateError = '';
+    var origin = document.activeElement;
+    requestBridge(action).then(function() {
+        if (document.activeElement === origin || document.activeElement === document.body) document.getElementById('updateMessage').focus();
+    }).catch(function() {
+        appUpdateError = 'Update request was not confirmed. Check again or retry; installed files are unchanged until a verified update is applied.';
+        setText('updateMessage', appUpdateError);
+    });
+}
+document.getElementById('openAppUpdates').addEventListener('click', function() {
+    document.getElementById('appUpdatesDialog').showModal();
+    document.getElementById('checkAppUpdates').focus();
+});
+document.getElementById('closeAppUpdates').addEventListener('click', function() { document.getElementById('appUpdatesDialog').close(); });
+document.getElementById('checkAppUpdates').addEventListener('click', function() { requestAppUpdate(() => window._checkForUpdates()); });
+document.getElementById('installAppUpdate').addEventListener('click', function() { document.getElementById('confirmAppUpdateDialog').showModal(); });
+document.getElementById('cancelAppUpdate').addEventListener('click', function() { document.getElementById('confirmAppUpdateDialog').close(); });
+document.getElementById('confirmAppUpdate').addEventListener('click', function() {
+    document.getElementById('confirmAppUpdateDialog').close();
+    requestAppUpdate(() => window._installUpdate());
+});
 setInterval(tick, 50);
 </script>
 </body>

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(AudioBridge VERSION 1.0.0 LANGUAGES C CXX)
+project(AudioBridge VERSION 0.2.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -41,6 +41,13 @@ FetchContent_MakeAvailable(webview)
 
 include(voice_effects.cmake)
 
+add_library(audiobridge_update_support STATIC src/update_support.cpp)
+target_compile_definitions(audiobridge_update_support PUBLIC WIN32_LEAN_AND_MEAN NOMINMAX _WIN32_WINNT=0x0A00)
+target_link_libraries(audiobridge_update_support PUBLIC bcrypt winhttp windowsapp ole32)
+add_executable(audiobridge_updater WIN32 src/update_helper.cpp)
+set_target_properties(audiobridge_updater PROPERTIES OUTPUT_NAME "audiobridge-updater")
+target_link_libraries(audiobridge_updater PRIVATE audiobridge_update_support shell32)
+
 add_executable(audiobridge WIN32
     src/main.cpp
     src/audio_capture.cpp
@@ -50,6 +57,8 @@ add_executable(audiobridge WIN32
     src/opus_decoder.cpp
     src/network.cpp
     src/gui.cpp
+    src/app_updater.cpp
+    src/version.rc
     ../common/dtls_session.cpp
 )
 
@@ -62,6 +71,7 @@ target_include_directories(audiobridge PRIVATE
 
 target_link_libraries(audiobridge PRIVATE
     audiobridge_voice
+    audiobridge_update_support
     opus
     webview::core
     ws2_32
@@ -78,8 +88,15 @@ target_link_libraries(audiobridge PRIVATE
 )
 
 copy_voice_runtime(audiobridge)
+add_dependencies(audiobridge audiobridge_updater)
 
 enable_testing()
+add_executable(updater_test ../tests/updater_test.cpp src/app_updater.cpp)
+target_include_directories(updater_test PRIVATE src ../common)
+target_link_libraries(updater_test PRIVATE audiobridge_update_support)
+target_compile_options(updater_test PRIVATE /UNDEBUG)
+add_test(NAME updater COMMAND updater_test)
+set_tests_properties(updater PROPERTIES TIMEOUT 90)
 add_executable(voice_effects_test ../tests/voice_effects_test.cpp)
 target_link_libraries(voice_effects_test PRIVATE audiobridge_voice)
 target_compile_options(voice_effects_test PRIVATE /UNDEBUG)
