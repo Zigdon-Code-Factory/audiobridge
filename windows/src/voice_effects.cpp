@@ -60,12 +60,22 @@ VoiceSettings VoiceSettings::parse(const std::string& text) {
     s.noise = n != 0; s.strength = std::clamp(strength,0,100);
     s.gate = g != 0; s.threshold = std::clamp(threshold,10,90);
     s.holdMs = std::clamp(hold,100,1500); s.lowCut = low != 0;
+    int makeupDb;
+    if (in >> makeupDb) s.makeupDb = std::clamp(makeupDb, 0, 12);
     return s;
 }
 std::string VoiceSettings::serialize() const {
     return std::to_string(noise) + " " + std::to_string(strength) + " " +
         std::to_string(gate) + " " + std::to_string(threshold) + " " +
-        std::to_string(holdMs) + " " + std::to_string(lowCut);
+        std::to_string(holdMs) + " " + std::to_string(lowCut) +
+        (makeupDb ? " " + std::to_string(makeupDb) : "");
+}
+
+static float softLimit(float x) {
+    constexpr float knee = 0.89f, range = 1.f - knee;
+    const float a = std::abs(x);
+    if (a <= knee) return x;
+    return std::copysign(knee + range * std::tanh((a - knee) / range), x);
 }
 
 struct VoiceDsp::Impl {
@@ -79,6 +89,7 @@ struct VoiceDsp::Impl {
     std::array<float,256> vadState{};
     std::array<float,64> context{};
     float gain = 1.f;
+    float limiterGain = 1.f;
     size_t sinceSpeech = 0;
     bool speech = true;
     double z1 = 0, z2 = 0;
@@ -117,7 +128,7 @@ struct VoiceDsp::Impl {
                 for (size_t j=0;j<count;++j) state[j] = .001f - .0009f*j/(count-1);
         }
         pending.clear(); dry.assign(Delay,0.f); vadPending.clear();
-        vadState.fill(0); context.fill(0); gain = 1; sinceSpeech = 0; speech = true; z1 = z2 = 0;
+        vadState.fill(0); context.fill(0); gain = 1; limiterGain = 1; sinceSpeech = 0; speech = true; z1 = z2 = 0;
     }
     float probability(const float* window) {
         std::array<float,576> x;
@@ -171,9 +182,19 @@ struct VoiceDsp::Impl {
                 vadPending.erase(vadPending.begin(),vadPending.begin()+1536);
             }
         } else { speech=true; sinceSpeech=0; vadPending.clear(); }
+        // Makeup gain restores level lost to suppression. When boosting, a peak limiter
+        // (instant attack, ~80 ms release) holds peaks at -1 dBFS instead of clipping them;
+        // softLimit is only a safety net. Without a boost, output is unchanged.
+        const float makeup = s.noise && s.strength > 0 ? std::pow(10.f, s.makeupDb / 20.f) : 1.f;
+        constexpr float ceiling = .89f, release = 1.f / (.08f * 48000);
         for (float& x : processed) {
             gain=std::clamp(gain+(speech ? 1.f/240 : -1.f/3840),0.f,1.f);
-            x=std::clamp(std::isfinite(x) ? x*gain : 0.f,-1.f,1.f);
+            if (!std::isfinite(x)) { x = 0.f; continue; }
+            if (makeup <= 1.f) { x = std::clamp(x*gain,-1.f,1.f); continue; }
+            const float y = x*gain*makeup, level = std::abs(y);
+            const float needed = level > ceiling ? ceiling / level : 1.f;
+            limiterGain = std::min(needed, limiterGain + (1.f - limiterGain) * release);
+            x = softLimit(y * limiterGain);
         }
         return processed;
     }

@@ -53,6 +53,23 @@ int main(int argc,char** argv) {
         assert(std::isfinite(wet[i]));
         assert(std::abs(mixed[i]-(.9f*wet[i]+.1f*x[i]))<1e-5);
     }
+    auto boostedSettings = blend;
+    boostedSettings.makeupDb = 6;
+    auto boosted = dsp.render(x, boostedSettings);
+    assert(std::abs(rms(boosted) / rms(mixed) - std::pow(10.f, 6.f/20)) < .001f);
+    assert(VoiceSettings::parse(boostedSettings.serialize()) == boostedSettings);
+    // Large boosts are soft-limited instead of hard-clipped at full scale.
+    auto loud = x; for (float& v : loud) v *= 2.5f;
+    boostedSettings.makeupDb = 12;
+    auto limited = dsp.render(loud, boostedSettings);
+    float limitedPeak = 0;
+    for (float v : limited) { assert(std::isfinite(v)); limitedPeak = std::max(limitedPeak, std::abs(v)); }
+    assert(limitedPeak <= .9f && limitedPeak > .8f);   // held near the -1 dBFS ceiling
+    // Gain reduction follows peaks and releases, so only a few samples sit at the ceiling.
+    const auto atCeiling = std::count_if(limited.begin(), limited.end(), [](float v) { return std::abs(v) >= .885f; });
+    assert(atCeiling < static_cast<long long>(limited.size() / 50));
+    assert(VoiceSettings::parse("1 6 1 50 300 0 99").makeupDb == 12);
+    assert(VoiceSettings::parse("1 6 1 50 300 0").makeupDb == 0);
     // Real VAD must eventually close on sustained silence and reset reproducibly.
     auto silence=std::vector<float>(48000,0.f);
     VoiceSettings gated; gated.noise=false;

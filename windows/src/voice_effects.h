@@ -16,9 +16,10 @@ struct VoiceSettings {
     int threshold = 50;
     int holdMs = 300;
     bool lowCut = false;
+    int makeupDb = 0;
     bool operator==(const VoiceSettings& b) const {
         return noise == b.noise && strength == b.strength && gate == b.gate &&
-            threshold == b.threshold && holdMs == b.holdMs && lowCut == b.lowCut;
+            threshold == b.threshold && holdMs == b.holdMs && lowCut == b.lowCut && makeupDb == b.makeupDb;
     }
     static VoiceSettings parse(const std::string& text);
     std::string serialize() const;

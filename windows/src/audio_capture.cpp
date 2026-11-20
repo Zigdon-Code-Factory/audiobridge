@@ -6,6 +6,7 @@
 #include <avrt.h>
 #include <cstdio>
 #include <cstring>
+#include <algorithm>
 #include <cmath>
 #include <chrono>
 
@@ -308,6 +309,7 @@ bool AudioCapture::initialize(const std::wstring& deviceId, bool loopback) {
         hr = device_->Activate(IID_IAudioClient, CLSCTX_ALL, nullptr, (void**)&audioClient_);
         if (FAILED(hr)) {
             printf("Failed to activate audio client: 0x%08lx\n", hr);
+            lastError_ = hr;
             return false;
         }
 
@@ -377,6 +379,7 @@ bool AudioCapture::initialize(const std::wstring& deviceId, bool loopback) {
 
         if (FAILED(hr)) {
             printf("Failed to initialize audio client: 0x%08lx\n", hr);
+            lastError_ = hr;
             CoTaskMemFree(mixFormat);
             return false;
         }
@@ -397,6 +400,8 @@ bool AudioCapture::start(FrameCallback callback) {
     callback_ = callback;
     resampleBuf_.clear();
     resamplePos_ = 0.0;
+    resamplePrev_.clear();
+    failed_ = false;
 
     if (usingKernelTap_) {
         if (lowPeriodClient_ && lowPeriodRender_) {
@@ -410,6 +415,7 @@ bool AudioCapture::start(FrameCallback callback) {
     HRESULT hr = audioClient_->Start();
     if (FAILED(hr)) {
         printf("Failed to start capture: 0x%08lx\n", hr);
+        lastError_ = hr;
         return false;
     }
 
@@ -651,6 +657,7 @@ void AudioCapture::captureThread() {
 
     printf("[CAPTURE] Thread exiting (total frames=%llu, discontinuities=%llu)\n",
            totalFrames, discontinuityCount);
+    if (running_) failed_ = true;   // ended without stop(): the stream is dead
     if (task) AvRevertMmThreadCharacteristics(task);
 }
 
@@ -684,36 +691,35 @@ void AudioCapture::resampleAndDeliver(const float* src, uint32_t srcFrames,
         // Resample: simple linear interpolation
         double ratio = (double)srcRate / (double)targetRate;
 
-        if (srcFrames < 2) {
-            // Too few frames to interpolate
-            resamplePos_ = 0.0;
-            return;
+        // Source index -1 is the previous packet's last frame, so interpolation spans
+        // packet boundaries instead of extrapolating the first output of each packet.
+        if (resamplePrev_.size() != srcChannels) {
+            resamplePrev_.assign(srcChannels, 0.0f);
+            if (resamplePos_ < 0.0) resamplePos_ = 0.0;
         }
-
-        for (uint32_t i = 0; ; i++) {
-            double srcPos = resamplePos_ + i * ratio;
-            if (srcPos >= (double)(srcFrames - 1)) {
-                resamplePos_ = srcPos - (double)srcFrames;
-                break;
-            }
-
-            uint32_t idx = (uint32_t)srcPos;
-            float frac = (float)(srcPos - idx);
-            uint32_t idx1 = idx + 1 < srcFrames ? idx + 1 : idx;
-
+        const auto sample = [&](int64_t index, uint32_t ch) {
+            return index < 0 ? resamplePrev_[ch] : src[index * srcChannels + ch];
+        };
+        double srcPos = resamplePos_;
+        while (srcPos <= (double)(srcFrames - 1)) {
+            const int64_t idx = (int64_t)std::floor(srcPos);
+            const float frac = (float)(srcPos - (double)idx);
+            const int64_t idx1 = std::min<int64_t>(idx + 1, srcFrames - 1);
             for (uint32_t ch = 0; ch < targetChannels; ch++) {
-                float s0 = 0.0f, s1 = 0.0f;
-                if (ch < srcChannels) {
-                    s0 = src[idx * srcChannels + ch];
-                    s1 = src[idx1 * srcChannels + ch];
-                } else if (srcChannels == 1) {
-                    // Mono to stereo: duplicate
-                    s0 = src[idx * srcChannels];
-                    s1 = src[idx1 * srcChannels];
+                // Missing channels duplicate a mono source and are silent otherwise.
+                const uint32_t from = ch < srcChannels ? ch : 0;
+                float value = 0.0f;
+                if (ch < srcChannels || srcChannels == 1) {
+                    const float s0 = sample(idx, from), s1 = sample(idx1, from);
+                    value = s0 + frac * (s1 - s0);
                 }
-                resampleBuf_.push_back(s0 + frac * (s1 - s0));
+                resampleBuf_.push_back(value);
             }
+            srcPos += ratio;
         }
+        resamplePos_ = srcPos - (double)srcFrames;
+        for (uint32_t ch = 0; ch < srcChannels; ch++)
+            resamplePrev_[ch] = src[(srcFrames - 1) * srcChannels + ch];
     }
 
     // Deliver complete frames reusing chunkBuf_

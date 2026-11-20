@@ -113,6 +113,8 @@ struct AppSettings {
     int frameSizeMs = 2;           // 2 => 2.5ms (120 samples), 5, 10, or 20 ms
     bool rawPcm = true;            // true = zero-lookahead 16-bit PCM, false = Opus
     bool loopbackMode = true;
+    std::string localMicSource = "off";   // "off" or a recording endpoint ID (UTF-8)
+    std::string localMicName;             // display name of the selected PC microphone
     bool preferNativeMic = true;
     std::string inputDeviceName;   // empty = default
     std::string outputDeviceName;  // empty = default
@@ -152,6 +154,8 @@ static AppSettings loadSettings() {
         else if (key == "mode") { s.loopbackMode = (val != "recording"); }
         else if (key == "input") { s.inputDeviceName = val; }
         else if (key == "output") { s.outputDeviceName = val; }
+        else if (key == "local_mic") s.localMicSource = val.empty() ? "off" : val;
+        else if (key == "local_mic_name") s.localMicName = val;
         else if (key == "native_mic") { s.preferNativeMic = (val != "0"); }
         else if (key == "voice") { s.voice = VoiceSettings::parse(val); }
     }
@@ -168,6 +172,8 @@ static void saveSettings(const AppSettings& s) {
     file << "mode=" << (s.loopbackMode ? "loopback" : "recording") << "\n";
     file << "input=" << s.inputDeviceName << "\n";
     file << "output=" << s.outputDeviceName << "\n";
+    file << "local_mic=" << s.localMicSource << "\n";
+    file << "local_mic_name=" << s.localMicName << "\n";
     file << "native_mic=" << (s.preferNativeMic ? "1" : "0") << "\n";
     file << "voice=" << s.voice.serialize() << "\n";
 }
@@ -219,7 +225,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         return 1;
     }
 
-    gui.addLogMessage("AudioBridge Server v0.2.1 starting...");
+    gui.addLogMessage("AudioBridge Server v0.2.2 starting...");
 
     // Load saved settings
     AppSettings settings = loadSettings();
@@ -378,6 +384,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         return applied;
     });
 
+    // Local microphone passthrough: capture state shared with the network/capture threads.
+    std::mutex sourceMutex;
+    AudioCapture* activeLocal = nullptr;   // guarded by sourceMutex
+    std::atomic<bool> localLost{false};
     network.setCallbacks(
         [&](const std::string& name) {
             packetsSent = 0;
@@ -395,6 +405,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
             gui.addLogMessage(std::string("Stream ") + (paused ? "PAUSED" : "RESUMED"));
         },
         [&](const uint8_t* opusData, int opusLen) {
+            std::lock_guard<std::mutex> lock(sourceMutex);
+            if (activeLocal) {
+                if (!opusData && opusLen == 0) decoder.reset();
+                return;
+            }
             if (!opusData && opusLen == 0) { decoder.reset(); voiceEffects.reset(); return; }
             float pcmOutput[960];
             int frames = decoder.decode(opusData, opusLen, pcmOutput, 960);
@@ -528,6 +543,171 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         }
     };
 
+    // PC microphone passthrough (UI thread only below; audio callbacks use sourceMutex).
+    std::unique_ptr<AudioCapture> localMic;
+    std::wstring localMicId;                 // endpoint actually opened
+    std::vector<std::pair<std::wstring, std::wstring>> localInputs;
+    std::vector<std::wstring> hiddenLocalInputs;   // present, but would record our own output
+    std::string localMicError, loggedLocalMicError;
+    int localRetrySeconds = 5;
+    auto nextLocalRetry = std::chrono::steady_clock::now();
+    auto localOpenedAt = nextLocalRetry;
+    auto lowerText = [](std::wstring text) {
+        for (auto& c : text) c = static_cast<wchar_t>(towlower(c));
+        return text;
+    };
+    auto adapterOf = [&](const std::wstring& name) {
+        const auto open = name.rfind(L'(');
+        return open == std::wstring::npos ? std::wstring() : lowerText(name.substr(open));
+    };
+    // Lists recording endpoints, hiding ones that would record AudioBridge's own output and
+    // feed it back in: AudioBridge endpoints, and the recording side of the virtual cable
+    // the microphone destination plays into.
+    auto refreshLocalInputs = [&] {
+        std::wstring outAdapter;
+        if (currentOutDeviceId != nativeMicId) {
+            std::wstring outName = currentOutDeviceId.empty() ? AudioCapture::getDefaultDeviceName(true) : L"";
+            if (!currentOutDeviceId.empty())
+                for (const auto& [id, name] : AudioRender::getDevices()) if (id == currentOutDeviceId) outName = name;
+            const auto adapter = adapterOf(outName);
+            for (const wchar_t* marker : {L"virtual", L"vb-audio", L"voicemeeter", L"cable"})
+                if (adapter.find(marker) != std::wstring::npos) { outAdapter = adapter; break; }
+        }
+        localInputs.clear();
+        hiddenLocalInputs.clear();
+        for (const auto& device : AudioCapture::getDevices(false)) {
+            const auto lowered = lowerText(device.name);
+            // Stereo Mix-style endpoints record the PC's playback, which can include the destination.
+            const bool feedback = lowered.find(L"audiobridge") != std::wstring::npos ||
+                lowered.find(L"stereo mix") != std::wstring::npos || lowered.find(L"what u hear") != std::wstring::npos ||
+                (!outAdapter.empty() && adapterOf(device.name) == outAdapter);
+            if (feedback) hiddenLocalInputs.push_back(device.id);
+            else localInputs.emplace_back(device.id, device.name);
+        }
+    };
+    auto utf8ToWide = [](const std::string& text) {
+        std::wstring wide(MultiByteToWideChar(CP_UTF8, 0, text.data(), (int)text.size(), nullptr, 0), L'\0');
+        if (!wide.empty()) MultiByteToWideChar(CP_UTF8, 0, text.data(), (int)text.size(), wide.data(), (int)wide.size());
+        return wide;
+    };
+    // Resolves a saved endpoint ID to an allowed, present endpoint; empty if unavailable.
+    auto resolveLocalSource = [&](const std::string& source) {
+        const auto wanted = utf8ToWide(source);
+        for (const auto& [id, name] : localInputs) if (id == wanted) return id;
+        return std::wstring();
+    };
+    auto unavailableReason = [&](const std::string& source) {
+        const auto wanted = utf8ToWide(source);
+        for (const auto& id : hiddenLocalInputs)
+            if (id == wanted) return std::string("This microphone records AudioBridge's own output, so it is not used (it would cause feedback).");
+        return std::string("The selected microphone is not connected.");
+    };
+    auto openErrorText = [](long hr) {
+        if (hr == E_ACCESSDENIED)
+            return std::string("Windows is blocking microphone access. Allow desktop apps to use the microphone in Settings > Privacy & security > Microphone.");
+        if (hr == AUDCLNT_E_DEVICE_IN_USE)
+            return std::string("Another app is using this microphone in exclusive mode.");
+        char text[96];
+        snprintf(text, sizeof(text), "Windows could not open this microphone (error 0x%08lx).", static_cast<unsigned long>(hr));
+        return std::string(text);
+    };
+    auto closeLocalMic = [&] {
+        {
+            std::lock_guard<std::mutex> lock(sourceMutex);
+            activeLocal = nullptr;
+            localLost = false;
+            decoder.reset();       // phone audio restarts from a clean decoder state
+            voiceEffects.reset();
+            micPeakLevel = 0;
+        }
+        localMic.reset();          // joins the capture thread outside sourceMutex
+        localMicId.clear();
+    };
+    auto openLocalMic = [&](const std::wstring& id) {
+        auto next = std::make_unique<AudioCapture>();
+        bool ok = next->initialize(id, false);
+        if (ok) {
+            next->setFrameSize(480);
+            next->setOnDeviceInvalidated([&, device = next.get()] {
+                std::lock_guard<std::mutex> lock(sourceMutex);
+                if (activeLocal == device) localLost = true;
+            });
+            ok = next->start([&, device = next.get(), energyL = 0.0, energyR = 0.0, mode = 0, weight = .5f]
+                             (const float* stereo, uint32_t frames) mutable {
+            std::lock_guard<std::mutex> lock(sourceMutex);
+            if (activeLocal != device) return;
+            float mono[960];
+            float peak = 0;
+            while (frames) {
+                const uint32_t count = std::min<uint32_t>(frames, 960);
+                // A mic on one input of a 2-channel interface leaves the other side (nearly)
+                // silent; use the live side alone instead of averaging it down by 6 dB. The
+                // choice follows slow energy averages with hysteresis and crossfades, so it
+                // does not flip at speech onsets.
+                double left = 0, right = 0;
+                for (uint32_t i = 0; i < count; ++i) {
+                    left += stereo[2*i] * stereo[2*i];
+                    right += stereo[2*i+1] * stereo[2*i+1];
+                }
+                energyL += (left / count - energyL) * 0.02;
+                energyR += (right / count - energyR) * 0.02;
+                if (std::max(energyL, energyR) > 1e-6) {   // ignore near-silence (below ~-60 dBFS)
+                    if (mode == 0 && energyR < energyL / 16) mode = 1;
+                    else if (mode == 0 && energyL < energyR / 16) mode = 2;
+                    else if ((mode == 1 && energyR > energyL / 4) || (mode == 2 && energyL > energyR / 4)) mode = 0;
+                }
+                const float target = mode == 1 ? 1.f : mode == 2 ? 0.f : .5f;
+                for (uint32_t i = 0; i < count; ++i) {
+                    const float w = weight + (target - weight) * (i + 1) / count;
+                    mono[i] = stereo[2*i] * w + stereo[2*i+1] * (1.f - w);
+                    peak = std::max(peak, std::abs(mono[i]));
+                }
+                weight = target;
+                voiceEffects.push(mono, count);
+                stereo += 2 * count;
+                frames -= count;
+            }
+            micPeakLevel.store(std::max(peak, micPeakLevel.load() * 0.85f));
+            });
+        }
+        if (!ok) {
+            localMicError = openErrorText(next->lastError() ? next->lastError() : E_FAIL);
+            return false;
+        }
+        {
+            std::lock_guard<std::mutex> lock(sourceMutex);
+            activeLocal = next.get();
+            localLost = false;
+            voiceEffects.reset();
+            micPeakLevel = 0;
+        }
+        localMic = std::move(next);   // the previous capture (if any) stops here, outside the lock
+        localMicId = id;
+        localMicError.clear();
+        localOpenedAt = std::chrono::steady_clock::now();
+        return true;
+    };
+    // Returns an empty string on success, otherwise the reason shown to the user.
+    gui.setLocalMicCallback([&](const std::string& source) -> std::string {
+        if (source == "off") {
+            closeLocalMic();
+        } else {
+            refreshLocalInputs();
+            const auto id = resolveLocalSource(source);
+            if (id.empty()) return unavailableReason(source);
+            if (id != localMicId && !openLocalMic(id)) return localMicError;
+            for (const auto& [inputId, name] : localInputs) if (inputId == id) settings.localMicName = ServerGui::wideToUtf8(name);
+        }
+        localMicError.clear();
+        loggedLocalMicError.clear();
+        localRetrySeconds = 5;
+        settings.localMicSource = source;
+        saveSettings(settings);
+        return std::string();
+    });
+    refreshLocalInputs();
+    auto nextInputRefresh = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+
     // Helper: refresh device lists in GUI
     auto refreshDeviceList = [&]() {
         auto devs = AudioCapture::getDevices(loopbackMode);
@@ -547,6 +727,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
             devList.push_back({d.first, d.second});
         }
         gui.updateOutDevices(devList, currentOutDeviceId, AudioCapture::getDefaultDeviceName(true));
+        nextInputRefresh = std::chrono::steady_clock::now();   // destination changed: re-check feedback sources
     };
 
     // Helper: reinitialize audio capture with error recovery
@@ -732,6 +913,16 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     gui.addLogMessage("Audio capture started. Waiting for clients...");
 
+    if (settings.localMicSource == "default") {
+        // Pre-release builds saved "default"; pin it to the current default recording endpoint.
+        refreshLocalInputs();
+        const auto defaultName = AudioCapture::getDefaultDeviceName(false);
+        settings.localMicSource = "off";
+        for (const auto& [id, name] : localInputs)
+            if (name == defaultName) { settings.localMicSource = ServerGui::wideToUtf8(id); settings.localMicName = ServerGui::wideToUtf8(name); }
+        saveSettings(settings);
+    }
+
     // Timing state for tick callback
     auto startTime = std::chrono::steady_clock::now();
     auto lastKeepalive = startTime;
@@ -754,7 +945,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
             ",\"voiceReady\":" + (voiceReady ? "true" : "false") +
             ",\"noise\":" + std::to_string(voice.noise) + ",\"strength\":" + std::to_string(voice.strength) +
             ",\"gate\":" + std::to_string(voice.gate) + ",\"threshold\":" + std::to_string(voice.threshold) +
-            ",\"hold\":" + std::to_string(voice.holdMs) + ",\"lowCut\":" + std::to_string(voice.lowCut) + "," +
+            ",\"hold\":" + std::to_string(voice.holdMs) + ",\"lowCut\":" + std::to_string(voice.lowCut) +
+            ",\"makeup\":" + std::to_string(voice.makeupDb) + "," +
             gui.remoteDevicesJson();
         if (state != previousControlState) { previousControlState = state; ++controlRevision; }
         return state + ",\"revision\":" + std::to_string(controlRevision) + "}";
@@ -878,6 +1070,63 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
         // Update GUI stats
         ServerStats stats;
+        if (localMic && localMic->hasFailed()) localLost = true;   // stream ended without an unplug event
+        if (localLost.exchange(false)) {
+            // A stream that dies right after opening is treated like a failed open (backoff,
+            // logged once) so a misbehaving device cannot cause a reopen loop.
+            const bool shortLived = now - localOpenedAt < std::chrono::seconds(5);
+            closeLocalMic();
+            nextInputRefresh = now;
+            if (shortLived) {
+                localMicError = "The microphone stopped right after opening.";
+                if (localMicError != loggedLocalMicError) {
+                    gui.addLogMessage("PC microphone unavailable: " + localMicError);
+                    loggedLocalMicError = localMicError;
+                }
+                nextLocalRetry = now + std::chrono::seconds(localRetrySeconds);
+                localRetrySeconds = std::min(localRetrySeconds * 2, 30);
+            } else {
+                gui.addLogMessage("PC microphone stopped. Phone microphone audio is used until it reconnects.");
+                loggedLocalMicError.clear();
+                localRetrySeconds = 5;
+                nextLocalRetry = now;
+            }
+        }
+        if (now >= nextInputRefresh) {
+            const auto previousInputs = localInputs;
+            refreshLocalInputs();
+            if (localInputs != previousInputs) { localRetrySeconds = 5; nextLocalRetry = std::min(nextLocalRetry, now); }
+            nextInputRefresh = now + std::chrono::seconds(5);
+            if (localMic && resolveLocalSource(settings.localMicSource) != localMicId) {
+                // Removed, or now records the microphone destination (feedback risk).
+                closeLocalMic();
+                gui.addLogMessage("PC microphone paused. Phone microphone audio is used until it is available.");
+                nextLocalRetry = now;
+            }
+        }
+        if (settings.localMicSource != "off" && !localMic && now >= nextLocalRetry) {
+            const auto id = resolveLocalSource(settings.localMicSource);
+            if (id.empty()) {
+                localMicError = unavailableReason(settings.localMicSource);
+                nextLocalRetry = now + std::chrono::seconds(5);
+            } else if (openLocalMic(id)) {
+                gui.addLogMessage("PC microphone connected.");
+            } else {
+                // Connected but cannot be opened (privacy, exclusive use): back off and log once.
+                if (localMicError != loggedLocalMicError) {
+                    gui.addLogMessage("PC microphone unavailable: " + localMicError);
+                    loggedLocalMicError = localMicError;
+                }
+                nextLocalRetry = now + std::chrono::seconds(localRetrySeconds);
+                localRetrySeconds = std::min(localRetrySeconds * 2, 30);
+            }
+        }
+        stats.localMicEnabled = settings.localMicSource != "off";
+        stats.localMic = localMic != nullptr;
+        stats.localMicId = stats.localMicEnabled ? utf8ToWide(settings.localMicSource) : std::wstring();
+        stats.localMicName = settings.localMicName;
+        stats.localMicError = localMic ? std::string() : localMicError;
+        stats.localInputs = localInputs;
         stats.voiceJson = voiceEffects.stateJson();
         stats.connected = network.isConnected();
         stats.clientCount = static_cast<int>(network.getClientCount());
@@ -1004,6 +1253,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     mediaInfoThread.join();
     capture.stop();
     network.shutdown();
+    localMic.reset();
     voiceEffects.stop();
     render.stop();
     virtualMic.stop();

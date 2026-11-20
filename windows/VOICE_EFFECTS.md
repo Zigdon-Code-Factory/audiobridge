@@ -27,6 +27,23 @@ CABLE Input, capture CABLE Input as PC-to-phone audio, or route the mic back int
 its own Voicemeeter bus. Independent game/music/call mixes may use Voicemeeter's
 existing virtual buses; they do not require a separate cable for each direction.
 
+## Using a PC microphone instead of the phone
+
+Turn on **Use a PC microphone** under Audio routing and choose the microphone.
+Its audio goes through the same Voice cleanup settings to the microphone
+destination above it (for example CABLE Input), so calling apps keep using
+CABLE Output. Phone microphone audio is ignored while the PC microphone runs.
+AudioBridge endpoints, the recording side of the destination's virtual cable and
+Stereo Mix-style inputs are not offered, because selecting them would feed
+AudioBridge's output back into itself. If the microphone disconnects, the phone
+microphone is used until it returns. **Level after cleanup** adds up to 12 dB
+after noise removal, with a peak limiter.
+
+If Windows keeps lowering the microphone's input level (Sound settings →
+Recording → Levels), turn off automatic gain in other software that holds the
+microphone, such as vendor noise suppression or a calling app's "automatically
+adjust microphone volume" option. AudioBridge never changes the Windows level.
+
 AudioBridge Microphone is an alternative only with a working installed driver and
 service. These changes do not install drivers or change Windows default devices.
 For a headset, use headphones to avoid acoustic echo. Noise removal is not echo

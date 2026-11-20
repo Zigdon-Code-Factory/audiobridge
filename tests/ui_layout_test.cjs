@@ -24,10 +24,13 @@ const baseline = {
     outDevices: ['CABLE Input (VB-Audio Virtual Cable)', 'AudioBridge Microphone'],
     defaultDeviceName: 'Speakers (Realtek Audio)', defaultOutDeviceName: 'Speakers (Realtek Audio)',
     currentDeviceIndex: 1, currentOutDeviceIndex: 1,
+    localMic: false, localMicEnabled: false, localMicId: '',
+    localInputs: [['{0.0.1.00000000}.{antlion}', 'Microphone (Antlion Wireless Microphone)'], ['{0.0.1.00000000}.{realtek}', 'Microphone Array (Realtek Audio)']],
     pairRequest: { pending: false }, peers: [], logs: ['Server ready. Listening for encrypted connections.'],
     voice: { settings: '1 20 1 50 300 0', ready: true, recording: false,
         duration: 0, processed: false, revision: 0, rendering: false, error: '', previewError: '' }
 };
+function usedSelectedMicrophone(calls) { return calls.some(call => call[0] === 'localMic' && call[1] === '{0.0.1.00000000}.{antlion}'); }
 (async () => {
     const browser = await chromium.launch({ channel: process.env.UI_BROWSER || 'msedge', headless: true });
     try {
@@ -58,6 +61,7 @@ const baseline = {
             window._setJitter = value => { if (window.__failCommand) throw Error('fixture command failure'); if (window.__noopCommand) return; window.__state.jitterBufferMs = Number(value); window.__calls.push(['jitter', value]); };
             window._selectDevice = value => { if (window.__failCommand) throw Error('fixture command failure'); if (window.__noopCommand) return; window.__state.currentDeviceIndex = Number(value); window.__calls.push(['device', value]); };
             window._selectOutDevice = value => { if (window.__failCommand) throw Error('fixture command failure'); if (window.__noopCommand) return; window.__state.currentOutDeviceIndex = Number(value); window.__calls.push(['output', value]); };
+            window._setLocalMic = value => { if (window.__failCommand) throw Error('fixture command failure'); window.__calls.push(['localMic', value]); if (window.__rejectLocalMic) return {applied:false, error:window.__rejectLocalMic}; Object.assign(window.__state, value === 'off' ? {localMic:false, localMicEnabled:false, localMicId:''} : {localMic:true, localMicEnabled:true, localMicId:value}); return {applied:true}; };
             window._openCableSetup = async () => { window.__calls.push(['setup']); return {applied:true}; };
             window._setCaptureMode = value => { if (window.__failCommand) throw Error('fixture command failure'); if (window.__noopCommand) return; window.__state.captureMode = value; window.__calls.push(['capture', value]); return {applied:true}; };
             window._approvePair = value => { window.__calls.push(['approve', value]); window.__state.pairRequest.pending = false; };
@@ -720,10 +724,38 @@ const baseline = {
         await inspect('65-updates-bridge-failure');
         await page.locator('#closeAppUpdates').click();
         assert.equal(await page.evaluate(() => document.activeElement.id), 'openAppUpdates');
+        // PC microphone passthrough: on, waiting for the device, rejected change and no usable inputs.
+        await page.setViewportSize({ width: 1280, height: 900 });
+        await page.locator('#routingTab').click().catch(() => {});
+        assert.equal(await page.locator('#localInput').inputValue(), '{0.0.1.00000000}.{antlion}');
+        await page.locator('#localMic').check();
+        await page.waitForFunction(() => window.__state.localMicEnabled === true);
+        assert(usedSelectedMicrophone(await page.evaluate(() => window.__calls)), 'passthrough uses the selected microphone');
+        await page.waitForFunction(() => document.getElementById('localMicStatus').textContent.startsWith('On.'));
+        await inspect('69-pc-microphone-on');
+        await page.evaluate(async () => { window.__state.localMic = false; window.__state.localMicName = 'Microphone (Antlion Wireless Microphone)'; window.__state.localMicError = 'The selected microphone is not connected.'; window.__state.localInputs = window.__state.localInputs.slice(1); await tick(); });
+        assert.match(await page.locator('#localMicStatus').textContent(), /not connected/);
+        assert.equal(await page.locator('#localMic').isChecked(), true);
+        assert.equal(await page.locator('#localInput').inputValue(), '{0.0.1.00000000}.{antlion}');
+        assert.match(await page.locator('#localInput option:checked').textContent(), /Antlion.*unavailable/);
+        await inspect('70-pc-microphone-waiting');
+        await page.evaluate(() => { window.__rejectLocalMic = 'Another app is using this microphone in exclusive mode.'; });
+        await page.locator('#localInput').selectOption('{0.0.1.00000000}.{realtek}');
+        await page.waitForFunction(() => !document.getElementById('localMicFeedback').hidden && !document.getElementById('localMicFeedback').textContent.includes('Applying'));
+        assert.match(await page.locator('#localMicFeedback').textContent(), /exclusive mode/);
+        assert.equal(await page.locator('#localInput').inputValue(), '{0.0.1.00000000}.{antlion}');
+        await inspect('71-pc-microphone-rejected');
+        await page.evaluate(() => { window.__rejectLocalMic = false; });
+        await page.locator('#localMic').uncheck();
+        await page.waitForFunction(() => window.__state.localMicEnabled === false);
+        await page.evaluate(async () => { window.__state.localInputs = []; await tick(); });
+        assert.equal(await page.locator('#localMic').isDisabled(), true);
+        assert.match(await page.locator('#localMicStatus').textContent(), /No usable PC microphone/);
+        await inspect('72-pc-microphone-none');
         assert.deepEqual(errors, [], 'browser errors');
         const failures = reports.filter(report => report.violations.length);
         fs.writeFileSync(path.join(outputDir, 'report.json'), JSON.stringify({ errors, reports }, null, 2));
         assert.deepEqual(failures, [], 'accessibility violations: ' + JSON.stringify(failures));
-        console.log('Desktop UI: 68 visual scenarios, update consent/progress/recovery, compact tab order, keyboard flow, routing, tuning, recording, pairing, removal and per-device permissions passed.');
+        console.log('Desktop UI: 72 visual scenarios, PC microphone passthrough, update consent/progress/recovery, compact tab order, keyboard flow, routing, tuning, recording, pairing, removal and per-device permissions passed.');
     } finally { await browser.close(); }
 })().catch(error => { console.error(error); process.exitCode = 1; });

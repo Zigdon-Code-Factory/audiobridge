@@ -31,6 +31,12 @@ struct ServerStats {
     bool kernelTap = false;
     bool captureReady = false;
     bool outputReady = false;
+    bool localMic = false;          // passthrough capture is running
+    bool localMicEnabled = false;   // user turned passthrough on (may be waiting for the device)
+    std::wstring localMicId;
+    std::string localMicName;       // UTF-8 display name of the selected microphone
+    std::string localMicError;      // why an enabled PC microphone is not running
+    std::vector<std::pair<std::wstring, std::wstring>> localInputs;
     bool captureLoopback = true;
     int jitterBufferMs = 10;
     int frameSizeMs = 2; // 2 => 2.5ms (120 samples), 5, 10, 20
@@ -96,6 +102,10 @@ public:
     std::string applyRemoteAudio(uint32_t command, int value);
     void setDeviceChangeCallback(DeviceChangeCallback cb) { onDeviceChange_ = cb; }
     void setOutDeviceChangeCallback(DeviceChangeCallback cb) { onOutDeviceChange_ = cb; }
+    static std::string wideToUtf8(const std::wstring& ws);
+    // Returns an empty string when applied, otherwise a user-facing reason.
+    using LocalMicCallback = std::function<std::string(const std::string&)>;
+    void setLocalMicCallback(LocalMicCallback cb) { onLocalMic_ = cb; }
     void setCaptureModeCallback(CaptureModeCallback cb) { onCaptureMode_ = cb; }
     void setTickCallback(TickCallback cb) { onTick_ = cb; }
     void setVoiceChangeCallback(VoiceChangeCallback cb) { onVoiceChange_ = cb; }
@@ -115,7 +125,6 @@ private:
     int getCurrentOutDeviceIndex() const;
 
     static std::string escapeJson(const std::string& s);
-    static std::string wideToUtf8(const std::wstring& ws);
 
     std::unique_ptr<webview::webview> webview_;
     std::unique_ptr<AppUpdater> updater_;
@@ -155,6 +164,7 @@ private:
     PeerRoleCallback onPeerRole_;
     DeviceChangeCallback onDeviceChange_;
     DeviceChangeCallback onOutDeviceChange_;
+    LocalMicCallback onLocalMic_;
     CaptureModeCallback onCaptureMode_;
     TickCallback onTick_;
     VoiceChangeCallback onVoiceChange_;

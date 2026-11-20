@@ -44,6 +44,10 @@ public:
     uint32_t getChannels() const { return channels_; }
     bool isUsingKernelTap() const { return usingKernelTap_; }
     bool isRunning() const { return running_.load(); }
+    // True when the capture thread ended on its own (device or audio service failure).
+    bool hasFailed() const { return failed_.load(); }
+    // HRESULT of the last initialize()/start() failure, S_OK otherwise.
+    long lastError() const { return lastError_; }
     bool isLoopback() const { return loopback_; }
     const std::wstring& getDeviceFriendlyName() const { return deviceFriendlyName_; }
 
@@ -86,7 +90,10 @@ private:
     // Resampling accumulation buffer
     std::deque<float> resampleBuf_;
     std::vector<float> chunkBuf_;
-    double resamplePos_ = 0.0;
+    double resamplePos_ = 0.0;         // next output position; [-1, 0) refers to resamplePrev_
+    std::vector<float> resamplePrev_;  // last source frame of the previous packet
+    std::atomic<bool> failed_{false};
+    long lastError_ = 0;
 
     // Peak level monitoring
     float peakLevel_ = 0.0f;

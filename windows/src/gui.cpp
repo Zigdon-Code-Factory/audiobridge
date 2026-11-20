@@ -229,6 +229,11 @@ void ServerGui::setupBindings() {
         return applied ? "{\"applied\":true}" : "{\"applied\":false}";
     });
 
+    webview_->bind("_setLocalMic", [this](const std::string& args) -> std::string {
+        const std::string error = onLocalMic_ ? onLocalMic_(parseFirstString(args)) : "Unavailable";
+        return error.empty() ? R"({"applied":true})" : R"({"applied":false,"error":")" + escapeJson(error) + "\"}";
+    });
+
     // _setCaptureMode: user changed capture mode dropdown
     webview_->bind("_setCaptureMode", [this](const std::string& args) -> std::string {
         std::string mode = parseFirstString(args);
@@ -328,6 +333,17 @@ std::string ServerGui::buildStateJson() {
     s += "\"kernelTap\":" + std::string(stats_.kernelTap ? "true" : "false") + ",";
     s += "\"captureReady\":" + std::string(stats_.captureReady ? "true" : "false") + ",";
     s += "\"outputReady\":" + std::string(stats_.outputReady ? "true" : "false") + ",";
+    s += "\"localMic\":" + std::string(stats_.localMic ? "true" : "false") + ",";
+    s += "\"localMicEnabled\":" + std::string(stats_.localMicEnabled ? "true" : "false") + ",";
+    s += "\"localMicId\":\"" + escapeJson(wideToUtf8(stats_.localMicId)) + "\",";
+    s += "\"localMicName\":\"" + escapeJson(stats_.localMicName) + "\",";
+    s += "\"localMicError\":\"" + escapeJson(stats_.localMicError) + "\",";
+    s += "\"localInputs\":[";
+    for (const auto& entry : stats_.localInputs) {
+        if (s.back() != '[') s += ",";
+        s += "[\"" + escapeJson(wideToUtf8(entry.first)) + "\",\"" + escapeJson(wideToUtf8(entry.second)) + "\"]";
+    }
+    s += "],";
     s += "\"captureMode\":\"" + std::string(stats_.captureLoopback ? "loopback" : "recording") + "\",";
     s += "\"jitterBufferMs\":" + std::to_string(stats_.jitterBufferMs) + ",";
     s += "\"frameSizeMs\":" + std::to_string(stats_.frameSizeMs) + ",";
