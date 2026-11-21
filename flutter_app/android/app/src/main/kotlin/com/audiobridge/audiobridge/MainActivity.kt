@@ -65,6 +65,7 @@ class MainActivity : FlutterActivity() {
     private external fun nativeSetMuted(muted: Boolean)
     private external fun nativeSetVolume(volume: Float)
     private external fun nativeSetSystemVolume(volume: Float)
+    private external fun nativeSetVoiceCommunication(enabled: Boolean)
     private external fun nativeGetLatencyBreakdown(): DoubleArray
     private external fun nativeGetAudioState(): DoubleArray
     private external fun nativeGetOutputPeakLevel(): Float
@@ -175,9 +176,6 @@ class MainActivity : FlutterActivity() {
                 audioManager.isBluetoothScoOn = true
             }
             bluetoothScoActive = true
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                AudioCallService.startCall(this)
-            }
             Log.i(TAG, "Bluetooth voice route started - using BT mic")
         } catch (e: Exception) {
             Log.w(TAG, "Failed to start Bluetooth SCO: ${e.message}")
@@ -346,11 +344,12 @@ class MainActivity : FlutterActivity() {
                     val serviceIntent = Intent(this@MainActivity, AudioForegroundService::class.java)
                     stopService(serviceIntent)
 
-                    stopBluetoothSco()
                     if (nativeStarted) {
                         nativeStopAudio()
                         nativeStarted = false
                     }
+                    stopBluetoothSco()
+                    nativeSetVoiceCommunication(false)
                     result.success(null)
                 }
                 "feedAudio" -> {
@@ -406,7 +405,8 @@ class MainActivity : FlutterActivity() {
                         } else {
                             stopBluetoothSco()
                         }
-                        val waitForBtRoute = wantBt && bluetoothScoActive && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
+                        val btActive = wantBt && bluetoothScoActive
+                        val waitForBtRoute = btActive && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
 
                         Thread {
                             if (waitForBtRoute) {
@@ -427,11 +427,29 @@ class MainActivity : FlutterActivity() {
                                 return@Thread
                             }
 
+                            if (btActive) {
+                                // Switch playback to USAGE_VOICE_COMMUNICATION before placing
+                                // the self-managed Telecom call so Android's call-muting logic
+                                // never silences AudioBridge playback during BT mic sessions.
+                                nativeSetVoiceCommunication(true)
+                                if (recordingSeq.get() != seq) {
+                                    nativeSetVoiceCommunication(false)
+                                    runOnUiThread { result.success(false) }
+                                    return@Thread
+                                }
+                            } else {
+                                nativeSetVoiceCommunication(false)
+                            }
+
                             val started = nativeStartRecording(ip, port)
                             if (recordingSeq.get() != seq) {
                                 if (started) nativeStopRecording()
+                                if (btActive) nativeSetVoiceCommunication(false)
                                 runOnUiThread { result.success(false) }
                                 return@Thread
+                            }
+                            if (!started && btActive) {
+                                nativeSetVoiceCommunication(false)
                             }
 
                             runOnUiThread {
@@ -441,6 +459,9 @@ class MainActivity : FlutterActivity() {
                                     return@runOnUiThread
                                 }
                                 if (started) {
+                                    if (btActive && bluetoothScoActive && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                                        AudioCallService.startCall(this@MainActivity)
+                                    }
                                     // Claim background microphone access while the app is still in front.
                                     try {
                                         startService(Intent(this@MainActivity, AudioForegroundService::class.java)
@@ -457,10 +478,15 @@ class MainActivity : FlutterActivity() {
                     }
                 }
                 "stopRecording" -> {
-                    recordingSeq.incrementAndGet()
+                    val seq = recordingSeq.incrementAndGet()
                     nativeStopRecording()
                     stopBluetoothSco()
-                    result.success(null)
+                    Thread {
+                        if (recordingSeq.get() == seq) {
+                            nativeSetVoiceCommunication(false)
+                        }
+                        runOnUiThread { result.success(null) }
+                    }.start()
                 }
                 "setMicMuted" -> {
                     NativeMic.setMuted(call.arguments as? Boolean ?: false)
@@ -571,6 +597,7 @@ class MainActivity : FlutterActivity() {
         recordingSeq.incrementAndGet()
         appUpdater?.close()
         stopBluetoothSco()
+        nativeSetVoiceCommunication(false)
         unregisterVolumeTracking()
         methodChannel = null
         super.onDestroy()

@@ -1,6 +1,20 @@
-# AudioBridge 0.2.3
+# AudioBridge 0.2.4
 
-Keep the Android microphone live in the background and toggle microphone mute with a headset double-tap.
+Hotfix for Bluetooth headset microphone playback muting on Android.
+
+## New in 0.2.4
+
+- **Fix silent playback after muting/unmuting with Bluetooth mic:** Android's
+  `PlaybackActivityMonitor` muted AudioBridge's `USAGE_MEDIA` output stream
+  whenever the self-managed Telecom call started or recycled during Bluetooth
+  headset mic sessions (such as AirPods double-tap mute/unmute or toggling the
+  Bluetooth mic off and back on). AudioBridge now switches Oboe playback to
+  `USAGE_VOICE_COMMUNICATION` while Bluetooth SCO is active (and back to
+  `USAGE_MEDIA` when stopped), with retry on route transitions and Bluetooth
+  route preservation across headset double-tap call recycles.
+- Windows and Android both report version 0.2.4. Android build 10 upgrades
+  build 9 without uninstalling or clearing app data. The Windows app has no
+  other changes.
 
 ## New in 0.2.3
 
@@ -74,7 +88,7 @@ Keep the Android microphone live in the background and toggle microphone mute wi
   user-writable folder and run `audiobridge.exe`. Keep its updater, runtime DLLs
   and `voice-models` folder together. WebView2 is required.
 - **Android:** install `AudioBridge-Android.apk` over the existing app; no uninstall
-  is needed. The display version is 0.2.3; Android build 9 upgrades build 8.
+  is needed. The display version is 0.2.4; Android build 10 upgrades build 9.
   This sideload build retains the existing signing identity.
 - For older builds, install this release once manually to get the update buttons.
   Future phone and Windows updates remain separate.

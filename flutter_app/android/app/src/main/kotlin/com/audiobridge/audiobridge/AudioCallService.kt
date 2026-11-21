@@ -2,6 +2,8 @@ package com.audiobridge.audiobridge
 
 import android.content.ComponentName
 import android.content.Context
+import android.media.AudioDeviceInfo
+import android.media.AudioManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -87,6 +89,21 @@ class AudioCallService : ConnectionService() {
             }
         }
 
+        private fun keepBluetoothRouteAlive(context: Context) {
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return
+            try {
+                val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return
+                val bt = audioManager.availableCommunicationDevices.firstOrNull {
+                    it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
+                        it.type == AudioDeviceInfo.TYPE_BLE_HEADSET
+                } ?: return
+                audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
+                audioManager.setCommunicationDevice(bt)
+            } catch (e: Exception) {
+                Log.w(TAG, "Could not preserve Bluetooth voice route: ${e.message}")
+            }
+        }
+
         private fun recycleAfterHeadsetDisconnect(context: Context, conn: AudioCallConnection) {
             if (activeConnection === conn) {
                 activeConnection = null
@@ -157,6 +174,7 @@ class AudioCallService : ConnectionService() {
             // and re-register the self-managed call so subsequent double-taps keep working.
             endingByApp = true
             AudioForegroundService.triggerHeadsetToggle()
+            keepBluetoothRouteAlive(service)
             setDisconnected(DisconnectCause(DisconnectCause.LOCAL))
             destroy()
             recycleAfterHeadsetDisconnect(service, this)
@@ -171,6 +189,7 @@ class AudioCallService : ConnectionService() {
             }
             endingByApp = true
             AudioForegroundService.triggerHeadsetToggle()
+            keepBluetoothRouteAlive(service)
             setDisconnected(DisconnectCause(DisconnectCause.CANCELED))
             destroy()
             recycleAfterHeadsetDisconnect(service, this)

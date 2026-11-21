@@ -243,7 +243,7 @@ class _AppUpdateDialogState extends State<AppUpdateDialog> {
           crossAxisAlignment: CrossAxisAlignment.stretch,
           mainAxisSize: MainAxisSize.min,
           children: [
-            Text('Installed: ${_state['currentVersion'] ?? '0.2.3'}'),
+            Text('Installed: ${_state['currentVersion'] ?? '0.2.4'}'),
             if (_state['version'] != null)
               Text('Latest release: ${_state['version']}'),
             const SizedBox(height: 12),

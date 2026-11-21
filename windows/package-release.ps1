@@ -1,7 +1,7 @@
 param(
-    [string]$Version = '0.2.3',
-    [string]$BuildDirectory = (Join-Path $PSScriptRoot 'build/release-0.2.3'),
-    [string]$OutputDirectory = (Join-Path $PSScriptRoot 'build/release-artifacts/v0.2.3'),
+    [string]$Version = '0.2.4',
+    [string]$BuildDirectory = (Join-Path $PSScriptRoot 'build/release-0.2.4'),
+    [string]$OutputDirectory = (Join-Path $PSScriptRoot 'build/release-artifacts/v0.2.4'),
     [string]$VisualStudioDirectory = ''
 )
 $ErrorActionPreference = 'Stop'

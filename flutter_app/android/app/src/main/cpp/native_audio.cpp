@@ -290,8 +290,36 @@ public:
         jitterBuffer_.setTargetMs(jitterMs);
     }
 
+    void setVoiceCommunication(bool enabled) {
+        {
+            std::lock_guard<std::recursive_mutex> lifecycle(lifecycleMutex_);
+            if (voiceCommunication_.load() == enabled) return;
+            voiceCommunication_.store(enabled);
+            if (!wanted_.load()) return;
+            stopStreamLocked();
+        }
+        restartWithRetry(enabled);
+    }
+
     bool start() {
         std::lock_guard<std::recursive_mutex> lifecycle(lifecycleMutex_);
+        if (running_) return true;
+        wanted_ = true;
+        if (!startStreamLocked()) {
+            wanted_ = false;
+            return false;
+        }
+        return true;
+    }
+
+    void stop() {
+        std::lock_guard<std::recursive_mutex> lifecycle(lifecycleMutex_);
+        wanted_ = false;
+        stopStreamLocked();
+    }
+
+private:
+    bool startStreamLocked() {
         if (running_) return true;
         int error;
         decoder_ = opus_decoder_create(SAMPLE_RATE, CHANNELS, &error);
@@ -309,18 +337,22 @@ public:
         callbackCount_ = 0;
         renderedPeak_ = 0;
 
-        // AAudio applies Android media volume even for exclusive MMAP streams.
+        // AAudio applies Android volume after this callback, including exclusive MMAP.
         // Apply only the independent app gain in our callback.
+        // While Bluetooth SCO / self-managed Telecom call is active, use VoiceCommunication
+        // so Android's PlaybackActivityMonitor does not mute playback for the active call
+        // and hardware volume keys control the active voice stream.
+        const bool voiceComm = voiceCommunication_.load(std::memory_order_relaxed);
         oboe::AudioStreamBuilder builder;
         builder.setDirection(oboe::Direction::Output)
                ->setPerformanceMode(oboe::PerformanceMode::LowLatency)
-               ->setSharingMode(oboe::SharingMode::Exclusive)
+               ->setSharingMode(voiceComm ? oboe::SharingMode::Shared : oboe::SharingMode::Exclusive)
                ->setFormat(oboe::AudioFormat::I16)
                ->setChannelCount(CHANNELS)
                ->setSampleRate(SAMPLE_RATE)
                ->setDataCallback(this)
                ->setErrorCallback(this)
-               ->setUsage(oboe::Usage::Media)
+               ->setUsage(voiceComm ? oboe::Usage::VoiceCommunication : oboe::Usage::Media)
                ->setContentType(oboe::ContentType::Music);
 
         std::shared_ptr<oboe::AudioStream> newStream;
@@ -372,8 +404,9 @@ public:
             return false;
         }
 
-        LOGI("Audio player started: api=%s, perf=%d, sharing=%s, rate=%d, burst=%d, bufSize=%d, cap=%d",
+        LOGI("Audio player started: api=%s, usage=%s, perf=%d, sharing=%s, rate=%d, burst=%d, bufSize=%d, cap=%d",
              newStream->getAudioApi() == oboe::AudioApi::AAudio ? "AAudio" : "OpenSLES",
+             voiceComm ? "VOICE_COMM" : "MEDIA",
              (int)newStream->getPerformanceMode(),
              exclusiveGranted ? "EXCLUSIVE" : "SHARED",
              newStream->getSampleRate(),
@@ -383,8 +416,7 @@ public:
         return true;
     }
 
-    void stop() {
-        std::lock_guard<std::recursive_mutex> lifecycle(lifecycleMutex_);
+    void stopStreamLocked() {
         running_ = false;
         isExclusiveMmap_.store(false, std::memory_order_relaxed);
         std::shared_ptr<oboe::AudioStream> oldStream;
@@ -404,6 +436,28 @@ public:
         jitterBuffer_.reset();
         remainingPlaybackFrames_.store(0, std::memory_order_relaxed);
     }
+
+    void restartWithRetry(bool expectedVoiceComm, bool checkVoiceComm = true) {
+        for (int attempt = 0; attempt < 6; ++attempt) {
+            {
+                std::lock_guard<std::recursive_mutex> lifecycle(lifecycleMutex_);
+                if (!wanted_.load() || running_.load()) return;
+                if (checkVoiceComm && voiceCommunication_.load() != expectedVoiceComm) return;
+                if (startStreamLocked()) {
+                    if (attempt > 0) {
+                        LOGI("Audio player restarted after %d attempt(s)", attempt + 1);
+                    }
+                    return;
+                }
+            }
+            if (attempt < 5) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(150));
+            }
+        }
+        LOGE("Audio player failed to restart after route/usage change");
+    }
+
+public:
 
     void feedPacket(const uint8_t* data, int length) {
         // Serialize decoder lifetime with start/stop without blocking the receive
@@ -681,13 +735,15 @@ public:
             LOGI("Audio device disconnected, restarting stream...");
             // Restart on a new thread — callbacks must not block
             std::thread([this, stream]() {
-                std::lock_guard<std::recursive_mutex> lifecycle(lifecycleMutex_);
                 {
-                    std::lock_guard<std::mutex> lock(streamMutex_);
-                    if (!running_ || stream_.get() != stream) return;
+                    std::lock_guard<std::recursive_mutex> lifecycle(lifecycleMutex_);
+                    {
+                        std::lock_guard<std::mutex> lock(streamMutex_);
+                        if (!wanted_.load() || !running_ || stream_.get() != stream) return;
+                    }
+                    stopStreamLocked();
                 }
-                stop();
-                start();
+                restartWithRetry(false, false);
             }).detach();
         } else {
             LOGE("Audio stream error: %s", oboe::convertToText(error));
@@ -703,6 +759,8 @@ private:
     PlaybackFrame playbackFrame_;
     std::atomic<int> remainingPlaybackFrames_{0};
     std::atomic<bool> running_;
+    std::atomic<bool> wanted_{false};
+    std::atomic<bool> voiceCommunication_{false};
     std::atomic<bool> muted_;
     std::atomic<bool> isExclusiveMmap_{false};
     std::atomic<float> volume_;
@@ -1616,6 +1674,12 @@ JNIEXPORT void JNICALL
 Java_com_audiobridge_audiobridge_MainActivity_nativeSetSystemVolume(
         JNIEnv* env, jobject thiz, jfloat volume) {
     g_player.setSystemVolume(volume);
+}
+
+JNIEXPORT void JNICALL
+Java_com_audiobridge_audiobridge_MainActivity_nativeSetVoiceCommunication(
+        JNIEnv* env, jobject thiz, jboolean enabled) {
+    g_player.setVoiceCommunication(enabled == JNI_TRUE);
 }
 
 JNIEXPORT jdoubleArray JNICALL
