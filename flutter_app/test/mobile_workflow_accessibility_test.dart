@@ -78,6 +78,7 @@ final class ImmediateFile implements File {
 
 class NativeAudioFixture {
   bool recording = true;
+  bool micMuted = false;
   bool muted = false;
   double volume = 1;
   bool rejectStop = false;
@@ -122,16 +123,22 @@ class NativeAudioFixture {
         await startPending?.future;
         if (rejectStart) throw PlatformException(code: 'input_failed');
         recording = true;
+        micMuted = false;
         return true;
       case 'stopRecording':
         await stopPending?.future;
         if (rejectStop) throw PlatformException(code: 'stop_failed');
         recording = false;
+        micMuted = false;
+        return null;
+      case 'setMicMuted':
+        micMuted = call.arguments as bool;
         return null;
       case 'getAudioState':
         if (rejectState) throw PlatformException(code: 'state_failed');
         return {
           'recording': recording,
+          'micMuted': micMuted,
           'playing': playing,
           'muted': muted,
           'volume': volume,
@@ -1031,4 +1038,104 @@ void main() {
       expect(tester.widget<Slider>(slider).value, 0.4);
     });
   });
+
+  testWidgets('Headset soft mute updates UI and mic button unmutes in place', (
+    tester,
+  ) async {
+    await withConnectedApp(tester, (native) async {
+      final mic = find.byKey(const ValueKey('phoneMicrophone'));
+      native.micMuted = true;
+      await emitNative(tester, 'onMicMuted', true);
+      expect(find.text('Mic Off'), findsOneWidget);
+      expect(
+        find.text(
+          'Microphone muted. Double-tap your headset or tap the mic button to unmute.',
+        ),
+        findsOneWidget,
+      );
+      expect(native.recording, isTrue);
+
+      native.calls.clear();
+      await tester.ensureVisible(mic);
+      await tester.tap(mic);
+      await tester.pumpAndSettle();
+      expect(native.calls, contains('setMicMuted'));
+      expect(native.calls, isNot(contains('stopRecording')));
+      expect(native.micMuted, isFalse);
+      expect(find.text('Mic On'), findsOneWidget);
+    }, reducedMotion: true);
+  });
+
+  testWidgets('Late onMicMuted ignored when microphone is already stopped', (
+    tester,
+  ) async {
+    await withConnectedApp(tester, (native) async {
+      final mic = find.byKey(const ValueKey('phoneMicrophone'));
+      await tester.ensureVisible(mic);
+      await tester.tap(mic);
+      await tester.pumpAndSettle();
+      expect(native.recording, isFalse);
+      expect(find.text('Phone microphone is off.'), findsOneWidget);
+
+      await emitNative(tester, 'onMicMuted', false);
+      expect(find.text('Phone microphone is off.'), findsOneWidget);
+      expect(find.text('Phone microphone is on.'), findsNothing);
+    }, reducedMotion: true);
+  });
+
+  testWidgets('Switching mic source while soft-muted keeps microphone muted', (
+    tester,
+  ) async {
+    await withConnectedApp(tester, (native) async {
+      native.micMuted = true;
+      await emitNative(tester, 'onMicMuted', true);
+      expect(find.text('Mic Off'), findsOneWidget);
+
+      final source = find.byKey(const ValueKey('micSource'));
+      await tester.ensureVisible(source);
+      await tester.tap(source);
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Mic: Bluetooth').last);
+      await tester.pumpAndSettle();
+
+      expect(native.recording, isTrue);
+      expect(native.micMuted, isTrue);
+      expect(find.text('Mic Off'), findsOneWidget);
+      expect(find.text('Microphone muted.'), findsOneWidget);
+    }, reducedMotion: true);
+  });
+
+  testWidgets(
+    'Losing mic ownership while soft-muted with failed stop retains Stop recovery',
+    (tester) async {
+      await withConnectedApp(tester, (native) async {
+        final mic = find.byKey(const ValueKey('phoneMicrophone'));
+        native.micMuted = true;
+        await emitNative(tester, 'onMicMuted', true);
+        expect(find.text('Mic Off'), findsOneWidget);
+
+        native.rejectStop = true;
+        await emitNative(
+          tester,
+          'onSessionInfo',
+          jsonEncode({'micAllowed': false, 'clients': 2}),
+        );
+        await tester.pumpAndSettle();
+
+        expect(native.recording, isTrue);
+        expect(find.text('Stop microphone'), findsOneWidget);
+        expect(tester.widget<OutlinedButton>(mic).onPressed, isNotNull);
+
+        native.rejectStop = false;
+        native.calls.clear();
+        await tester.ensureVisible(mic);
+        await tester.tap(mic);
+        await tester.pumpAndSettle();
+        expect(native.calls, contains('stopRecording'));
+        expect(native.calls, isNot(contains('setMicMuted')));
+        expect(native.recording, isFalse);
+        expect(tester.widget<OutlinedButton>(mic).onPressed, isNull);
+      }, reducedMotion: true);
+    },
+  );
 }

@@ -43,6 +43,7 @@ class PhoneAudioControls extends StatefulWidget {
         'PC media controls require current Admin permission. Phone audio controls remain available.',
     required this.mediaPlaying,
     required this.recording,
+    this.micMuted = false,
     required this.micAllowed,
     required this.micBusy,
     this.micUnknown = false,
@@ -67,6 +68,7 @@ class PhoneAudioControls extends StatefulWidget {
   final String mediaUnavailableMessage;
   final bool mediaPlaying;
   final bool recording;
+  final bool micMuted;
   final bool micAllowed;
   final bool micBusy;
   final bool micUnknown;
@@ -148,6 +150,7 @@ class _PhoneAudioControlsState extends State<PhoneAudioControls> {
   @override
   Widget build(BuildContext context) {
     final percent = (widget.muted ? 0 : widget.volume * 100).round();
+    final micActive = widget.recording && !widget.micMuted;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
@@ -164,16 +167,18 @@ class _PhoneAudioControlsState extends State<PhoneAudioControls> {
             message:
                 widget.micUnknown
                     ? 'Stop microphone to confirm it is off'
-                    : widget.recording
+                    : !widget.micAllowed && widget.recording
+                    ? 'Stop phone microphone'
+                    : micActive
                     ? 'Turn phone microphone off'
                     : !widget.micAllowed
                     ? 'Another phone owns microphone return'
                     : 'Turn phone microphone on',
             child: Semantics(
-              toggled: widget.micUnknown ? null : widget.recording,
+              toggled: widget.micUnknown ? null : micActive,
               value:
                   widget.micUnknown
-                      ? 'State unknown. Last confirmed: ${widget.recording ? 'On' : 'Off'}'
+                      ? 'State unknown. Last confirmed: ${micActive ? 'On' : 'Off'}'
                       : null,
               child: OutlinedButton.icon(
                 focusNode: _microphoneFocus,
@@ -186,7 +191,7 @@ class _PhoneAudioControlsState extends State<PhoneAudioControls> {
                         ? widget.onToggleMic
                         : null,
                 icon: Icon(
-                  widget.recording ? Icons.mic_rounded : Icons.mic_off_rounded,
+                  micActive ? Icons.mic_rounded : Icons.mic_off_rounded,
                 ),
                 label: Text(
                   widget.micBusy
@@ -196,7 +201,7 @@ class _PhoneAudioControlsState extends State<PhoneAudioControls> {
                       ? 'Stop microphone'
                       : !widget.micAllowed
                       ? 'Mic on first phone'
-                      : widget.recording
+                      : micActive
                       ? 'Mic On'
                       : 'Mic Off',
                 ),

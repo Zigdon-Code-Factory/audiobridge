@@ -1,6 +1,29 @@
-# AudioBridge 0.2.2
+# AudioBridge 0.2.3
 
-Use a PC microphone with AudioBridge's voice cleanup, without the phone.
+Keep the Android microphone live in the background and toggle microphone mute with a headset double-tap.
+
+## New in 0.2.3
+
+- **Background microphone on Android 14+:** `AudioForegroundService` now declares
+  and claims the `microphone` foreground service type so Android no longer
+  silences the phone or Bluetooth microphone when you switch apps or lock the
+  screen.
+- **Reliable Bluetooth headset mic startup & recovery:** Android 12+ uses
+  `setCommunicationDevice()` without tearing down an active route, waits for
+  Bluetooth SCO to settle before starting Oboe capture, retries transient
+  `ErrorDisconnected` route changes, and automatically reopens the recording
+  stream if a Bluetooth route changes mid-session.
+- **Double-tap headset mute/unmute across both modes:**
+  - **Bluetooth mic mode:** registers a self-managed Android Telecom
+    `ConnectionService` so double-tapping AirPods (HFP `AT+CHUP`) toggles soft
+    mute while keeping the mic stream and Bluetooth route open.
+  - **Phone mic mode:** double-tapping a Bluetooth headset (AVRCP next-track)
+    toggles the same soft mute without leaving stereo A2DP audio.
+  - Plays a short falling tone on mute and rising tone on unmute (audible even
+    when the phone is on Vibrate/Silent), and preserves mute state when
+    switching microphone sources.
+- Windows and Android both report version 0.2.3. Android build 9 upgrades build 8
+  without uninstalling or clearing app data.
 
 ## New in 0.2.2
 
@@ -51,7 +74,7 @@ Use a PC microphone with AudioBridge's voice cleanup, without the phone.
   user-writable folder and run `audiobridge.exe`. Keep its updater, runtime DLLs
   and `voice-models` folder together. WebView2 is required.
 - **Android:** install `AudioBridge-Android.apk` over the existing app; no uninstall
-  is needed. The display version is 0.2.2; Android build 8 upgrades build 7.
+  is needed. The display version is 0.2.3; Android build 9 upgrades build 8.
   This sideload build retains the existing signing identity.
 - For older builds, install this release once manually to get the update buttons.
   Future phone and Windows updates remain separate.

@@ -741,6 +741,50 @@ public:
     AudioRecorder() : encoder_(nullptr), running_(false), sequence_(0) {}
 
     bool isRunning() const { return running_.load(); }
+    bool isActive() const { return running_.load() || wanted_.load(); }
+    bool isMuted() const { return muted_.load(); }
+    // Soft mute: the stream stays open (Bluetooth route and background mic access are kept)
+    // and silence is sent instead of the microphone signal.
+    void setMuted(bool muted) { muted_.store(muted); }
+
+    // Requested by the app: keep the microphone running until stopRequested().
+    // Retries briefly if Bluetooth SCO or another route change disconnects the stream mid-start.
+    bool startRequested(const char* serverIp, int serverPort) {
+        const uint64_t token = ++requestToken_;
+        {
+            std::lock_guard<std::recursive_mutex> lifecycle(lifecycleMutex_);
+            wanted_ = true;
+            muted_ = false;
+        }
+        for (int attempt = 0; attempt < 6; ++attempt) {
+            {
+                std::lock_guard<std::recursive_mutex> lifecycle(lifecycleMutex_);
+                if (!wanted_.load() || requestToken_.load() != token) return false;
+                if (start(serverIp, serverPort)) {
+                    if (attempt > 0) {
+                        LOGI("Recording stream started after %d attempt(s)", attempt + 1);
+                    }
+                    return true;
+                }
+            }
+            if (attempt < 5) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            }
+        }
+        std::lock_guard<std::recursive_mutex> lifecycle(lifecycleMutex_);
+        if (requestToken_.load() == token) {
+            wanted_ = false;
+        }
+        return false;
+    }
+
+    void stopRequested() {
+        ++requestToken_;
+        std::lock_guard<std::recursive_mutex> lifecycle(lifecycleMutex_);
+        wanted_ = false;
+        muted_ = false;
+        stop();
+    }
 
     bool start(const char* serverIp, int serverPort) {
         std::lock_guard<std::recursive_mutex> lifecycle(lifecycleMutex_);
@@ -805,8 +849,8 @@ public:
             return false;
         }
 
-        LOGI("Audio recording started to %s:%d (channels=%d, burst=%d, bufSize=%d)",
-             serverIp, serverPort, actualChannels_,
+        LOGI("Audio recording started to %s:%d (deviceId=%d, channels=%d, burst=%d, bufSize=%d)",
+             serverIp, serverPort, stream_->getDeviceId(), actualChannels_,
              stream_->getFramesPerBurst(), stream_->getBufferSizeInFrames());
         return true;
     }
@@ -833,7 +877,8 @@ public:
             return oboe::DataCallbackResult::Stop;
         }
 
-        auto* input = static_cast<int16_t*>(audioData);
+        auto* input = static_cast<const int16_t*>(audioData);
+        const bool isMuted = muted_.load(std::memory_order_relaxed);
         int fms = g_frameSizeMs.load(std::memory_order_relaxed);
         if (fms != 5 && fms != 10 && fms != 20) fms = 10;
         const int encodeFrames = fms * (SAMPLE_RATE / 1000); // 240 (5ms), 480 (10ms), or 960 (20ms)
@@ -849,7 +894,9 @@ public:
             }
             int toCopy = std::min<int>(numFrames - framesRead, space);
 
-            if (actualChannels_ > MIC_CHANNELS) {
+            if (isMuted) {
+                memset(accumBuf_ + accumFrames_, 0, static_cast<size_t>(toCopy) * sizeof(int16_t));
+            } else if (actualChannels_ > MIC_CHANNELS) {
                 for (int i = 0; i < toCopy; i++) {
                     int32_t sum = 0;
                     for (int ch = 0; ch < actualChannels_; ch++) {
@@ -899,23 +946,28 @@ public:
     }
 
     void onErrorAfterClose(oboe::AudioStream* stream, oboe::Result error) override {
-        if (error == oboe::Result::ErrorDisconnected) {
-            LOGI("Recording device disconnected, restarting stream...");
-            std::thread([this, stream]() {
+        // Any stream error (route change, Bluetooth SCO switch, audio server restart) reopens
+        // the microphone for as long as the app wants it, retrying until it succeeds.
+        LOGI("Recording stream ended (%s), reopening...", oboe::convertToText(error));
+        std::thread([this, stream]() {
+            {
                 std::lock_guard<std::recursive_mutex> lifecycle(lifecycleMutex_);
-                if (!running_ || stream_.get() != stream) return;
+                if (stream_.get() != stream) return;
                 stop();
-                if (!serverIp_.empty()) {
-                    start(serverIp_.c_str(), serverPort_);
+            }
+            for (int attempt = 0; ; ++attempt) {
+                {
+                    std::lock_guard<std::recursive_mutex> lifecycle(lifecycleMutex_);
+                    if (!wanted_ || running_ || serverIp_.empty()) return;
+                    if (start(serverIp_.c_str(), serverPort_)) {
+                        LOGI("Recording stream reopened after %d attempt(s)", attempt + 1);
+                        return;
+                    }
                 }
-            }).detach();
-        } else {
-            LOGE("Recording stream error: %s", oboe::convertToText(error));
-            std::thread([this, stream]() {
-                std::lock_guard<std::recursive_mutex> lifecycle(lifecycleMutex_);
-                if (stream_.get() == stream) stop();
-            }).detach();
-        }
+                std::this_thread::sleep_for(std::chrono::milliseconds(
+                    attempt < 5 ? 200 : (attempt < 30 ? 1000 : 2000)));
+            }
+        }).detach();
     }
 
 private:
@@ -930,6 +982,9 @@ private:
     std::recursive_mutex lifecycleMutex_;
     std::shared_ptr<oboe::AudioStream> stream_;
     std::atomic<bool> running_;
+    std::atomic<bool> muted_{false};
+    std::atomic<bool> wanted_{false};   // written under lifecycleMutex_
+    std::atomic<uint64_t> requestToken_{0};
     std::chrono::steady_clock::time_point streamStart_;
     std::atomic<uint32_t> sequence_;
     int actualChannels_ = MIC_CHANNELS;
@@ -1514,7 +1569,7 @@ Java_com_audiobridge_audiobridge_MainActivity_nativeStartRecording(
         JNIEnv* env, jobject thiz, jstring serverIp, jint port) {
 
     const char* ipStr = env->GetStringUTFChars(serverIp, nullptr);
-    bool result = g_recorder.start(ipStr, port);
+    bool result = g_recorder.startRequested(ipStr, port);
     env->ReleaseStringUTFChars(serverIp, ipStr);
 
     if (result) {
@@ -1527,7 +1582,22 @@ Java_com_audiobridge_audiobridge_MainActivity_nativeStartRecording(
 JNIEXPORT void JNICALL
 Java_com_audiobridge_audiobridge_MainActivity_nativeStopRecording(
         JNIEnv* env, jobject thiz) {
-    g_recorder.stop();
+    g_recorder.stopRequested();
+}
+
+JNIEXPORT void JNICALL
+Java_com_audiobridge_audiobridge_NativeMic_setMuted(JNIEnv*, jobject, jboolean muted) {
+    g_recorder.setMuted(muted == JNI_TRUE);
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_audiobridge_audiobridge_NativeMic_isMuted(JNIEnv*, jobject) {
+    return g_recorder.isMuted() ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_audiobridge_audiobridge_NativeMic_isRunning(JNIEnv*, jobject) {
+    return g_recorder.isActive() ? JNI_TRUE : JNI_FALSE;
 }
 
 JNIEXPORT void JNICALL
@@ -1551,11 +1621,12 @@ Java_com_audiobridge_audiobridge_MainActivity_nativeSetSystemVolume(
 JNIEXPORT jdoubleArray JNICALL
 Java_com_audiobridge_audiobridge_MainActivity_nativeGetAudioState(JNIEnv* env, jobject) {
     jdouble values[] = {g_player.isRunning() ? 1.0 : 0.0,
-                       g_recorder.isRunning() ? 1.0 : 0.0,
+                       g_recorder.isActive() ? 1.0 : 0.0,
                        g_player.isMuted() ? 1.0 : 0.0,
-                       g_player.volume(), g_player.systemVolume()};
-    jdoubleArray result = env->NewDoubleArray(5);
-    if (result) env->SetDoubleArrayRegion(result, 0, 5, values);
+                       g_player.volume(), g_player.systemVolume(),
+                       g_recorder.isMuted() ? 1.0 : 0.0};
+    jdoubleArray result = env->NewDoubleArray(6);
+    if (result) env->SetDoubleArrayRegion(result, 0, 6, values);
     return result;
 }
 

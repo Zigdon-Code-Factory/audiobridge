@@ -97,6 +97,8 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
   String _deviceId = '';
   String _deviceName = 'AudioBridge';
   bool _isRecording = true; // mic on by default
+  // Soft mute from a headset tap or the notification: the mic keeps running but sends silence.
+  bool _micMuted = false;
   bool _isMuted = false; // audio output mute
   double _volume = 1.0;
   double _lastAudibleVolume = 1.0;
@@ -176,6 +178,16 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
           break;
         case 'onDesktopResult':
           _desktopControls.receiveResult(call.arguments as String? ?? '');
+          break;
+        case 'onMicMuted':
+          if (!mounted || !_isRecording) break;
+          setState(() {
+            _micMuted = call.arguments == true;
+            _micMessage = _micMuted
+                ? 'Microphone muted. Double-tap your headset or tap the mic button to unmute.'
+                : 'Phone microphone is on.';
+          });
+          if (_state == ConnectionState_.connected) _updateServiceState();
           break;
         case 'onMediaAction':
           final action = call.arguments as String?;
@@ -633,6 +645,7 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
       _micUnknown = false;
       _micMessage = '';
       _isRecording = _resumeMicrophone;
+      _micMuted = false;
       _micDesired = _resumeMicrophone;
       _playbackMessage = '';
       _serverName = name;
@@ -951,6 +964,7 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
     setState(() {
       final actual = audio?['recording'];
       if (actual is bool) _isRecording = actual;
+      _micMuted = _isRecording && audio?['micMuted'] == true;
       _micUnknown = actual is! bool || _micStartsPending > 0;
       _micMessage = _micUnknown
           ? 'Microphone outcome is still unknown. Stop microphone or disconnect to recover.'
@@ -990,6 +1004,7 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
       if (mounted && !_disposing && epoch == _connectionEpoch) {
         setState(() {
           _isRecording = enable && !stoppedForOwnership;
+          _micMuted = false;   // starting or stopping the mic clears a headset mute
           _micUnknown = _micStartsPending > 0;
           _micMessage = _micUnknown
               ? 'A microphone start is still pending. Stop microphone or disconnect to recover.'
@@ -1005,6 +1020,7 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
         setState(() {
           final actual = audio?['recording'];
           if (actual is bool) _isRecording = actual;
+          _micMuted = _isRecording && audio?['micMuted'] == true;
           _micUnknown = actual is! bool || _micStartsPending > 0;
           final requestedState = enable && !stoppedForOwnership;
           final operation = requestedState ? 'start' : 'stop';
@@ -1021,10 +1037,35 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
     }
   }
 
+  void _onMicButton() {
+    if (_isRecording && _micMuted && _micAllowed && !_micUnknown && !_micBusy) {
+      _setMicMuted(false);
+    } else {
+      _toggleMic(_micUnknown ? false : !_isRecording);
+    }
+  }
+
+  Future<void> _setMicMuted(bool muted) async {
+    if (!_isRecording || _micBusy || _micUnknown || (!muted && !_micAllowed)) return;
+    final epoch = _connectionEpoch;
+    try {
+      await _channel.invokeMethod('setMicMuted', muted);
+    } catch (_) {
+      return;
+    }
+    if (!mounted || _disposing || epoch != _connectionEpoch || !_isRecording) return;
+    setState(() {
+      _micMuted = muted;
+      _micMessage = muted ? 'Microphone muted.' : 'Phone microphone is on.';
+    });
+    if (_state == ConnectionState_.connected) _updateServiceState();
+  }
+
   Future<void> _switchMicSource(String source) async {
     if (source == _micSource || _micBusy || _micUnknown) return;
     final epoch = _connectionEpoch;
     final restart = _isRecording && _state == ConnectionState_.connected;
+    final wasMuted = _micMuted;
     if (restart) {
       await _toggleMic(false);
       if (!mounted || epoch != _connectionEpoch || _isRecording || _micUnknown) {
@@ -1032,7 +1073,12 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
       }
     }
     setState(() => _micSource = source);
-    if (restart && _state == ConnectionState_.connected) await _toggleMic(true);
+    if (restart && _state == ConnectionState_.connected) {
+      await _toggleMic(true);
+      if (wasMuted && mounted && epoch == _connectionEpoch && _isRecording && !_micUnknown) {
+        await _setMicMuted(true);
+      }
+    }
   }
 
   Future<void> _refreshPlayback(int epoch, String status) async {
@@ -1139,7 +1185,7 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
   void _updateServiceState() {
     try {
       _channel.invokeMethod('updateServiceState', {
-        'micMuted': !_isRecording,
+        'micMuted': !_isRecording || _micMuted,
         'paused': _isPaused,
         'mediaPlaying': _nowPlayingStatus == 1,
         'serverName': _serverName,
@@ -1162,6 +1208,7 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
       setState(() {
         _state = ConnectionState_.disconnected;
         _isRecording = false;
+        _micMuted = false;
         _playbackApplying = false;
         _playbackRequested = null;
         _playbackMessage = '';
@@ -1195,6 +1242,7 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
       setState(() {
         final actual = audio?['recording'];
         if (actual is bool) _isRecording = actual;
+        _micMuted = _isRecording && audio?['micMuted'] == true;
         _micUnknown = actual is! bool || _micStartsPending > 0;
         _state = ConnectionState_.disconnectFailed;
         _shutdownMessage = 'Audio shutdown is not confirmed. Microphone or playback may still be running. Retry stopping audio and disconnecting; if it cannot be confirmed, stop AudioBridge from Android app settings.';
@@ -1277,7 +1325,7 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
     return Scaffold(
       backgroundColor: cs.surface,
       appBar: AppBar(
-        title: const Text('AudioBridge · 0.2.2'),
+        title: const Text('AudioBridge · 0.2.3'),
         actions: [IconButton(
           tooltip: 'App updates',
           icon: const Icon(Icons.system_update_rounded),
@@ -1606,6 +1654,7 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
                   : 'Read only: PC media controls require Admin permission. Phone audio controls remain available.',
               mediaPlaying: _nowPlayingStatus == 1,
               recording: _isRecording,
+              micMuted: _micMuted,
               micAllowed: _micAllowed,
               micBusy: _micBusy,
               micUnknown: _micUnknown,
@@ -1618,7 +1667,7 @@ class _AudioBridgePageState extends State<AudioBridgePage> with SingleTickerProv
               onPrevious: () => _sendMediaCommand(0x12),
               onPlayPause: _mediaPlayPause,
               onNext: () => _sendMediaCommand(0x11),
-              onToggleMic: () => _toggleMic(_micUnknown ? false : !_isRecording),
+              onToggleMic: _onMicButton,
               onToggleMute: _toggleMute,
               onVolume: _setVolume,
               onMicSource: _switchMicSource,

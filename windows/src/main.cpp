@@ -225,7 +225,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         return 1;
     }
 
-    gui.addLogMessage("AudioBridge Server v0.2.2 starting...");
+    gui.addLogMessage("AudioBridge Server v0.2.3 starting...");
 
     // Load saved settings
     AppSettings settings = loadSettings();

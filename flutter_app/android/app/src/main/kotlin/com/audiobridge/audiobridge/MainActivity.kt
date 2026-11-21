@@ -26,6 +26,10 @@ class MainActivity : FlutterActivity() {
     private val CHANNEL = "com.audiobridge/audio"
     private var nativeStarted = false
     private var bluetoothScoActive = false
+    private var communicationListener: AudioManager.OnCommunicationDeviceChangedListener? = null
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private var btReselectRunnable: Runnable? = null
+    private val recordingSeq = java.util.concurrent.atomic.AtomicInteger(0)
     private var volumeReceiverRegistered = false
     private var appUpdater: AppUpdater? = null
 
@@ -108,29 +112,100 @@ class MainActivity : FlutterActivity() {
         }
     }
 
+    private fun isBluetoothVoice(device: AudioDeviceInfo?) = device != null &&
+        (device.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
+            (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && device.type == AudioDeviceInfo.TYPE_BLE_HEADSET))
+
+    /** Finds a connected Bluetooth voice device on Android 12+, or null if none is available. */
+    private fun findBluetoothVoiceDevice(audioManager: AudioManager): AudioDeviceInfo? {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return null
+        return audioManager.availableCommunicationDevices.firstOrNull { isBluetoothVoice(it) }
+    }
+
+    private fun isPhoneCallActive(audioManager: AudioManager): Boolean {
+        val mode = audioManager.mode
+        return mode == AudioManager.MODE_IN_CALL ||
+            mode == AudioManager.MODE_RINGTONE ||
+            (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && mode == AudioManager.MODE_CALL_SCREENING)
+    }
+
     private fun startBluetoothSco() {
         if (bluetoothScoActive) return
         try {
             val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
-            audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
-            audioManager.startBluetoothSco()
-            audioManager.isBluetoothScoOn = true
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                val device = findBluetoothVoiceDevice(audioManager)
+                if (device == null) {
+                    Log.i(TAG, "No Bluetooth voice device available; keeping current audio route")
+                    return
+                }
+                audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
+                if (!audioManager.setCommunicationDevice(device)) {
+                    audioManager.mode = AudioManager.MODE_NORMAL
+                    Log.w(TAG, "Failed to select Bluetooth voice device")
+                    return
+                }
+                // Android 12+: keep the headset mic selected if another app or a route change moves it.
+                if (communicationListener == null) {
+                    val listener = AudioManager.OnCommunicationDeviceChangedListener { changed ->
+                        if (!bluetoothScoActive || isBluetoothVoice(changed)) return@OnCommunicationDeviceChangedListener
+                        btReselectRunnable?.let { mainHandler.removeCallbacks(it) }
+                        val reselect = Runnable {
+                            btReselectRunnable = null
+                            if (!bluetoothScoActive || isPhoneCallActive(audioManager)) return@Runnable
+                            if (!isBluetoothVoice(audioManager.communicationDevice)) {
+                                val btDevice = findBluetoothVoiceDevice(audioManager) ?: return@Runnable
+                                audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
+                                if (audioManager.setCommunicationDevice(btDevice)) {
+                                    Log.i(TAG, "Bluetooth mic re-selected")
+                                }
+                            }
+                        }
+                        btReselectRunnable = reselect
+                        mainHandler.postDelayed(reselect, 1000)
+                    }
+                    audioManager.addOnCommunicationDeviceChangedListener(ContextCompat.getMainExecutor(this), listener)
+                    communicationListener = listener
+                }
+            } else {
+                audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
+                @Suppress("DEPRECATION")
+                audioManager.startBluetoothSco()
+                @Suppress("DEPRECATION")
+                audioManager.isBluetoothScoOn = true
+            }
             bluetoothScoActive = true
-            Log.i(TAG, "Bluetooth SCO started - using BT mic")
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                AudioCallService.startCall(this)
+            }
+            Log.i(TAG, "Bluetooth voice route started - using BT mic")
         } catch (e: Exception) {
             Log.w(TAG, "Failed to start Bluetooth SCO: ${e.message}")
         }
     }
 
     private fun stopBluetoothSco() {
-        if (!bluetoothScoActive) return
+        btReselectRunnable?.let { mainHandler.removeCallbacks(it) }
+        btReselectRunnable = null
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            AudioCallService.endCall()
+        }
+        if (!bluetoothScoActive && communicationListener == null) return
         try {
             val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
-            audioManager.isBluetoothScoOn = false
-            audioManager.stopBluetoothSco()
-            audioManager.mode = AudioManager.MODE_NORMAL
             bluetoothScoActive = false
-            Log.i(TAG, "Bluetooth SCO stopped")
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                communicationListener?.let { audioManager.removeOnCommunicationDeviceChangedListener(it) }
+                communicationListener = null
+                audioManager.clearCommunicationDevice()
+            } else {
+                @Suppress("DEPRECATION")
+                audioManager.isBluetoothScoOn = false
+                @Suppress("DEPRECATION")
+                audioManager.stopBluetoothSco()
+            }
+            audioManager.mode = AudioManager.MODE_NORMAL
+            Log.i(TAG, "Bluetooth voice route stopped")
         } catch (e: Exception) {
             Log.w(TAG, "Failed to stop Bluetooth SCO: ${e.message}")
         }
@@ -267,6 +342,7 @@ class MainActivity : FlutterActivity() {
                     result.success(nativeStarted)
                 }
                 "stopAudio" -> {
+                    recordingSeq.incrementAndGet()
                     val serviceIntent = Intent(this@MainActivity, AudioForegroundService::class.java)
                     stopService(serviceIntent)
 
@@ -315,25 +391,79 @@ class MainActivity : FlutterActivity() {
 
                         val args = call.arguments as? Map<String, Any>
                         val micSource = args?.get("micSource") as? String ?: "auto"
-
-                        // Manage Bluetooth SCO based on mic source selection
-                        stopBluetoothSco() // Reset first
-                        when (micSource) {
-                            "auto" -> {
-                                if (isBluetoothHeadsetConnected()) startBluetoothSco()
-                            }
-                            "bluetooth" -> startBluetoothSco()
-                            "phone" -> { /* no SCO, use built-in mic */ }
-                        }
-
                         val ip = args?.get("ip") as? String ?: ""
                         val port = args?.get("port") as? Int ?: 0
-                        result.success(nativeStartRecording(ip, port))
+                        val seq = recordingSeq.incrementAndGet()
+
+                        // Manage Bluetooth SCO without tearing down an already-active BT route.
+                        val wantBt = when (micSource) {
+                            "auto" -> isBluetoothHeadsetConnected()
+                            "bluetooth" -> true
+                            else -> false
+                        }
+                        if (wantBt) {
+                            startBluetoothSco()
+                        } else {
+                            stopBluetoothSco()
+                        }
+                        val waitForBtRoute = wantBt && bluetoothScoActive && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
+
+                        Thread {
+                            if (waitForBtRoute) {
+                                val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+                                val deadline = android.os.SystemClock.elapsedRealtime() + 1200L
+                                while (recordingSeq.get() == seq &&
+                                    !isBluetoothVoice(audioManager.communicationDevice) &&
+                                    android.os.SystemClock.elapsedRealtime() < deadline) {
+                                    try { Thread.sleep(50) } catch (_: InterruptedException) { break }
+                                }
+                                if (recordingSeq.get() == seq && isBluetoothVoice(audioManager.communicationDevice)) {
+                                    try { Thread.sleep(150) } catch (_: InterruptedException) {}
+                                }
+                            }
+
+                            if (recordingSeq.get() != seq) {
+                                runOnUiThread { result.success(false) }
+                                return@Thread
+                            }
+
+                            val started = nativeStartRecording(ip, port)
+                            if (recordingSeq.get() != seq) {
+                                if (started) nativeStopRecording()
+                                runOnUiThread { result.success(false) }
+                                return@Thread
+                            }
+
+                            runOnUiThread {
+                                if (recordingSeq.get() != seq) {
+                                    if (started) nativeStopRecording()
+                                    result.success(false)
+                                    return@runOnUiThread
+                                }
+                                if (started) {
+                                    // Claim background microphone access while the app is still in front.
+                                    try {
+                                        startService(Intent(this@MainActivity, AudioForegroundService::class.java)
+                                            .setAction(AudioForegroundService.ACTION_ENABLE_MIC))
+                                    } catch (e: Exception) {
+                                        Log.w(TAG, "Could not enable background microphone: ${e.message}")
+                                    }
+                                } else {
+                                    stopBluetoothSco()
+                                }
+                                result.success(started)
+                            }
+                        }.start()
                     }
                 }
                 "stopRecording" -> {
+                    recordingSeq.incrementAndGet()
                     nativeStopRecording()
                     stopBluetoothSco()
+                    result.success(null)
+                }
+                "setMicMuted" -> {
+                    NativeMic.setMuted(call.arguments as? Boolean ?: false)
                     result.success(null)
                 }
                 "setMuted" -> {
@@ -428,7 +558,8 @@ class MainActivity : FlutterActivity() {
                         "recording" to (state[1] != 0.0),
                         "muted" to (state[2] != 0.0),
                         "volume" to state[3],
-                        "systemVolume" to state[4]
+                        "systemVolume" to state[4],
+                        "micMuted" to (state.getOrNull(5) == 1.0)
                     ))
                 }
                 else -> result.notImplemented()
@@ -437,7 +568,9 @@ class MainActivity : FlutterActivity() {
     }
 
     override fun onDestroy() {
+        recordingSeq.incrementAndGet()
         appUpdater?.close()
+        stopBluetoothSco()
         unregisterVolumeTracking()
         methodChannel = null
         super.onDestroy()
