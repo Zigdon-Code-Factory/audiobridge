@@ -12,7 +12,8 @@
 namespace app_update {
 static const std::vector<std::string> requiredFiles = {
     "audiobridge.exe", "audiobridge-updater.exe", "onnxruntime.dll",
-    "voice-models/deepfilternet3_streaming.onnx", "voice-models/silero_vad.onnx"
+    "voice-models/deepfilternet3_streaming.onnx", "voice-models/fastenhancer_l.onnx",
+    "voice-models/dpdfnet8_48khz_hr.onnx", "voice-models/silero_vad.onnx"
 };
 
 std::array<unsigned, 3> versionParts(const std::string& version) {
@@ -107,6 +108,8 @@ std::string sha256File(const std::filesystem::path& file) {
 
 bool allowedBundlePath(const std::string& name) {
     if (std::find(requiredFiles.begin(), requiredFiles.end(), name) != requiredFiles.end() ||
+        name == "DirectML.dll" || name == "onnxruntime_providers_shared.dll" ||
+        name == "voice-models/inworld_realtime_fp16.onnx" ||
         name == "msvcp140.dll" || name == "msvcp140_1.dll" || name == "vcruntime140.dll" || name == "vcruntime140_1.dll" ||
         name == "README.md" || name == "VOICE_EFFECTS.md" || name == "DEVICE_PERMISSIONS.md" || name == "UPDATING.md") return true;
     if (name.size() > 200 || name.rfind("licenses/", 0) != 0 || name.back() == '/' ||
@@ -206,7 +209,7 @@ void extractBundle(const std::filesystem::path& archive, const std::filesystem::
         L"$archive=[IO.Compression.ZipFile]::OpenRead(" + literal(archive.wstring()) + L"); $root=" + literal(destination.wstring()) + L"; "
         L"try { $total=0L; $seen=@{}; foreach($entry in $archive.Entries) { $name=$entry.FullName; "
         L"if($name.EndsWith('/')){continue}; if($name.Contains('\\') -or $name -match '(^|/)\\.\\.?(/|$)' -or $name -match '[. ](/|$)'){throw 'Unsafe update entry'}; "
-        L"if($name -cnotmatch '^(audiobridge\\.exe|audiobridge-updater\\.exe|onnxruntime\\.dll|msvcp140(?:_1)?\\.dll|vcruntime140(?:_1)?\\.dll|voice-models/(deepfilternet3_streaming|silero_vad)\\.onnx|README\\.md|VOICE_EFFECTS\\.md|DEVICE_PERMISSIONS\\.md|UPDATING\\.md|licenses/[A-Za-z0-9_. /-]+)$'){throw 'Unexpected update entry'}; "
+        L"if($name -cnotmatch '^(audiobridge\\.exe|audiobridge-updater\\.exe|onnxruntime\\.dll|onnxruntime_providers_shared\\.dll|DirectML\\.dll|msvcp140(?:_1)?\\.dll|vcruntime140(?:_1)?\\.dll|voice-models/(deepfilternet3_streaming|fastenhancer_l|dpdfnet8_48khz_hr|inworld_realtime_fp16|silero_vad)\\.onnx|README\\.md|VOICE_EFFECTS\\.md|DEVICE_PERMISSIONS\\.md|UPDATING\\.md|licenses/[A-Za-z0-9_. /-]+)$'){throw 'Unexpected update entry'}; "
         L"if($seen.ContainsKey($name)){throw 'Duplicate update entry'}; $seen[$name]=$true; $total+=$entry.Length; if($total -gt 600MB -or $seen.Count -gt 100){throw 'Update too large'}; "
         L"$path=Join-Path $root $name; [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($path))|Out-Null; "
         L"$input=$entry.Open(); try{$output=[IO.File]::Open($path,'CreateNew','Write','None'); try{$buffer=New-Object byte[] 65536; $copied=0L; while(($count=$input.Read($buffer,0,$buffer.Length)) -gt 0){$copied+=$count; if($copied -gt $entry.Length){throw 'Invalid update size'}; $output.Write($buffer,0,$count)}; if($copied -ne $entry.Length){throw 'Truncated update'}}finally{$output.Dispose()}}finally{$input.Dispose()} "

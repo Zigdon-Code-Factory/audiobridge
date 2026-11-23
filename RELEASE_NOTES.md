@@ -1,6 +1,19 @@
-# AudioBridge 0.2.4
+# AudioBridge 0.2.5
 
-Hotfix for Bluetooth headset microphone playback muting on Android.
+Redesigned Windows desktop workspace, four native streaming noise-removal models (CPU & DirectML GPU), rendering device selection, live Mic → DSP latency telemetry, and zero-drop render/loopback fixes.
+
+## New in 0.2.5
+
+- **3-Section Accordion Desktop Workspace:** Reorganized the Windows UI into three collapsible studio sections (**01 Audio I/O**, **02 Audio Processing**, **03 Devices**) with live summary headers, segmented hardware LED meters, a bespoke dark-studio mic-check audio player, and clean compact (`640×600`) tabbed adaptation.
+- **Four Native 48 kHz Noise-Removal Models (CPU & DirectML GPU):**
+  - **DeepFilterNet3** (CPU · 0% GPU, `12.3 MB`, 32 ms delay) — balanced everyday denoiser.
+  - **FastEnhancer-L** (CPU · 0% GPU, `4.4 MB`, 17 ms delay) — lowest-latency neural cleanup.
+  - **DPDFNet8 HR** (CPU · 0% GPU, `14.2 MB`, 50 ms delay) — strongest CPU suppression (`-92 dB` floor), ideal while gaming.
+  - **Inworld Realtime** (Discrete GPU · DirectML FP16, `129.4 MB`, 53 ms delay) — 58.2M-parameter Transformer+Mamba streaming voice isolator with zero-copy GPU state buffers.
+- **Rendering Device Selector & Live GPU Overload Detection:** Pick **Auto** or a specific DirectML GPU (`< 4 GB` adapters flagged as `iGPU / slow`). CPU models lock cleanly to `CPU (0% GPU usage)`. If a selected GPU falls behind real time or fails to initialize, AudioBridge surfaces an inline alert and auto-opens **Model & rendering device** for immediate recovery.
+- **Live `Mic → DSP` Input Latency Readout:** Reports live end-to-end microphone-to-post-processed latency (`Local mic` or `Phone mic` + model lookahead + DSP wall time) in the top telemetry strip and Audio Processing footer.
+- **Zero-Drop Loopback & Render Stability:** Fixed WASAPI loopback early-event wake races on virtual buses (such as Voicemeeter Input) and increased the microphone render queue headroom (`100 ms` cap, `25 ms` prime/catchup target) to eliminate underruns and overflow drops under load.
+- Windows and Android both report version 0.2.5. Android build 11 upgrades build 10 without uninstalling or clearing app data.
 
 ## New in 0.2.4
 
@@ -88,10 +101,14 @@ Hotfix for Bluetooth headset microphone playback muting on Android.
   user-writable folder and run `audiobridge.exe`. Keep its updater, runtime DLLs
   and `voice-models` folder together. WebView2 is required.
 - **Android:** install `AudioBridge-Android.apk` over the existing app; no uninstall
-  is needed. The display version is 0.2.4; Android build 10 upgrades build 9.
+  is needed. The display version is 0.2.5; Android build 11 upgrades build 10.
   This sideload build retains the existing signing identity.
-- For older builds, install this release once manually to get the update buttons.
-  Future phone and Windows updates remain separate.
+- **Upgrading Windows from 0.2.4 or earlier:** extract `AudioBridge-Windows-x64.zip`
+  manually once over your existing folder (keeping your existing settings/pairings
+  files). Because 0.2.5 introduces DirectML and three new ONNX voice models, older
+  Windows updaters reject the expanded bundle; future updates from 0.2.5+ work
+  normally via the in-app updater. Android in-app updates from 0.2.4 work directly.
+  Phone and Windows updates remain separate.
 - A calling-app microphone still needs a working VB-CABLE or AudioBridge virtual
   microphone setup. This release does not install drivers or alter Windows defaults.
 

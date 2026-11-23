@@ -58,6 +58,10 @@ private:
     bool primed_ = false;
     size_t windowMinFrames_ = (std::numeric_limits<size_t>::max)();
     uint32_t windowPushCount_ = 0;
+    uint64_t statPushes_ = 0;
+    uint64_t statOverflowDrops_ = 0;
+    uint64_t statCatchupDrops_ = 0;
+    uint64_t statUnderruns_ = 0;
 
     bool comInitialized_ = false;
 

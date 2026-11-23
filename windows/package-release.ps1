@@ -1,7 +1,7 @@
 param(
-    [string]$Version = '0.2.4',
-    [string]$BuildDirectory = (Join-Path $PSScriptRoot 'build/release-0.2.4'),
-    [string]$OutputDirectory = (Join-Path $PSScriptRoot 'build/release-artifacts/v0.2.4'),
+    [string]$Version = '0.2.5',
+    [string]$BuildDirectory = (Join-Path $PSScriptRoot 'build/inworld-gpu'),
+    [string]$OutputDirectory = (Join-Path $PSScriptRoot 'build/release-artifacts/v0.2.5'),
     [string]$VisualStudioDirectory = ''
 )
 $ErrorActionPreference = 'Stop'
@@ -17,7 +17,12 @@ if (Test-Path -LiteralPath $output) { throw 'Use a fresh output directory to avo
 $stage = Join-Path $output 'windows'
 New-Item -ItemType Directory -Path $stage -Force | Out-Null
 $runtimeFiles = @('audiobridge.exe', 'audiobridge-updater.exe', 'onnxruntime.dll',
-    'voice-models/deepfilternet3_streaming.onnx', 'voice-models/silero_vad.onnx')
+    'onnxruntime_providers_shared.dll', 'DirectML.dll',
+    'voice-models/deepfilternet3_streaming.onnx', 'voice-models/fastenhancer_l.onnx',
+    'voice-models/dpdfnet8_48khz_hr.onnx', 'voice-models/silero_vad.onnx')
+if (Test-Path -LiteralPath (Join-Path $build 'voice-models/inworld_realtime_fp16.onnx')) {
+    $runtimeFiles += 'voice-models/inworld_realtime_fp16.onnx'
+}
 foreach ($relative in $runtimeFiles) {
     $destination = Join-Path $stage $relative
     New-Item -ItemType Directory -Path (Split-Path $destination) -Force | Out-Null
@@ -26,6 +31,9 @@ foreach ($relative in $runtimeFiles) {
 $licenses = Join-Path $stage 'licenses'
 New-Item -ItemType Directory -Path $licenses -Force | Out-Null
 Copy-Item -LiteralPath (Join-Path $build 'licenses/onnxruntime') -Destination $licenses -Recurse
+if (Test-Path -LiteralPath (Join-Path $build 'licenses/directml')) {
+    Copy-Item -LiteralPath (Join-Path $build 'licenses/directml') -Destination $licenses -Recurse
+}
 Copy-Item -LiteralPath (Join-Path $build 'voice-models/licenses') -Destination (Join-Path $licenses 'voice-models') -Recurse
 $dependencies = @{
     opus = 'opus-src/COPYING'

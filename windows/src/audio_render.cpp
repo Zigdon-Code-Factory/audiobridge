@@ -5,7 +5,9 @@
 #include <ksmedia.h>
 #include <avrt.h>
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 
 #pragma comment(lib, "avrt.lib")
@@ -248,25 +250,29 @@ void AudioRender::pushAudio(const float* data, uint32_t frameCount) {
     }
 
     audioBuffer_.insert(audioBuffer_.end(), outputPtr->begin(), outputPtr->end());
+    ++statPushes_;
 
-    // Hard cap on buffer size to bound worst-case latency spikes (max 45ms at device rate)
-    const size_t maxFrames = (deviceSampleRate_ * 45) / 1000;
+    // Hard cap on buffer size to bound worst-case latency spikes (max 100ms at device rate;
+    // accommodates 20ms batched GPU voice-cleanup bursts without dropping mic frames)
+    const size_t maxFrames = (deviceSampleRate_ * 100) / 1000;
     const size_t maxSamples = maxFrames * deviceChannels_;
     if (audioBuffer_.size() > maxSamples) {
         audioBuffer_.erase(audioBuffer_.begin(), audioBuffer_.begin() + (audioBuffer_.size() - maxSamples));
+        ++statOverflowDrops_;
     }
 
-    // Windowed (~350ms) minimum-depth catch-up to drain accumulated drift back to ~12ms
+    // Windowed (~350ms) minimum-depth catch-up to drain accumulated drift back to ~25ms
     if (primed_) {
         windowPushCount_++;
         const uint32_t pushMs = (std::max)(5u, (frameCount * 1000u) / INPUT_SAMPLE_RATE);
         const uint32_t windowPushes = (std::max)(20u, 350u / pushMs);
         if (windowPushCount_ >= windowPushes) {
-            const size_t targetFrames = (deviceSampleRate_ * 12) / 1000;
+            const size_t targetFrames = (deviceSampleRate_ * 25) / 1000;
             const size_t curFrames = audioBuffer_.size() / deviceChannels_;
             if (windowMinFrames_ > targetFrames && curFrames > targetFrames) {
                 size_t dropFrames = (std::min)(windowMinFrames_ - targetFrames, curFrames - targetFrames);
                 audioBuffer_.erase(audioBuffer_.begin(), audioBuffer_.begin() + dropFrames * deviceChannels_);
+                ++statCatchupDrops_;
             }
             windowMinFrames_ = (std::numeric_limits<size_t>::max)();
             windowPushCount_ = 0;
@@ -290,6 +296,7 @@ void AudioRender::renderThread() {
     }
 
     const uint32_t bytesPerFrame = deviceChannels_ * (deviceBitsPerSample_ / 8);
+    auto lastStats = std::chrono::steady_clock::now();
 
     while (running_) {
         UINT32 numFramesPadding = 0;
@@ -307,7 +314,7 @@ void AudioRender::renderThread() {
         if (numFramesAvailable > 0) {
             std::lock_guard<std::mutex> lock(bufferMutex_);
             uint32_t availableFrames = static_cast<uint32_t>(audioBuffer_.size()) / deviceChannels_;
-            const uint32_t primeTarget = (std::max)(quantumFrames, (deviceSampleRate_ * 12) / 1000);
+            const uint32_t primeTarget = (std::max)(quantumFrames, (deviceSampleRate_ * 25) / 1000);
 
             if (!primed_ && availableFrames >= primeTarget) {
                 primed_ = true;
@@ -346,8 +353,19 @@ void AudioRender::renderThread() {
             } else if (primed_ && availableFrames == 0 && numFramesPadding == 0) {
                 // Mic stream ended or underran completely — re-prime cleanly on next speech burst
                 primed_ = false;
+                ++statUnderruns_;
                 windowMinFrames_ = (std::numeric_limits<size_t>::max)();
                 windowPushCount_ = 0;
+            }
+            const auto now = std::chrono::steady_clock::now();
+            if (statPushes_ > 0 && std::chrono::duration_cast<std::chrono::seconds>(now - lastStats).count() >= 5) {
+                printf("[RENDER] Stats: pushes=%llu underruns=%llu overflowDrops=%llu catchupDrops=%llu bufFrames=%u\n",
+                       statPushes_, statUnderruns_, statOverflowDrops_, statCatchupDrops_, availableFrames);
+                statPushes_ = 0;
+                statUnderruns_ = 0;
+                statOverflowDrops_ = 0;
+                statCatchupDrops_ = 0;
+                lastStats = now;
             }
         }
 

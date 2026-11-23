@@ -537,6 +537,8 @@ void AudioCapture::captureThread() {
     size_t maxResampleBuf = 0;
     size_t minResampleBuf = 999999;
     uint64_t discontinuityCount = 0; // AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY
+    DWORD lastWaitResult = WAIT_TIMEOUT;
+    int emptyRetries = 0;
 
     while (running_) {
         UINT32 packetLength = 0;
@@ -552,7 +554,14 @@ void AudioCapture::captureThread() {
         }
 
         if (packetLength == 0) {
+            if (captureEvent_ && lastWaitResult == WAIT_OBJECT_0 && emptyRetries < 8) {
+                ++emptyRetries;
+                Sleep(1);
+                continue;
+            }
             emptyPollCount++;
+        } else {
+            emptyRetries = 0;
         }
 
         while (packetLength > 0) {
@@ -649,7 +658,8 @@ void AudioCapture::captureThread() {
 
         // Wait for next buffer: event-driven (wakes immediately on WASAPI quantum) or 1ms poll fallback
         if (captureEvent_) {
-            WaitForSingleObject(captureEvent_, 25);
+            lastWaitResult = WaitForSingleObject(captureEvent_, 25);
+            emptyRetries = 0;
         } else {
             Sleep(1);
         }

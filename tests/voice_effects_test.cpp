@@ -13,6 +13,21 @@ static float rms(const std::vector<float>& x, size_t start=0) {
     double sum=0; for(size_t i=start;i<x.size();++i) sum+=x[i]*x[i];
     return static_cast<float>(std::sqrt(sum/(x.size()-start)));
 }
+static std::vector<float> speechLike(size_t count=48000) {
+    // Voiced speech-like harmonic bursts (modulated pitch + syllable envelope) so denoisers preserve it.
+    std::vector<float> x(count, 0.f);
+    double phase = 0.0;
+    for (size_t i = 0; i < count; ++i) {
+        const double t = static_cast<double>(i) / 48000.0;
+        const double env = (t >= 0.15 && t <= 0.85) ? std::max(0.0, std::sin(6.283185307179586 * 3.0 * (t - 0.15))) : 0.0;
+        const double f0 = 140.0 + 40.0 * std::sin(6.283185307179586 * 2.2 * t);
+        phase += 6.283185307179586 * f0 / 48000.0;
+        double s = 0.0;
+        for (int h = 1; h <= 10; ++h) s += std::sin(h * phase) / (h * (1.0 + 0.12 * h));
+        x[i] = static_cast<float>(0.18 * env * s);
+    }
+    return x;
+}
 static std::vector<float> tone(float hz, size_t count=48000) {
     std::vector<float> x(count);
     for(size_t i=0;i<count;++i) x[i]=.2f*std::sin(6.283185307179586*hz*i/48000);
@@ -44,15 +59,63 @@ int main(int argc,char** argv) {
     assert(rms(filtered,24000)<.12f*rms(rumble,24000));
     auto voice=tone(300); filtered=dsp.render(voice,low);
     assert(std::abs(rms(filtered,24000)/rms(voice,24000)-1)<.03);
-    // The dry/wet blend must line up after compensating the 32 ms model delay.
+    auto voiceClip = speechLike(48000);
+    std::mt19937 noiseRng(123);
+    std::normal_distribution<float> whiteDist(0.f, 0.03f);
+    std::vector<float> whiteNoise(48000);
+    for (float& v : whiteNoise) v = whiteDist(noiseRng);
+
+    // The dry/wet blend must line up after compensating each model's delay.
+    std::vector<int> modelsToTest = {VoiceSettings::ModelDeepFilterNet3, VoiceSettings::ModelFastEnhancerL, VoiceSettings::ModelDpdfNet8};
+    if (std::filesystem::exists(std::filesystem::path(dir) / L"inworld_realtime_fp16.onnx"))
+        modelsToTest.push_back(VoiceSettings::ModelInworldGpu);
+    for (int model : modelsToTest) {
+        VoiceSettings full = bypass; full.noise = true; full.model = model;
+        auto wet = dsp.render(x, full); // warms session
+        VoiceSettings blend = full; blend.strength = 20;
+        auto mixed = dsp.render(x, blend);
+        assert(wet.size() == x.size() && mixed.size() == x.size());
+        for (size_t i = 0; i < x.size(); ++i) {
+            assert(std::isfinite(wet[i]));
+            assert(std::abs(mixed[i] - (.9f * wet[i] + .1f * x[i])) < 1e-5);
+        }
+        // Measure warm 1-second render time, speech preservation, noise suppression, and exact lag.
+        auto t0 = std::chrono::steady_clock::now();
+        auto cleanVoice = dsp.render(voiceClip, full);
+        auto t1 = std::chrono::steady_clock::now();
+        auto cleanNoise = dsp.render(whiteNoise, full);
+        int bestLag = 0; double bestCorr = -1.0;
+        for (int lag = -3000; lag <= 3000; ++lag) {
+            double c = 0;
+            for (size_t i = 7200; i < 40800; ++i)
+                c += voiceClip[i] * cleanVoice[static_cast<size_t>(static_cast<int>(i) + lag)];
+            if (c > bestCorr) { bestCorr = c; bestLag = lag; }
+        }
+        const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        const float speechInRms = rms(voiceClip, 7200), speechOutRms = rms(cleanVoice, 7200);
+        const float noiseInRms = rms(whiteNoise, 9600), noiseOutRms = rms(cleanNoise, 9600);
+        std::cout << "Model " << model << ": warm 1.0s=" << ms << "ms (RTF=" << (ms / 1000.0)
+                  << "), peakLag=" << bestLag
+                  << ", speechRatio=" << (speechOutRms / speechInRms)
+                  << ", noiseAtten=" << (noiseOutRms / noiseInRms) << "\n";
+        assert(speechOutRms > 0.35f * speechInRms);
+        assert(noiseOutRms < 0.25f * noiseInRms);
+        assert(std::abs(bestLag) <= 24);
+        // Verify arbitrary packet sizes work cleanly across each model's hop boundary.
+        dsp.reset();
+        std::vector<float> modelStreamed;
+        for (size_t i = 0; i < x.size();) {
+            auto n = std::min<size_t>((i % 3 + 1) * 120, x.size() - i);
+            auto out = dsp.process(x.data() + i, n, full);
+            modelStreamed.insert(modelStreamed.end(), out.begin(), out.end());
+            i += n;
+        }
+        assert(!modelStreamed.empty());
+        for (float v : modelStreamed) assert(std::isfinite(v));
+    }
     VoiceSettings full=bypass; full.noise=true;
-    auto wet=dsp.render(x,full);
     VoiceSettings blend=full; blend.strength=20;
     auto mixed=dsp.render(x,blend);
-    for(size_t i=0;i<x.size();++i) {
-        assert(std::isfinite(wet[i]));
-        assert(std::abs(mixed[i]-(.9f*wet[i]+.1f*x[i]))<1e-5);
-    }
     auto boostedSettings = blend;
     boostedSettings.makeupDb = 6;
     auto boosted = dsp.render(x, boostedSettings);
@@ -70,6 +133,18 @@ int main(int argc,char** argv) {
     assert(atCeiling < static_cast<long long>(limited.size() / 50));
     assert(VoiceSettings::parse("1 6 1 50 300 0 99").makeupDb == 12);
     assert(VoiceSettings::parse("1 6 1 50 300 0").makeupDb == 0);
+    assert(VoiceSettings::parse("1 6 1 50 300 0").model == VoiceSettings::ModelDeepFilterNet3);
+    assert(VoiceSettings::parse("1 6 1 50 300 0 0 1").model == VoiceSettings::ModelFastEnhancerL);
+    assert(VoiceSettings::parse("1 6 1 50 300 0 3 2").model == VoiceSettings::ModelDpdfNet8);
+    assert(VoiceSettings::parse("1 6 1 50 300 0 3 3").model == VoiceSettings::ModelInworldGpu);
+    assert(VoiceSettings::parse("1 6 1 50 300 0 3 99").model == VoiceSettings::ModelInworldGpu);
+    assert(VoiceSettings::parse("1 6 1 50 300 0 0 1").serialize() == "1 6 1 50 300 0 0 1");
+    assert(VoiceSettings::parse("1 6 1 50 300 0 4 2").serialize() == "1 6 1 50 300 0 4 2");
+    assert(VoiceSettings::parse("1 6 1 50 300 0 0 0").serialize() == "1 6 1 50 300 0");
+    assert(VoiceSettings::parse("1 6 1 50 300 0 6 3 1").gpuDevice == 1);
+    assert(VoiceSettings::parse("1 6 1 50 300 0 6 3 1").serialize() == "1 6 1 50 300 0 6 3 1");
+    assert(VoiceSettings::parse("1 6 1 50 300 0 6 3 -1").serialize() == "1 6 1 50 300 0 6 3");
+    assert(VoiceSettings::parse("1 6 1 50 300 0 6 3 99").gpuDevice == 31);
     // Real VAD must eventually close on sustained silence and reset reproducibly.
     auto silence=std::vector<float>(48000,0.f);
     VoiceSettings gated; gated.noise=false;

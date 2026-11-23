@@ -53,9 +53,9 @@ closing AudioBridge and confirming the update succeeded.
 
 ## Versioning and signing
 
-The public release is **0.2.4**, following the 0.2.0 overhaul. Intermediate local
-builds used `1.0.x` display names. Android 0.2.4 has
-`versionCode` **10**, higher than the previous build 9, so changing the display
+The public release is **0.2.5**, following the 0.2.0 overhaul. Intermediate local
+builds used `1.0.x` display names. Android 0.2.5 has
+`versionCode` **11**, higher than the previous build 10, so changing the display
 version does not require uninstalling or clearing app data. Future releases must
 increase both the semantic version and Android build number.
 

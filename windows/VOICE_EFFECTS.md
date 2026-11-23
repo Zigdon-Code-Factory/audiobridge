@@ -51,10 +51,15 @@ cancellation and does not eliminate feedback from a phone speaker into its mic.
 
 ## Controls
 
-- **Noise removal** uses DeepFilterNet3 at 48 kHz. Strength limits attenuation to
-  6/10/15/20/30 dB or Max. Lower values retain more room sound. Dry audio is delayed
-  to align with the model before mixing; model delay is 32 ms plus hop/queue buffering.
-- **Voice gate** uses Silero VAD. Expand the tuning section for detection threshold,
+- **Noise removal** offers four native 48 kHz streaming models:
+  - **DeepFilterNet3** (default, CPU, 12.3 MB): 32 ms model delay, balanced quality and light CPU load (0% GPU).
+  - **FastEnhancer-L** (CPU, 4.4 MB): 17 ms model delay, lowest-latency streaming enhancement (0% GPU).
+  - **DPDFNet8 HR** (CPU, 14.2 MB): 50 ms model delay, heavier 8-block dual-path RNN model for tougher noise and reverb (0% GPU).
+  - **Inworld Realtime** (Discrete GPU · DirectML FP16, 129.4 MB): 53 ms model delay, 58M-parameter FP16 streaming voice isolator running on your high-performance DirectML GPU (AMD/NVIDIA/Intel) with zero-copy GPU state buffers.
+  Expand **Model & rendering device** to switch models, inspect the comparison table, or pick a specific DirectML GPU (`Auto` prefers the highest-VRAM discrete GPU; integrated GPUs under 4 GB VRAM are flagged as slow, and live inference overload raises an inline warning). The status line also reports live **Mic → post-processed** latency (`Local mic` or `Phone mic` + model lookahead + DSP wall time).
+  Strength limits attenuation to 6/10/15/20/30 dB or Max. Lower values retain more room
+  sound. Dry audio is delayed to align with the active model before mixing.
+- **Voice gate** uses Silero VAD. Expand **Fine-tune audio & gate** for **Level after cleanup**, detection threshold,
   0.1–1.5 second hold, and an optional 80 Hz Butterworth high-pass filter.
 - **Record** captures up to 10 seconds of returned phone mic audio into memory.
   Stop to generate aligned Original/Processed versions. The playback bar provides
@@ -101,6 +106,10 @@ routing, or acoustic echo performance; verify those with your phone and a call.
 - ONNX Runtime 1.23.2 (MIT): https://github.com/microsoft/onnxruntime/tree/v1.23.2
 - DeepFilterNet / torchDF streaming export (MIT/Apache-2.0):
   https://github.com/grazder/DeepFilterNet/tree/408414f2bdb9ed772580558d1c3ec26c5dc002d7
+- FastEnhancer-L 48 kHz streaming export (MIT):
+  https://github.com/aask1357/fastenhancer/releases/tag/onnx-48khz-v1
+- DPDFNet8 HR 48 kHz streaming export (Apache-2.0):
+  https://github.com/ceva-ip/DPDFNet / https://huggingface.co/Ceva-IP/DPDFNet
 - Silero VAD v6.2.3 (MIT): https://github.com/snakers4/silero-vad/tree/v6.2.3
 
 The pinned model URLs and SHA-256 values are recorded in `voice_models.py`.

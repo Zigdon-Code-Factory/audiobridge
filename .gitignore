@@ -76,3 +76,7 @@ windows/build/_deps/
 *.log
 audiobridge_crash.log
 approved_peers.txt
+
+# === Python cache ===
+__pycache__/
+*.pyc

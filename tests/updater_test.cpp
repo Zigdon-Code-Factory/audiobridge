@@ -106,7 +106,8 @@ int main(int argumentCount, char** arguments) {
     assert(sha256File(root / "hash") == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
     rejects([&] { sha256File(root / "missing"); });
     const std::vector<std::string> names = {"audiobridge.exe", "audiobridge-updater.exe", "onnxruntime.dll",
-        "voice-models/deepfilternet3_streaming.onnx", "voice-models/silero_vad.onnx", "licenses/onnxruntime/LICENSE"};
+        "voice-models/deepfilternet3_streaming.onnx", "voice-models/fastenhancer_l.onnx",
+        "voice-models/dpdfnet8_48khz_hr.onnx", "voice-models/silero_vad.onnx", "licenses/onnxruntime/LICENSE"};
     for (const auto& name : names) {
         write(root / "new" / name, "new");
         write(root / "installed" / name, "old");
