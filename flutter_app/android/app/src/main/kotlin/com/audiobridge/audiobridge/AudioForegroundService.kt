@@ -172,7 +172,12 @@ class AudioForegroundService : Service() {
         updateNotification()
         playCue(muted)
         Handler(Looper.getMainLooper()).post {
-            MainActivity.methodChannel?.invokeMethod("onMicMuted", muted)
+            val channel = MainActivity.methodChannel
+            if (channel != null) {
+                channel.invokeMethod("onMicMuted", muted)
+            } else {
+                Log.w(TAG, "onMicMuted skipped: methodChannel is null")
+            }
         }
     }
 

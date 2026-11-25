@@ -105,9 +105,8 @@ class AudioCallService : ConnectionService() {
         }
 
         private fun recycleAfterHeadsetDisconnect(context: Context, conn: AudioCallConnection) {
-            if (activeConnection === conn) {
-                activeConnection = null
-            }
+            if (activeConnection !== conn) return
+            activeConnection = null
             if (!callWanted) return
             val appContext = context.applicationContext
             restartRunnable?.let { mainHandler.removeCallbacks(it) }
@@ -118,7 +117,14 @@ class AudioCallService : ConnectionService() {
                 }
             }
             restartRunnable = restart
-            mainHandler.postDelayed(restart, 250)
+            // Newer Android releases tear SCO down asynchronously after a Telecom
+            // disconnect. Advertising another call before that teardown completes
+            // leaves AirPods sending media keys on a voice-only playback route.
+            val headset = if (Build.VERSION.SDK_INT >= 36) {
+                context.getSystemService(AudioManager::class.java).communicationDevice
+            } else null
+            val restartDelay = if (headset?.productName?.contains("AirPods", ignoreCase = true) == true) 1800L else 250L
+            mainHandler.postDelayed(restart, restartDelay)
         }
     }
 

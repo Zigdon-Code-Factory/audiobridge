@@ -32,6 +32,7 @@ class MainActivity : FlutterActivity() {
     private val recordingSeq = java.util.concurrent.atomic.AtomicInteger(0)
     private var volumeReceiverRegistered = false
     private var appUpdater: AppUpdater? = null
+    private var instanceChannel: MethodChannel? = null
 
     private val volumeReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
@@ -47,7 +48,10 @@ class MainActivity : FlutterActivity() {
     }
 
     companion object {
+        @Volatile
         var methodChannel: MethodChannel? = null
+        @Volatile
+        private var activeInstance: MainActivity? = null
         private const val TAG = "AudioBridge"
 
         init {
@@ -89,7 +93,7 @@ class MainActivity : FlutterActivity() {
     fun onNativeEvent(method: String, data: String) {
         runOnUiThread {
             try {
-                methodChannel?.invokeMethod(method, data)
+                (instanceChannel ?: methodChannel)?.invokeMethod(method, data)
             } catch (e: Exception) {
                 Log.w(TAG, "Failed to invoke Dart method '$method': ${e.message}")
             }
@@ -291,7 +295,9 @@ class MainActivity : FlutterActivity() {
         syncSystemVolume()
 
         val channel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL)
+        instanceChannel = channel
         methodChannel = channel
+        activeInstance = this
 
         channel.setMethodCallHandler { call, result ->
             when (call.method) {
@@ -596,15 +602,37 @@ class MainActivity : FlutterActivity() {
     override fun onDestroy() {
         recordingSeq.incrementAndGet()
         appUpdater?.close()
-        stopBluetoothSco()
-        nativeSetVoiceCommunication(false)
+        val isActive = activeInstance === this || activeInstance == null
+        if (isActive) {
+            stopBluetoothSco()
+            nativeSetVoiceCommunication(false)
+            activeInstance = null
+        } else {
+            btReselectRunnable?.let { mainHandler.removeCallbacks(it) }
+            btReselectRunnable = null
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && communicationListener != null) {
+                try {
+                    val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+                    communicationListener?.let { audioManager.removeOnCommunicationDeviceChangedListener(it) }
+                } catch (_: Exception) {}
+                communicationListener = null
+            }
+            bluetoothScoActive = false
+        }
         unregisterVolumeTracking()
-        methodChannel = null
+        if (methodChannel === instanceChannel) {
+            methodChannel = null
+        }
+        instanceChannel = null
         super.onDestroy()
     }
 
     override fun onResume() {
         super.onResume()
+        if (instanceChannel != null) {
+            methodChannel = instanceChannel
+            activeInstance = this
+        }
         appUpdater?.onResume()
     }
 

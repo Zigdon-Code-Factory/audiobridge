@@ -1,7 +1,7 @@
 param(
-    [string]$Version = '0.2.5',
+    [string]$Version = '0.2.6',
     [string]$BuildDirectory = (Join-Path $PSScriptRoot 'build/inworld-gpu'),
-    [string]$OutputDirectory = (Join-Path $PSScriptRoot 'build/release-artifacts/v0.2.5'),
+    [string]$OutputDirectory = (Join-Path $PSScriptRoot 'build/release-artifacts/v0.2.6'),
     [string]$VisualStudioDirectory = ''
 )
 $ErrorActionPreference = 'Stop'

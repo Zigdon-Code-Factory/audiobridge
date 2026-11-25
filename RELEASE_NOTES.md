@@ -1,6 +1,12 @@
-# AudioBridge 0.2.5
+# AudioBridge 0.2.6
 
-Redesigned Windows desktop workspace, four native streaming noise-removal models (CPU & DirectML GPU), rendering device selection, live Mic → DSP latency telemetry, and zero-drop render/loopback fixes.
+Fixes AirPods double-tap mute/unmute reliability on Android 16+ and prevents stale `MainActivity` destruction from dropping native-to-Flutter state updates (such as in-app `Mic On` / `Mic Off` feedback and PC control sync).
+
+## New in 0.2.6
+
+- **Fix AirPods double-tap mute/unmute on Android 16+:** After a Bluetooth headset double-tap ends the self-managed Telecom call, Android 16+ needs extra time to finish SCO teardown before recycling the call. AudioBridge now waits 1800 ms on API 36+ for AirPods and guards recycled callbacks against stale connections so repeated mute and unmute gestures stay on HFP instead of falling back to dropped media keys.
+- **Fix stale `MainActivity.onDestroy()` breaking in-app UI sync:** When Android recreates `MainActivity` (for example after an app update or task clear), the older activity's `onDestroy()` could execute after the new activity was already running and clear `MainActivity.methodChannel` (or tear down Bluetooth/Telecom audio state), leaving the Flutter UI out of sync with the actual mute state. Each activity now tracks its own channel and only clears shared state when it is still the active instance.
+- Windows and Android both report version 0.2.6. Android build 12 upgrades build 11 without uninstalling or clearing app data. The Windows app has no other changes.
 
 ## New in 0.2.5
 
@@ -101,7 +107,7 @@ Redesigned Windows desktop workspace, four native streaming noise-removal models
   user-writable folder and run `audiobridge.exe`. Keep its updater, runtime DLLs
   and `voice-models` folder together. WebView2 is required.
 - **Android:** install `AudioBridge-Android.apk` over the existing app; no uninstall
-  is needed. The display version is 0.2.5; Android build 11 upgrades build 10.
+  is needed. The display version is 0.2.6; Android build 12 upgrades build 11.
   This sideload build retains the existing signing identity.
 - **Upgrading Windows from 0.2.4 or earlier:** extract `AudioBridge-Windows-x64.zip`
   manually once over your existing folder (keeping your existing settings/pairings
